@@ -6,7 +6,7 @@
 
 - SOCKS5 TCP `CONNECT` 入站，支持 IPv4、IPv6 与域名目标；默认无认证，可用 `authentication` 列表启用 RFC 1929 用户名/密码认证，并可用 `skip-auth-prefixes` CIDR 允许指定来源免认证。
 - TCP 出站支持 `DIRECT`、HTTP `CONNECT`、SOCKS5；HTTP 与 SOCKS5 出站可选用户名/密码认证。
-- 有序首匹配规则支持 `DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`DOMAIN-WILDCARD`、有限的 `DOMAIN-REGEX`、`IP-CIDR`/`IP-CIDR6`、`SRC-IP-CIDR`、`SRC-PORT`、`DST-PORT`、`MATCH`；动作可为 `DIRECT`、`REJECT` 或配置中声明的代理名称。
+- 有序首匹配规则支持 `DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`DOMAIN-WILDCARD`、有限的 `DOMAIN-REGEX`、`IP-CIDR`/`IP-CIDR6`、`SRC-IP-CIDR`、`SRC-PORT`、`DST-PORT`、有限的 `RULE-SET` 和 `MATCH`；动作可为 `DIRECT`、`REJECT` 或配置中声明的代理名称。
 - `REJECT` 在拨号前返回 SOCKS5 connection-not-allowed；代理握手与连接共用配置的出站超时。
 - 默认监听 `127.0.0.1:1080`，拒绝非 loopback 监听；连接并发有界。
 - 未知 YAML 字段、代理类型、规则类型、动作、重复代理名和未配置的代理引用均显式报错。
@@ -34,9 +34,23 @@ rules:
   - MATCH,DIRECT
 ```
 
+rule provider 当前仅支持内联 classical 子集，例如：
+
+```yaml
+rule-providers:
+  local-blocklist:
+    type: inline
+    behavior: classical
+    payload:
+      - "DOMAIN-SUFFIX,ads.example"
+rules:
+  - RULE-SET,local-blocklist,REJECT
+  - MATCH,DIRECT
+```
+
 代理类型目前只支持 `http`（HTTP CONNECT 隧道，不是通用正向 HTTP 转发，也不支持 TLS-to-proxy）和 `socks5`（SOCKS5 TCP CONNECT）。规则的第三列用代理名选择出站，例如 `MATCH,upstream`。省略规则时按本项目约定使用 `MATCH,DIRECT`。
 
-`skip-auth-prefixes` 命中时将协商无认证方法；该功能应谨慎配置，避免把不可信来源列入豁免范围。SOCKS5 入站认证和 SOCKS5 出站认证按 RFC 1929 传输明文凭据，因此仅应在可信本机网络使用；监听仍被限制为 loopback。**仍未实现：** UDP、HTTP 入站、HTTPS/其他代理出站、代理组、`RULE-SET`/rule providers、Mihomo DNS 策略、TUN、订阅、REST API、UI 与 Android 服务。IP-CIDR 不会为域名目标先行解析。该项目不接受完整 Mihomo YAML；见 [兼容性台账](COMPATIBILITY.md)。
+`skip-auth-prefixes` 命中时将协商无认证方法；该功能应谨慎配置，避免把不可信来源列入豁免范围。SOCKS5 入站认证和 SOCKS5 出站认证按 RFC 1929 传输明文凭据，因此仅应在可信本机网络使用；监听仍被限制为 loopback。rule provider 目前仅支持静态 `type: inline`、`behavior: classical` 的有限规则子集，不读取本地文件或远程 URL，也不自动刷新。**仍未实现：** UDP、HTTP 入站、HTTPS/其他代理出站、代理组、完整 rule-provider 行为、Mihomo DNS 策略、TUN、订阅、REST API、UI 与 Android 服务。IP-CIDR 不会为域名目标先行解析。该项目不接受完整 Mihomo YAML；见 [兼容性台账](COMPATIBILITY.md)。
 
 ## 快速开始
 

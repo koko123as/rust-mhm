@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, HashMap},
     net::{IpAddr, SocketAddr},
     path::Path,
 };
@@ -27,12 +28,24 @@ pub struct Config {
     max_connections: usize,
     #[serde(default = "default_rules")]
     rules: Vec<String>,
+    #[serde(default, rename = "rule-providers")]
+    rule_providers: BTreeMap<String, RuleProviderConfig>,
     #[serde(default)]
     proxies: Vec<ProxyOutbound>,
     #[serde(default)]
     authentication: Vec<String>,
     #[serde(default, rename = "skip-auth-prefixes")]
     skip_auth_prefixes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuleProviderConfig {
+    #[serde(rename = "type")]
+    provider_type: String,
+    behavior: String,
+    #[serde(default)]
+    payload: Vec<String>,
 }
 
 impl Default for Config {
@@ -42,6 +55,7 @@ impl Default for Config {
             connect_timeout_ms: default_connect_timeout_ms(),
             max_connections: default_max_connections(),
             rules: default_rules(),
+            rule_providers: BTreeMap::new(),
             proxies: Vec::new(),
             authentication: Vec::new(),
             skip_auth_prefixes: Vec::new(),
@@ -83,7 +97,16 @@ impl Config {
             .iter()
             .map(|proxy| proxy.name.clone())
             .collect::<Vec<_>>();
-        Ok(RuleSet::parse_with_proxies(&self.rules, &names)?)
+        let rule_providers = self
+            .rule_providers
+            .iter()
+            .map(|(name, provider)| (name.clone(), provider.payload.clone()))
+            .collect::<HashMap<_, _>>();
+        Ok(RuleSet::parse_with_rule_providers(
+            &self.rules,
+            &names,
+            &rule_providers,
+        )?)
     }
 
     pub fn proxy_outbounds(&self) -> &[ProxyOutbound] {
@@ -141,7 +164,15 @@ impl Config {
             .iter()
             .map(|proxy| proxy.name.clone())
             .collect::<Vec<_>>();
-        RuleSet::parse_with_proxies(&self.rules, &proxy_names)?;
+        for (name, provider) in &self.rule_providers {
+            provider.validate(name)?;
+        }
+        let rule_providers = self
+            .rule_providers
+            .iter()
+            .map(|(name, provider)| (name.clone(), provider.payload.clone()))
+            .collect::<HashMap<_, _>>();
+        RuleSet::parse_with_rule_providers(&self.rules, &proxy_names, &rule_providers)?;
         let mut usernames = std::collections::HashSet::new();
         for entry in &self.authentication {
             let Some((username, password)) = entry.split_once(':') else {
@@ -169,6 +200,45 @@ impl Config {
                 ));
             }
         }
+        Ok(())
+    }
+}
+
+impl RuleProviderConfig {
+    fn validate(&self, name: &str) -> Result<(), ConfigError> {
+        let invalid = |reason: String| ConfigError::InvalidRuleProvider {
+            name: name.to_owned(),
+            reason,
+        };
+        if name.trim().is_empty() || name != name.trim() || name.contains(',') {
+            return Err(invalid(
+                "provider name must be non-empty, have no surrounding whitespace, and contain no commas"
+                    .to_owned(),
+            ));
+        }
+        if self.provider_type != "inline" {
+            return Err(invalid("only type: inline is supported".to_owned()));
+        }
+        if self.behavior != "classical" {
+            return Err(invalid("only behavior: classical is supported".to_owned()));
+        }
+        if self
+            .payload
+            .iter()
+            .any(|rule| rule.trim().is_empty() || rule.contains(['\r', '\n']))
+        {
+            return Err(invalid(
+                "payload entries must be non-empty single-line rules".to_owned(),
+            ));
+        }
+
+        let validation_rules = self
+            .payload
+            .iter()
+            .map(|rule| format!("{rule},DIRECT"))
+            .collect::<Vec<_>>();
+        RuleSet::parse(&validation_rules)
+            .map_err(|error| invalid(format!("invalid classical payload: {error}")))?;
         Ok(())
     }
 }
@@ -247,6 +317,8 @@ pub enum ConfigError {
     Routing(#[from] RuleError),
     #[error("invalid proxy configuration: {0}")]
     InvalidProxy(String),
+    #[error("invalid rule provider {name}: {reason}")]
+    InvalidRuleProvider { name: String, reason: String },
     #[error("invalid SOCKS5 authentication configuration: {0}")]
     InvalidAuthentication(String),
 }
@@ -321,7 +393,91 @@ mod tests {
         let error = Config::from_yaml_str("rules:\n  - RULE-SET,ads,REJECT\n").unwrap_err();
         assert!(matches!(
             error,
-            ConfigError::Routing(RuleError::UnsupportedRuleType { .. })
+            ConfigError::Routing(RuleError::UnknownRuleProvider { .. })
+        ));
+    }
+
+    #[test]
+    fn inline_classical_rule_provider_expands_in_order_and_overrides_action() {
+        let config = Config::from_yaml_str(
+            r#"
+rule-providers:
+  local:
+    type: inline
+    behavior: classical
+    payload:
+      - "DOMAIN-SUFFIX,blocked.example"
+      - "DST-PORT,8443"
+rules:
+  - DOMAIN,allow.example,DIRECT
+  - RULE-SET,local,REJECT
+  - MATCH,DIRECT
+"#,
+        )
+        .unwrap();
+        let rules = config.routing_rules().unwrap();
+        assert_eq!(
+            rules.route(&RequestTarget {
+                host: TargetHost::Domain("blocked.example".into()),
+                port: 443,
+            }),
+            RouteAction::Reject
+        );
+        assert_eq!(
+            rules.route(&RequestTarget {
+                host: TargetHost::Domain("other.example".into()),
+                port: 8443,
+            }),
+            RouteAction::Reject
+        );
+        assert_eq!(
+            rules.route(&RequestTarget {
+                host: TargetHost::Domain("allow.example".into()),
+                port: 443,
+            }),
+            RouteAction::Direct
+        );
+    }
+
+    #[test]
+    fn rule_provider_rejects_unsupported_types_and_invalid_payloads() {
+        let file_provider = Config::from_yaml_str(
+            "rule-providers:\n  remote:\n    type: file\n    behavior: classical\n",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            file_provider,
+            ConfigError::InvalidRuleProvider { .. }
+        ));
+
+        let invalid_payload = Config::from_yaml_str(
+            "rule-providers:\n  local:\n    type: inline\n    behavior: classical\n    payload:\n      - 'GEOIP,CN'\n",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            invalid_payload,
+            ConfigError::InvalidRuleProvider { .. }
+        ));
+    }
+
+    #[test]
+    fn empty_rule_provider_still_validates_action_and_match_position() {
+        let invalid_action = Config::from_yaml_str(
+            "rule-providers:\n  empty:\n    type: inline\n    behavior: classical\nrules:\n  - RULE-SET,empty,not-configured\n",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            invalid_action,
+            ConfigError::Routing(RuleError::UnsupportedAction { .. })
+        ));
+
+        let misplaced_match = Config::from_yaml_str(
+            "rule-providers:\n  empty:\n    type: inline\n    behavior: classical\nrules:\n  - MATCH,DIRECT\n  - RULE-SET,empty,REJECT\n",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            misplaced_match,
+            ConfigError::Routing(RuleError::MatchMustBeLast)
         ));
     }
 

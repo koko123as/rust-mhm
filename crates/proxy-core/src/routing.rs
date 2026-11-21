@@ -1,4 +1,7 @@
-use std::net::{IpAddr, SocketAddr};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+};
 
 use regex::Regex;
 use thiserror::Error;
@@ -65,6 +68,8 @@ pub enum RuleError {
     InvalidSyntax { index: usize },
     #[error("unsupported routing rule type at index {index}: {kind}")]
     UnsupportedRuleType { index: usize, kind: String },
+    #[error("unknown rule provider at index {index}: {name}")]
+    UnknownRuleProvider { index: usize, name: String },
     #[error("unsupported routing action at index {index}: {action}")]
     UnsupportedAction { index: usize, action: String },
     #[error("invalid domain in routing rule at index {index}")]
@@ -103,6 +108,50 @@ impl RuleSet {
 
     /// Parse rules whose actions may also name one of the configured outbounds.
     pub fn parse_with_proxies(lines: &[String], proxy_names: &[String]) -> Result<Self, RuleError> {
+        Self::parse_with_rule_providers(lines, proxy_names, &HashMap::new())
+    }
+
+    /// Parse rules and expand references to already-validated classical rule-provider payloads.
+    pub(crate) fn parse_with_rule_providers(
+        lines: &[String],
+        proxy_names: &[String],
+        rule_providers: &HashMap<String, Vec<String>>,
+    ) -> Result<Self, RuleError> {
+        let mut expanded_lines = Vec::with_capacity(lines.len());
+        for (offset, line) in lines.iter().enumerate() {
+            let fields: Vec<&str> = line.split(',').map(str::trim).collect();
+            if fields.first().copied() == Some("MATCH")
+                && fields.len() == 2
+                && offset + 1 != lines.len()
+            {
+                return Err(RuleError::MatchMustBeLast);
+            }
+            if fields.first().copied() != Some("RULE-SET") {
+                expanded_lines.push(line.clone());
+                continue;
+            }
+
+            let index = offset + 1;
+            if fields.len() != 3 || fields.iter().any(|field| field.is_empty()) {
+                return Err(RuleError::InvalidSyntax { index });
+            }
+            let Some(payload) = rule_providers.get(fields[1]) else {
+                return Err(RuleError::UnknownRuleProvider {
+                    index,
+                    name: fields[1].to_owned(),
+                });
+            };
+            parse_action(fields[2], index, proxy_names)?;
+            expanded_lines.extend(payload.iter().map(|rule| format!("{rule},{}", fields[2])));
+        }
+
+        Self::parse_expanded_with_proxies(&expanded_lines, proxy_names)
+    }
+
+    fn parse_expanded_with_proxies(
+        lines: &[String],
+        proxy_names: &[String],
+    ) -> Result<Self, RuleError> {
         if lines.is_empty() {
             return Ok(Self::default());
         }
@@ -699,7 +748,7 @@ mod tests {
         let lines = vec!["RULE-SET,ads,REJECT".to_owned()];
         assert!(matches!(
             RuleSet::parse(&lines),
-            Err(RuleError::UnsupportedRuleType { .. })
+            Err(RuleError::UnknownRuleProvider { .. })
         ));
     }
 

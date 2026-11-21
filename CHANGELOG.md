@@ -11,7 +11,8 @@
 - 路由规则新增有限 `DOMAIN-WILDCARD` 支持：仅支持 `*` 和 `?` 两种通配符。
 - 路由规则新增有限 `SRC-IP-CIDR` 与 `SRC-PORT` 支持：按入站 TCP peer 地址和来源端口匹配。
 - 路由规则新增有限 `DOMAIN-REGEX` 支持：规则加载时编译 Rust `regex` 表达式，对规范化域名执行匹配，拒绝无效或超过 4096 字节的表达式。
-- `RULE-SET`、代理组、UDP、DNS 策略、TUN 与平台集成仍未实现。
+- 增加有限 inline classical `RULE-SET` 支持：在引用位置展开 payload 并由引用动作统一覆盖；file/http、domain/ipcidr provider、缓存和自动更新仍未实现。
+- 完整 rule-provider 生命周期、文件/HTTP 加载、代理组、UDP、DNS 策略、TUN 与平台集成仍未实现；`RULE-SET` 当前仅为 inline classical 子集。
 
 ## 0.1.0 — 初始原型
 

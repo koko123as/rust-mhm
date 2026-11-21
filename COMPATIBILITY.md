@@ -16,7 +16,7 @@
 | `SRC-PORT` | 有限支持 | 匹配 TCP 客户端 peer 端口，接受单端口或闭区间格式。 |
 | `DST-PORT` | 有限支持 | 匹配一个端口或一个闭区间，例如 `443` 或 `8000-8100`。 |
 | `MATCH` | 支持 | 匹配所有剩余请求；显式出现时必须是唯一且最后一条规则。 |
-| `RULE-SET` | 未支持 | 尚无 rule provider 的读取、格式解析、缓存或更新生命周期。 |
+| `RULE-SET` | 有限支持 | 只支持 `type: inline`、`behavior: classical` 与 `payload` 列表；引用处的动作覆盖 provider 中每条规则。内容仅能使用本项目已实现的规则类型。 |
 
 规则依配置顺序评估，首个匹配决定动作。动作可为 `DIRECT`（TCP 直连）、`REJECT`（拨号前返回 SOCKS5 `REP=0x02`）或已声明的代理名。代理引用必须精确匹配 `proxies[].name`；未配置名称、重复名称和保留名称 `DIRECT`/`REJECT` 均不接受。
 
@@ -44,8 +44,9 @@
 - `SRC-IP-CIDR` 与 `SRC-PORT` 检查接入 socket 提供的客户端 peer IP 和端口。入站仍限制在 loopback，因此来源网段当前只代表 loopback 客户端地址；本项目也仅接受 TCP CONNECT。
 - `DST-PORT` 目前只接受单值或单个 `-` 区间，不承诺上游语法中的所有端口集合/表达式形式。
 - 没有规则时，或列表未写 `MATCH` 时，本项目会追加 `MATCH,DIRECT`。这是本项目的 fallback 约定，不代表完整 Mihomo 的默认值。
-- 顶层只识别 `listen`、`connect_timeout_ms`、`max_connections`、`rules`、`proxies`、`authentication`、`skip-auth-prefixes`。`mixed-port`、`proxy-groups`、`rule-providers`、完整 DNS 配置等仍会失败。
-- 代理组（手动选择、故障转移、负载均衡）、规则集、DNS 策略、UDP、透明代理与 TUN 均未实现。
+- 顶层只识别 `listen`、`connect_timeout_ms`、`max_connections`、`rules`、`rule-providers`、`proxies`、`authentication`、`skip-auth-prefixes`。`rule-providers` 仅接受 `inline`/`classical`/`payload` 子集；`mixed-port`、`proxy-groups`、完整 DNS 配置等仍会失败。
+- `RULE-SET` 目前不加载 `file`/`http` provider，不支持 `domain`/`ipcidr` 专用行为、文本/MRS 文件格式、刷新间隔、缓存或自动更新；classical payload 中未实现的规则类型会报错。
+- 代理组（手动选择、故障转移、负载均衡）、DNS 策略、UDP、透明代理与 TUN 均未实现。
 
 ## 官方参考
 
@@ -54,7 +55,7 @@
 - [Mihomo 官方 Proxy 配置文档](https://wiki.metacubex.one/en/config/proxies/) 与[配置语法手册](https://wiki.metacubex.one/en/handbook/syntax/)：上游出站配置参考；本项目使用不同 YAML 子集，不代表相同语义或完整支持。
 - [Mihomo 官方全局配置](https://wiki.metacubex.one/en/config/general/)：`authentication` 与 `skip-auth-prefixes` 参考；本项目只支持全局认证列表及来源 CIDR 豁免的 SOCKS5 子集。
 - [Mihomo 官方 SOCKS 入站文档](https://wiki.metacubex.one/en/config/inbound/listeners/socks/)：监听器级 `users` 覆盖语义参考，当前未实现。
-- [Mihomo 官方 Rule Providers 文档](https://wiki.metacubex.one/en/config/rule-providers/) 与[内容格式说明](https://wiki.metacubex.one/en/config/rule-providers/content/)：供后续独立实现阶段评估。
+- [Mihomo 官方 Rule Providers 文档](https://wiki.metacubex.one/en/config/rule-providers/) 与[内容格式说明](https://wiki.metacubex.one/en/config/rule-providers/content/)：provider 类型、behavior 与 payload 格式参考；本项目目前仅实现 inline classical 子集。
 - [RFC 1928](https://www.rfc-editor.org/rfc/rfc1928)：SOCKS5 协议与回复码。
 - [RFC 1929](https://www.rfc-editor.org/rfc/rfc1929)：SOCKS5 用户名/密码认证。
 - [RFC 9110, Section 9.3.6](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.3.6)：HTTP CONNECT 方法语义。
