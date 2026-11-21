@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{File, OpenOptions},
     io::{Read, Write},
     net::{IpAddr, SocketAddr},
@@ -13,7 +13,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::outbound::ProxyOutbound;
-use crate::routing::{RuleError, RuleSet};
+use crate::routing::{RouteAction, RuleError, RuleSet};
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:1080";
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 10_000;
@@ -44,10 +44,23 @@ pub struct Config {
     config_path: Option<PathBuf>,
     #[serde(default)]
     proxies: Vec<ProxyOutbound>,
+    #[serde(default, rename = "proxy-groups")]
+    proxy_groups: Vec<ProxyGroupConfig>,
     #[serde(default)]
     authentication: Vec<String>,
     #[serde(default, rename = "skip-auth-prefixes")]
     skip_auth_prefixes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProxyGroupConfig {
+    name: String,
+    #[serde(rename = "type")]
+    group_type: String,
+    proxies: Vec<String>,
+    #[serde(default, rename = "default-selected")]
+    default_selected: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -95,6 +108,7 @@ impl Default for Config {
             config_dir: None,
             config_path: None,
             proxies: Vec::new(),
+            proxy_groups: Vec::new(),
             authentication: Vec::new(),
             skip_auth_prefixes: Vec::new(),
         }
@@ -186,14 +200,16 @@ impl Config {
             .iter()
             .map(|proxy| proxy.name.clone())
             .collect::<Vec<_>>();
+        let group_actions = self.proxy_group_actions()?;
         let rule_providers = self
             .rule_providers
             .iter()
             .map(|(name, provider)| (name.clone(), provider.normalized_payload()))
             .collect::<HashMap<_, _>>();
-        Ok(RuleSet::parse_with_rule_providers(
+        Ok(RuleSet::parse_with_rule_providers_and_groups(
             &self.rules,
             &names,
+            &group_actions,
             &rule_providers,
         )?)
     }
@@ -473,6 +489,7 @@ impl Config {
             .iter()
             .map(|proxy| proxy.name.clone())
             .collect::<Vec<_>>();
+        let group_actions = self.proxy_group_actions()?;
         let mut cache_paths = std::collections::HashSet::new();
         for (name, provider) in &self.rule_providers {
             provider.validate(name)?;
@@ -508,7 +525,12 @@ impl Config {
             .iter()
             .map(|(name, provider)| (name.clone(), provider.normalized_payload()))
             .collect::<HashMap<_, _>>();
-        RuleSet::parse_with_rule_providers(&self.rules, &proxy_names, &rule_providers)?;
+        RuleSet::parse_with_rule_providers_and_groups(
+            &self.rules,
+            &proxy_names,
+            &group_actions,
+            &rule_providers,
+        )?;
         let mut usernames = std::collections::HashSet::new();
         for entry in &self.authentication {
             let Some((username, password)) = entry.split_once(':') else {
@@ -538,6 +560,160 @@ impl Config {
         }
         Ok(())
     }
+
+    fn proxy_group_actions(&self) -> Result<HashMap<String, RouteAction>, ConfigError> {
+        let proxy_names = self
+            .proxies
+            .iter()
+            .map(|proxy| proxy.name.clone())
+            .collect::<HashSet<_>>();
+        let mut all_names = proxy_names.clone();
+        let mut groups = HashMap::<&str, &ProxyGroupConfig>::new();
+
+        for group in &self.proxy_groups {
+            if group.name.trim().is_empty()
+                || group.name.contains(',')
+                || group
+                    .name
+                    .chars()
+                    .any(|character| character.is_whitespace() || character.is_control())
+                || matches!(group.name.as_str(), "DIRECT" | "REJECT")
+            {
+                return Err(ConfigError::InvalidProxyGroup(format!(
+                    "invalid or reserved group name: {}",
+                    group.name
+                )));
+            }
+            if !all_names.insert(group.name.clone()) {
+                return Err(ConfigError::InvalidProxyGroup(format!(
+                    "group name collides with another proxy or group: {}",
+                    group.name
+                )));
+            }
+            if group.group_type != "select" {
+                return Err(ConfigError::InvalidProxyGroup(format!(
+                    "unsupported group type '{}' for {} (only select is supported)",
+                    group.group_type, group.name
+                )));
+            }
+            if group.proxies.is_empty() {
+                return Err(ConfigError::InvalidProxyGroup(format!(
+                    "select group {} must contain at least one member",
+                    group.name
+                )));
+            }
+            groups.insert(group.name.as_str(), group);
+        }
+
+        for group in &self.proxy_groups {
+            let mut members = HashSet::new();
+            for member in &group.proxies {
+                if !members.insert(member.as_str()) {
+                    return Err(ConfigError::InvalidProxyGroup(format!(
+                        "duplicate member {member} in group {}",
+                        group.name
+                    )));
+                }
+                if !matches!(member.as_str(), "DIRECT" | "REJECT")
+                    && !proxy_names.contains(member)
+                    && !groups.contains_key(member.as_str())
+                {
+                    return Err(ConfigError::InvalidProxyGroup(format!(
+                        "unknown member {member} in group {}",
+                        group.name
+                    )));
+                }
+            }
+        }
+
+        let mut visiting = HashSet::new();
+        let mut validated = HashSet::new();
+        for group in &self.proxy_groups {
+            validate_proxy_group_cycles(&group.name, &groups, &mut visiting, &mut validated)?;
+        }
+
+        let mut resolved = HashMap::new();
+        for group in &self.proxy_groups {
+            resolve_proxy_group_action(
+                &group.name,
+                &groups,
+                &proxy_names,
+                &mut HashSet::new(),
+                &mut resolved,
+            )?;
+        }
+        Ok(resolved)
+    }
+}
+
+fn validate_proxy_group_cycles(
+    name: &str,
+    groups: &HashMap<&str, &ProxyGroupConfig>,
+    visiting: &mut HashSet<String>,
+    validated: &mut HashSet<String>,
+) -> Result<(), ConfigError> {
+    if validated.contains(name) {
+        return Ok(());
+    }
+    if !visiting.insert(name.to_owned()) {
+        return Err(ConfigError::InvalidProxyGroup(format!(
+            "cyclic group reference involving {name}"
+        )));
+    }
+
+    let group = *groups
+        .get(name)
+        .expect("group names are validated before cycle detection");
+    for member in &group.proxies {
+        if groups.contains_key(member.as_str()) {
+            validate_proxy_group_cycles(member, groups, visiting, validated)?;
+        }
+    }
+    visiting.remove(name);
+    validated.insert(name.to_owned());
+    Ok(())
+}
+
+fn resolve_proxy_group_action(
+    name: &str,
+    groups: &HashMap<&str, &ProxyGroupConfig>,
+    proxy_names: &HashSet<String>,
+    visiting: &mut HashSet<String>,
+    resolved: &mut HashMap<String, RouteAction>,
+) -> Result<RouteAction, ConfigError> {
+    if let Some(action) = resolved.get(name) {
+        return Ok(action.clone());
+    }
+    if !visiting.insert(name.to_owned()) {
+        return Err(ConfigError::InvalidProxyGroup(format!(
+            "cyclic selected group reference involving {name}"
+        )));
+    }
+
+    let group = *groups
+        .get(name)
+        .expect("group names are validated before resolution");
+    let selected = group
+        .default_selected
+        .as_deref()
+        .filter(|candidate| group.proxies.iter().any(|member| member == *candidate))
+        .unwrap_or_else(|| group.proxies[0].as_str());
+    let action = match selected {
+        "DIRECT" => RouteAction::Direct,
+        "REJECT" => RouteAction::Reject,
+        target if proxy_names.contains(target) => RouteAction::Proxy(target.to_owned()),
+        target if groups.contains_key(target) => {
+            resolve_proxy_group_action(target, groups, proxy_names, visiting, resolved)?
+        }
+        _ => {
+            return Err(ConfigError::InvalidProxyGroup(format!(
+                "selected member {selected} is not available in group {name}"
+            )));
+        }
+    };
+    visiting.remove(name);
+    resolved.insert(name.to_owned(), action.clone());
+    Ok(action)
 }
 
 #[derive(Deserialize)]
@@ -1158,6 +1334,8 @@ pub enum ConfigError {
     Routing(#[from] RuleError),
     #[error("invalid proxy configuration: {0}")]
     InvalidProxy(String),
+    #[error("invalid proxy group configuration: {0}")]
+    InvalidProxyGroup(String),
     #[error("invalid rule provider {name}: {reason}")]
     InvalidRuleProvider { name: String, reason: String },
     #[error("file rule providers require Config::load with a configuration-file path")]
@@ -2044,6 +2222,115 @@ rules:
         };
         assert_eq!(rules.route(&target), RouteAction::Proxy("upstream".into()));
         assert_eq!(config.proxy_outbounds().len(), 1);
+    }
+
+    #[test]
+    fn static_select_groups_resolve_defaults_nested_members_and_special_actions() {
+        let config = Config::from_yaml_str(
+            r#"
+proxies:
+  - { name: first, type: http, server: 127.0.0.1, port: 8080 }
+  - { name: second, type: socks5, server: 127.0.0.1, port: 1080 }
+proxy-groups:
+  - name: outer
+    type: select
+    proxies: [inner, DIRECT]
+    default-selected: inner
+  - name: inner
+    type: select
+    proxies: [first, second]
+    default-selected: second
+  - name: fallback
+    type: select
+    proxies: [first, second]
+    default-selected: typo
+  - name: omitted
+    type: select
+    proxies: [first, second]
+  - name: direct
+    type: select
+    proxies: [DIRECT, first]
+    default-selected: DIRECT
+  - name: reject
+    type: select
+    proxies: [first, REJECT]
+    default-selected: REJECT
+rules:
+  - DOMAIN,outer.example,outer
+  - DOMAIN,fallback.example,fallback
+  - DOMAIN,omitted.example,omitted
+  - DOMAIN,direct.example,direct
+  - DOMAIN,reject.example,reject
+  - MATCH,DIRECT
+"#,
+        )
+        .unwrap();
+        let rules = config.routing_rules().unwrap();
+        let action_for = |domain: &str| {
+            rules.route(&RequestTarget {
+                host: TargetHost::Domain(domain.into()),
+                port: 443,
+            })
+        };
+
+        assert_eq!(
+            action_for("outer.example"),
+            RouteAction::Proxy("second".into())
+        );
+        assert_eq!(
+            action_for("fallback.example"),
+            RouteAction::Proxy("first".into())
+        );
+        assert_eq!(
+            action_for("omitted.example"),
+            RouteAction::Proxy("first".into())
+        );
+        assert_eq!(action_for("direct.example"), RouteAction::Direct);
+        assert_eq!(action_for("reject.example"), RouteAction::Reject);
+    }
+
+    #[test]
+    fn select_groups_resolve_rule_provider_actions() {
+        let config = Config::from_yaml_str(
+            "proxies:\n  - { name: upstream, type: http, server: 127.0.0.1, port: 8080 }\nproxy-groups:\n  - name: selected\n    type: select\n    proxies: [upstream]\nrule-providers:\n  hosted:\n    type: inline\n    behavior: classical\n    payload:\n      - DOMAIN,provider.example\nrules:\n  - RULE-SET,hosted,selected\n  - MATCH,DIRECT\n",
+        )
+        .unwrap();
+        let action = config.routing_rules().unwrap().route(&RequestTarget {
+            host: TargetHost::Domain("provider.example".into()),
+            port: 443,
+        });
+        assert_eq!(action, RouteAction::Proxy("upstream".into()));
+    }
+
+    #[test]
+    fn rejects_invalid_select_group_types_members_names_and_cycles() {
+        let invalid_groups = [
+            "proxy-groups:\n  - { name: empty, type: select, proxies: [] }\n",
+            "proxy-groups:\n  - { name: unknown, type: select, proxies: [missing] }\n",
+            "proxy-groups:\n  - { name: duplicate, type: select, proxies: [DIRECT, DIRECT] }\n",
+            "proxy-groups:\n  - { name: unsupported, type: url-test, proxies: [DIRECT] }\n",
+            "proxy-groups:\n  - { name: cycle, type: select, proxies: [cycle] }\n",
+            "proxy-groups:\n  - { name: first, type: select, proxies: [second] }\n  - { name: second, type: select, proxies: [first] }\n",
+            "proxy-groups:\n  - { name: same, type: select, proxies: [DIRECT] }\n  - { name: same, type: select, proxies: [REJECT] }\n",
+            "proxies:\n  - { name: same, type: http, server: localhost, port: 80 }\nproxy-groups:\n  - { name: same, type: select, proxies: [DIRECT] }\n",
+            "proxy-groups:\n  - { name: DIRECT, type: select, proxies: [REJECT] }\n",
+        ];
+        for source in invalid_groups {
+            assert!(
+                matches!(
+                    Config::from_yaml_str(source),
+                    Err(ConfigError::InvalidProxyGroup(_))
+                ),
+                "group config should be rejected: {source}"
+            );
+        }
+
+        assert!(matches!(
+            Config::from_yaml_str(
+                "proxy-groups:\n  - name: strict\n    type: select\n    proxies: [DIRECT]\n    url: https://example.org/\n"
+            ),
+            Err(ConfigError::Yaml(_))
+        ));
     }
 
     #[test]

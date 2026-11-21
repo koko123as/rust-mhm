@@ -6,10 +6,11 @@
 
 - SOCKS5 TCP `CONNECT` 入站，支持 IPv4、IPv6 与域名目标；默认无认证，可用 `authentication` 列表启用 RFC 1929 用户名/密码认证，并可用 `skip-auth-prefixes` CIDR 允许指定来源免认证。
 - TCP 出站支持 `DIRECT`、HTTP `CONNECT`、SOCKS5；HTTP 与 SOCKS5 出站可选用户名/密码认证。
-- 有序首匹配规则支持 `DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`DOMAIN-WILDCARD`、有限的 `DOMAIN-REGEX`、`IP-CIDR`/`IP-CIDR6`、`SRC-IP-CIDR`、`SRC-PORT`、`DST-PORT`、有限的 `RULE-SET` 和 `MATCH`；动作可为 `DIRECT`、`REJECT` 或配置中声明的代理名称。
+- 有序首匹配规则支持 `DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`DOMAIN-WILDCARD`、有限的 `DOMAIN-REGEX`、`IP-CIDR`/`IP-CIDR6`、`SRC-IP-CIDR`、`SRC-PORT`、`DST-PORT`、有限的 `RULE-SET` 和 `MATCH`；动作可为 `DIRECT`、`REJECT`、配置中的代理名，或配置加载时解析出的静态组动作。
 - `REJECT` 在拨号前返回 SOCKS5 connection-not-allowed；代理握手与连接共用配置的出站超时。
 - 默认监听 `127.0.0.1:1080`，拒绝非 loopback 监听；连接并发有界。
-- 未知 YAML 字段、代理类型、规则类型、动作、重复代理名和未配置的代理引用均显式报错。
+- 严格配置支持 `type: select` 代理组子集：组可嵌套引用代理组；组动作在加载时按 `default-selected` 静态解析，未填写或指向非成员时取首成员。
+- 未知 YAML 字段、代理类型、规则类型、动作、重复代理/组名和未配置的成员引用均显式报错。
 
 配置示例（账号字段是明文配置；实际使用时应限制配置文件权限，不要提交真实凭据）：
 
@@ -26,13 +27,20 @@ proxies:
     port: 8080
     username: your-user # 可省略；若配置则 username/password 必须同时存在
     password: your-password
+proxy-groups:
+  - name: preferred
+    type: select
+    proxies: [upstream, DIRECT]
+    default-selected: upstream
 rules:
   - DOMAIN,ads.example,REJECT
   - DOMAIN-SUFFIX,example.org,DIRECT
   - IP-CIDR,192.0.2.0/24,DIRECT,no-resolve
-  - DST-PORT,443,upstream
+  - DST-PORT,443,preferred
   - MATCH,DIRECT
 ```
+
+这是配置时静态选择：`default-selected` 之外的候选节点不会保留为运行时策略对象，也不能通过 API 动态切换；`url-test`、`fallback`、`load-balance`、健康检查与组过滤器均未实现。该小子集不代表完整 Mihomo 代理组兼容。
 
 规则 provider 支持 `inline`、本地 `file` 和 HTTP/HTTPS，当前行为限定为 `classical`、`domain`、`ipcidr`；本地文件路径相对配置文件所在目录。file provider 支持通过 `interval` 定时重新读取，示例：
 
@@ -72,7 +80,7 @@ HTTP 响应必须成功且不超过 4 MiB；完整请求及流式下载受 `conn
 
 SOCKS5 入站现支持有限的 RFC 1928 `UDP ASSOCIATE`：为每个已认证的 TCP 控制连接建立 loopback UDP relay，控制连接关闭时结束关联；仅允许来自控制连接客户端 IP 的数据报，并在首个合法数据报后固定客户端 UDP 端点。IPv4、IPv6 和域名目标按每个数据报应用路由规则：`DIRECT` 通过临时系统 UDP socket 发送，具名 SOCKS5 代理使用上游 `UDP ASSOCIATE`（域名交给代理端解析）；`REJECT` 与 HTTP 代理 UDP 动作会丢弃，绝不回退直连。上游 SOCKS5 控制连接随入站关联保持，队列有界。UDP 分片、HTTP 代理 UDP 出站、DNS 策略、Mihomo 的 `udp` 配置字段及完整入站语义均未实现；畸形和分片帧也会丢弃。relay 地址仍限制在 loopback。
 
-`skip-auth-prefixes` 命中时将协商无认证方法；该功能应谨慎配置，避免把不可信来源列入豁免范围。SOCKS5 入站认证和 SOCKS5 出站认证按 RFC 1929 传输明文凭据，因此仅应在可信本机网络使用。**仍未实现：** HTTP 入站、HTTPS/其他代理出站、代理组、Mihomo DNS 策略、TUN、订阅、REST API、UI 与 Android 服务。IP-CIDR 不会为域名目标先行解析。该项目不接受完整 Mihomo YAML；见 [兼容性台账](COMPATIBILITY.md)。
+`skip-auth-prefixes` 命中时将协商无认证方法；该功能应谨慎配置，避免把不可信来源列入豁免范围。SOCKS5 入站认证和 SOCKS5 出站认证按 RFC 1929 传输明文凭据，因此仅应在可信本机网络使用。**仍未实现：** HTTP 入站、HTTPS/其他代理出站、动态代理组选择/API、URL-test、fallback、load-balance、Mihomo DNS 策略、TUN、订阅、REST API、UI 与 Android 服务。IP-CIDR 不会为域名目标先行解析。该项目不接受完整 Mihomo YAML；见 [兼容性台账](COMPATIBILITY.md)。
 
 ## 快速开始
 
@@ -104,4 +112,4 @@ SOCKS5 子集参考 [RFC 1928](https://www.rfc-editor.org/rfc/rfc1928) 和 [RFC 
 
 ## 验证状态
 
-Linux x86_64 上提交 `d4bf016` 的 DIRECT-only UDP ASSOCIATE 阶段已通过完整本地门禁和 [Linux、Windows、macOS 与 Rust 1.85 CI](https://github.com/koko123as/rust-mhm/actions/runs/44947943108)。当前 SOCKS5 UDP 代理出站切片已通过格式、workspace 全目标检查、78 项 workspace 测试、零警告 Clippy、CLI 帮助和 Rust 1.85 锁定依赖测试；本阶段跨平台 CI 尚待提交后验证。既有 [file-provider 热重载 CI](https://github.com/koko123as/rust-mhm/actions/runs/44946737973) 也全项通过。网络测试只使用本地假服务，不依赖外网；Android、真实第三方代理、长时负载及 Android VPN 集成尚未验证。
+Linux x86_64 上静态 `select` 代理组切片已通过格式、workspace 全目标检查、workspace 测试、零警告 Clippy、CLI 帮助、Rust 1.85 锁定依赖测试和差异检查；其跨平台 CI 在本提交推送后核验。此前 SOCKS5 UDP 出站的 [Linux、Windows、macOS 与 Rust 1.85 CI](https://github.com/koko123as/rust-mhm/actions/runs/44948797643) 已全项通过。网络测试只使用本地假服务，不依赖外网；Android、真实第三方代理、长时负载及 Android VPN 集成尚未验证。

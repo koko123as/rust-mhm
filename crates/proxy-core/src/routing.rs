@@ -117,6 +117,21 @@ impl RuleSet {
         proxy_names: &[String],
         rule_providers: &HashMap<String, Vec<String>>,
     ) -> Result<Self, RuleError> {
+        Self::parse_with_rule_providers_and_groups(
+            lines,
+            proxy_names,
+            &HashMap::new(),
+            rule_providers,
+        )
+    }
+
+    /// Parse rules with validated provider payloads and statically resolved proxy-group actions.
+    pub(crate) fn parse_with_rule_providers_and_groups(
+        lines: &[String],
+        proxy_names: &[String],
+        group_actions: &HashMap<String, RouteAction>,
+        rule_providers: &HashMap<String, Vec<String>>,
+    ) -> Result<Self, RuleError> {
         let mut expanded_lines = Vec::with_capacity(lines.len());
         for (offset, line) in lines.iter().enumerate() {
             let fields: Vec<&str> = line.split(',').map(str::trim).collect();
@@ -141,16 +156,17 @@ impl RuleSet {
                     name: fields[1].to_owned(),
                 });
             };
-            parse_action(fields[2], index, proxy_names)?;
+            parse_action(fields[2], index, proxy_names, group_actions)?;
             expanded_lines.extend(payload.iter().map(|rule| format!("{rule},{}", fields[2])));
         }
 
-        Self::parse_expanded_with_proxies(&expanded_lines, proxy_names)
+        Self::parse_expanded_with_proxies(&expanded_lines, proxy_names, group_actions)
     }
 
     fn parse_expanded_with_proxies(
         lines: &[String],
         proxy_names: &[String],
+        group_actions: &HashMap<String, RouteAction>,
     ) -> Result<Self, RuleError> {
         if lines.is_empty() {
             return Ok(Self::default());
@@ -267,7 +283,7 @@ impl RuleSet {
 
             rules.push(RoutingRule {
                 matcher,
-                action: parse_action(action_field, index, proxy_names)?,
+                action: parse_action(action_field, index, proxy_names, group_actions)?,
             });
         }
 
@@ -349,6 +365,7 @@ fn parse_action(
     value: &str,
     index: usize,
     proxy_names: &[String],
+    group_actions: &HashMap<String, RouteAction>,
 ) -> Result<RouteAction, RuleError> {
     match value {
         "DIRECT" => Ok(RouteAction::Direct),
@@ -356,6 +373,7 @@ fn parse_action(
         name if proxy_names.iter().any(|proxy_name| proxy_name == name) => {
             Ok(RouteAction::Proxy(name.to_owned()))
         }
+        name if group_actions.contains_key(name) => Ok(group_actions[name].clone()),
         other => Err(RuleError::UnsupportedAction {
             index,
             action: other.to_owned(),
