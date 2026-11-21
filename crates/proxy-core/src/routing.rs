@@ -1,6 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
+    sync::{Arc, RwLock},
 };
 
 use regex::Regex;
@@ -26,14 +27,64 @@ pub struct RequestTarget {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct ProxyGroupDefinition {
+    pub(crate) members: Vec<String>,
+    pub(crate) default_selected: String,
+}
+
+#[derive(Debug, Clone)]
+enum RuleAction {
+    Fixed(RouteAction),
+    ProxyGroup(String),
+}
+
+#[derive(Debug, Clone)]
 pub struct RuleSet {
     rules: Vec<RoutingRule>,
+    proxy_groups: Arc<RwLock<ProxyGroupSelections>>,
 }
 
 #[derive(Debug, Clone)]
 struct RoutingRule {
     matcher: Matcher,
-    action: RouteAction,
+    action: RuleAction,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProxyGroupSelections {
+    definitions: HashMap<String, ProxyGroupDefinition>,
+    selected: HashMap<String, String>,
+}
+
+impl ProxyGroupSelections {
+    fn from_definitions(definitions: &HashMap<String, ProxyGroupDefinition>) -> Self {
+        let selected = definitions
+            .iter()
+            .map(|(name, definition)| (name.clone(), definition.default_selected.clone()))
+            .collect();
+        Self {
+            definitions: definitions.clone(),
+            selected,
+        }
+    }
+
+    fn resolve(&self, name: &str, visiting: &mut HashSet<String>) -> Option<RouteAction> {
+        if !visiting.insert(name.to_owned()) {
+            return None;
+        }
+        let Some(selected) = self.selected.get(name) else {
+            visiting.remove(name);
+            return None;
+        };
+        let action = match selected.as_str() {
+            "DIRECT" => Some(RouteAction::Direct),
+            "REJECT" => Some(RouteAction::Reject),
+            member if self.definitions.contains_key(member) => self.resolve(member, visiting),
+            proxy => Some(RouteAction::Proxy(proxy.to_owned())),
+        };
+        visiting.remove(name);
+        action
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +137,10 @@ pub enum RuleError {
     InvalidPort { index: usize },
     #[error("MATCH must appear at most once and must be the final routing rule")]
     MatchMustBeLast,
+    #[error("unknown proxy group: {name}")]
+    UnknownProxyGroup { name: String },
+    #[error("member {member} is not configured in proxy group {group}")]
+    InvalidProxyGroupMember { group: String, member: String },
 }
 
 impl Default for RuleSet {
@@ -93,8 +148,9 @@ impl Default for RuleSet {
         Self {
             rules: vec![RoutingRule {
                 matcher: Matcher::Any,
-                action: RouteAction::Direct,
+                action: RuleAction::Fixed(RouteAction::Direct),
             }],
+            proxy_groups: Arc::new(RwLock::new(ProxyGroupSelections::default())),
         }
     }
 }
@@ -125,11 +181,11 @@ impl RuleSet {
         )
     }
 
-    /// Parse rules with validated provider payloads and statically resolved proxy-group actions.
+    /// Parse rules with validated provider payloads and proxy-group definitions.
     pub(crate) fn parse_with_rule_providers_and_groups(
         lines: &[String],
         proxy_names: &[String],
-        group_actions: &HashMap<String, RouteAction>,
+        group_definitions: &HashMap<String, ProxyGroupDefinition>,
         rule_providers: &HashMap<String, Vec<String>>,
     ) -> Result<Self, RuleError> {
         let mut expanded_lines = Vec::with_capacity(lines.len());
@@ -156,20 +212,26 @@ impl RuleSet {
                     name: fields[1].to_owned(),
                 });
             };
-            parse_action(fields[2], index, proxy_names, group_actions)?;
+            parse_action(fields[2], index, proxy_names, group_definitions)?;
             expanded_lines.extend(payload.iter().map(|rule| format!("{rule},{}", fields[2])));
         }
 
-        Self::parse_expanded_with_proxies(&expanded_lines, proxy_names, group_actions)
+        Self::parse_expanded_with_proxies(&expanded_lines, proxy_names, group_definitions)
     }
 
     fn parse_expanded_with_proxies(
         lines: &[String],
         proxy_names: &[String],
-        group_actions: &HashMap<String, RouteAction>,
+        group_definitions: &HashMap<String, ProxyGroupDefinition>,
     ) -> Result<Self, RuleError> {
         if lines.is_empty() {
-            return Ok(Self::default());
+            let default = Self::default();
+            return Ok(Self {
+                rules: default.rules,
+                proxy_groups: Arc::new(RwLock::new(ProxyGroupSelections::from_definitions(
+                    group_definitions,
+                ))),
+            });
         }
 
         let mut rules = Vec::with_capacity(lines.len() + 1);
@@ -283,18 +345,23 @@ impl RuleSet {
 
             rules.push(RoutingRule {
                 matcher,
-                action: parse_action(action_field, index, proxy_names, group_actions)?,
+                action: parse_action(action_field, index, proxy_names, group_definitions)?,
             });
         }
 
         if !has_match {
             rules.push(RoutingRule {
                 matcher: Matcher::Any,
-                action: RouteAction::Direct,
+                action: RuleAction::Fixed(RouteAction::Direct),
             });
         }
 
-        Ok(Self { rules })
+        Ok(Self {
+            rules,
+            proxy_groups: Arc::new(RwLock::new(ProxyGroupSelections::from_definitions(
+                group_definitions,
+            ))),
+        })
     }
 
     /// Evaluate rules in source order; the first matching rule wins.
@@ -311,8 +378,58 @@ impl RuleSet {
         self.rules
             .iter()
             .find(|rule| rule.matches(target, source))
-            .map(|rule| rule.action.clone())
+            .map(|rule| self.resolve_action(&rule.action))
             .unwrap_or(RouteAction::Direct)
+    }
+
+    /// Select a configured member for a group in this ruleset.
+    /// Clones of the same ruleset share selections; separate rulesets do not.
+    pub fn select_proxy_group_member(&self, group: &str, member: &str) -> Result<(), RuleError> {
+        let mut selections = self
+            .proxy_groups
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(definition) = selections.definitions.get(group) else {
+            return Err(RuleError::UnknownProxyGroup {
+                name: group.to_owned(),
+            });
+        };
+        if !definition
+            .members
+            .iter()
+            .any(|candidate| candidate == member)
+        {
+            return Err(RuleError::InvalidProxyGroupMember {
+                group: group.to_owned(),
+                member: member.to_owned(),
+            });
+        }
+        selections
+            .selected
+            .insert(group.to_owned(), member.to_owned());
+        Ok(())
+    }
+
+    /// Return the currently selected member for a configured group, if present.
+    pub fn selected_proxy_group_member(&self, group: &str) -> Option<String> {
+        self.proxy_groups
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .selected
+            .get(group)
+            .cloned()
+    }
+
+    fn resolve_action(&self, action: &RuleAction) -> RouteAction {
+        match action {
+            RuleAction::Fixed(action) => action.clone(),
+            RuleAction::ProxyGroup(name) => self
+                .proxy_groups
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .resolve(name, &mut HashSet::new())
+                .unwrap_or(RouteAction::Reject),
+        }
     }
 
     pub fn rule_count(&self) -> usize {
@@ -365,15 +482,15 @@ fn parse_action(
     value: &str,
     index: usize,
     proxy_names: &[String],
-    group_actions: &HashMap<String, RouteAction>,
-) -> Result<RouteAction, RuleError> {
+    group_definitions: &HashMap<String, ProxyGroupDefinition>,
+) -> Result<RuleAction, RuleError> {
     match value {
-        "DIRECT" => Ok(RouteAction::Direct),
-        "REJECT" => Ok(RouteAction::Reject),
+        "DIRECT" => Ok(RuleAction::Fixed(RouteAction::Direct)),
+        "REJECT" => Ok(RuleAction::Fixed(RouteAction::Reject)),
         name if proxy_names.iter().any(|proxy_name| proxy_name == name) => {
-            Ok(RouteAction::Proxy(name.to_owned()))
+            Ok(RuleAction::Fixed(RouteAction::Proxy(name.to_owned())))
         }
-        name if group_actions.contains_key(name) => Ok(group_actions[name].clone()),
+        name if group_definitions.contains_key(name) => Ok(RuleAction::ProxyGroup(name.to_owned())),
         other => Err(RuleError::UnsupportedAction {
             index,
             action: other.to_owned(),

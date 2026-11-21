@@ -1,6 +1,6 @@
 # Compatibility ledger
 
-`rust-mhm` 当前只在本项目自己的严格 YAML 配置中实现部分 Mihomo 风格规则、有限 TCP 出站、静态 `select` 组解析及 SOCKS5 UDP ASSOCIATE 的有限入站/代理出站切片。它不是完整 Mihomo 配置解析器，也没有完整规则、DNS、动态代理组或完整数据面；“支持”只表示所列有限行为在本仓库实现并有本地测试覆盖。
+`rust-mhm` 当前只在本项目自己的严格 YAML 配置中实现部分 Mihomo 风格规则、有限 TCP 出站、有限 `select` 组解析与进程内手动选择状态，以及 SOCKS5 UDP ASSOCIATE 的有限入站/代理出站切片。它不是完整 Mihomo 配置解析器，也没有完整规则、DNS、服务级组控制 API 或完整数据面；“支持”只表示所列有限行为在本仓库实现并有本地测试覆盖。
 
 ## 当前规则子集
 
@@ -18,18 +18,19 @@
 | `MATCH` | 支持 | 匹配所有剩余请求；显式出现时必须是唯一且最后一条规则。 |
 | `RULE-SET` | 有限支持 | 支持 `type: inline`/`file`/`http`，`behavior: classical`/`domain`/`ipcidr`；HTTP/HTTPS provider 支持持久原文缓存、离线缓存回退、按秒刷新间隔和自定义请求头，file provider 可按秒重新读取本地文件。只有新内容与完整路由表都通过校验才切换活动路由；失败时保留旧表。引用处动作覆盖 provider 内容。classical 内容仅能使用本项目已实现的规则类型。缓存/刷新不是完整 Mihomo 生命周期兼容。 |
 
-规则依配置顺序评估，首个匹配决定动作。动作可为 `DIRECT`（TCP 直连或入站 UDP 直连）、`REJECT`（TCP 在拨号前返回 SOCKS5 `REP=0x02`；UDP 数据报静默丢弃）、已声明的代理名，或静态组名。`proxy-groups[].name` 在加载时折叠到其选中成员最终对应的动作，因此规则不会保存可变的组引用。UDP 具名 SOCKS5 代理动作通过上游 UDP ASSOCIATE 转发；HTTP 代理 UDP 动作会丢弃，不会回退直连。代理和组引用必须精确匹配已声明名称；重复名称及保留名称 `DIRECT`/`REJECT` 不接受。
+规则依配置顺序评估，首个匹配决定动作。动作可为 `DIRECT`（TCP 直连或入站 UDP 直连）、`REJECT`（TCP 在拨号前返回 SOCKS5 `REP=0x02`；UDP 数据报静默丢弃）、已声明的代理名，或组名。组名在规则中保留为符号化动作，并在每次路由时依该 `RuleSet` 当前进程内选择解析；嵌套选择同样按当前状态递归。UDP 具名 SOCKS5 代理动作通过上游 UDP ASSOCIATE 转发；HTTP 代理 UDP 动作会丢弃，不会回退直连。代理和组引用必须精确匹配已声明名称；重复名称及保留名称 `DIRECT`/`REJECT` 不接受。
 
-## 静态代理组子集
+## `select` 代理组子集
 
 | 能力 | 状态 | 当前行为与边界 |
 |---|---|---|
 | `type: select` | 有限支持 | 严格配置接受组名、`type`、非空 `proxies` 和可选 `default-selected`；不接受未实现的额外 Mihomo 字段。 |
 | 组成员 | 有限支持 | 可引用配置代理、其他组、`DIRECT` 或 `REJECT`；允许前向引用和嵌套引用，拒绝未知/重复成员、组名冲突及任何引用环路。 |
-| 默认成员 | 有限支持 | 成员匹配 `default-selected` 时选中该项；缺省或不属于该组的值时取首成员。嵌套组在加载时递归折叠为最终路由动作。 |
-| 动态选择与其他策略 | 不支持 | 无运行时切换/API、`url-test`、`fallback`、`load-balance`、健康检查、过滤器或自动策略。 |
+| 默认成员 | 有限支持 | 成员匹配 `default-selected` 时初始化为该项；缺省或不属于该组的值时取首成员。嵌套组会在每次路由时按当前选择递归解析。 |
+| 手动选择状态 | 有限支持 | `RuleSet` 提供进程内 `select_proxy_group_member` / `selected_proxy_group_member` 方法；校验成员后更新选择。同一 `RuleSet` 的克隆共享状态，独立调用 `Config::routing_rules()` 创建的实例隔离；不持久化，现有 CLI/服务没有组控制入口。 |
+| 自动策略组 | 不支持 | 无 `url-test`、`fallback`、`load-balance`、健康检查或组过滤器。 |
 
-这只是配置加载时的静态解析，不表示 Mihomo 的组运行时语义兼容。静态选择值后续不能通过控制接口更改；没有依据推断任何动态组能力。
+手动选择只改变库内 `RuleSet` 的进程内选择状态；它不是 Mihomo 控制 API、现有 CLI/服务的运行时管理接口或持久化配置。该有限模型不代表完整 Mihomo 组运行时语义兼容。
 
 ## 当前入站认证
 
@@ -57,7 +58,7 @@
 - 没有规则时，或列表未写 `MATCH` 时，本项目会追加 `MATCH,DIRECT`。这是本项目的 fallback 约定，不代表完整 Mihomo 的默认值。
 - 顶层只识别 `listen`、`connect_timeout_ms`、`max_connections`、`rules`、`rule-providers`、`proxies`、静态 `proxy-groups` 子集、`authentication`、`skip-auth-prefixes`。`rule-providers` 是受限的 `inline`/`file`/`http` 子集；`mixed-port`、未实现的组类型/字段和完整 DNS 配置等仍会失败。
 - `RULE-SET` 的 file provider 在启动时读取相对配置文件或绝对路径，并可按 `interval` 周期重新读取；file 与 HTTP 响应均限制为 4 MiB，并支持有限 YAML `payload` 或逐行 UTF-8 文本。HTTP provider 只允许无 URL 凭据的 HTTP/HTTPS URL，要求成功状态，完整下载受 `connect_timeout_ms` 限制；无自定义请求头时最多跟随 5 次重定向，配置官方单数 `header` 时禁用重定向以避免敏感头被转发。`header` 的每个头名可对应单个字符串或字符串列表。HTTP 数据会原子写入显式 `path`（相对配置目录或绝对路径）或默认 `.rust-mhm-cache/` 缓存；缓存不能直接覆盖配置文件，也不能被多个 provider 共用。显式路径可写至配置目录外，因此只应使用可信配置。联网失败时仅回退到经规则校验的已有缓存，否则启动失败。file/HTTP `interval` 均为 1–31536000 秒，默认一天；后台刷新仅在新 payload 和完整路由表均通过校验后切换活动路由，文件缺失、超限、下载失败或内容无效时保留旧规则。库调用方需使用 `Config::load_async`，CLI 已使用异步加载；仅含 file provider 的配置也可使用 `Config::load`。MRS/自定义格式、`size-limit`、完整 provider 语义和整个配置文件热重载未实现；`classical` 中未实现的规则类型会报错。`Config::from_yaml_str` 不接受 file 或 HTTP provider；`Config::load` 不接受 HTTP provider。
-- 运行时手动切换、故障转移、负载均衡等动态代理组策略、DNS 策略、HTTP 代理 UDP 出站、UDP 分片、完整 Mihomo UDP 配置、透明代理与 TUN 均未实现。
+- 面向现有服务的代理组控制 API、故障转移、负载均衡等自动策略、DNS 策略、HTTP 代理 UDP 出站、UDP 分片、完整 Mihomo UDP 配置、透明代理与 TUN 均未实现。
 
 ## 官方参考
 
@@ -67,7 +68,7 @@
 - [Mihomo 官方 Proxy 配置文档](https://wiki.metacubex.one/en/config/proxies/) 与[配置语法手册](https://wiki.metacubex.one/en/handbook/syntax/)：上游出站配置参考；本项目使用不同 YAML 子集，不代表相同语义或完整支持。
 - [Mihomo 官方 Proxy Groups 通用字段文档](https://wiki.metacubex.one/en/config/proxy-groups/)：组可引用代理或其他组；`default-selected` 缺省或找不到组内节点时使用首成员。本项目只采纳该默认成员规则的静态子集。
 - [Mihomo 官方 Select 组文档](https://wiki.metacubex.one/en/config/proxy-groups/select/)：`select` 组语法参考；本项目只接受严格字段子集，不包含其余上游配置项。
-- [Mihomo 官方 API 文档](https://wiki.metacubex.one/en/api/)：运行时可通过 `/proxies/{proxies_name}` 的 `PUT` 选择节点；本项目未实现该控制 API 或动态选择状态。
+- [Mihomo 官方 API 文档](https://wiki.metacubex.one/en/api/)：运行时可通过 `/proxies/{proxies_name}` 的 `PUT` 选择节点；本项目只实现库内进程手动选择状态，未实现该服务控制 API。
 - [Mihomo 官方全局配置](https://wiki.metacubex.one/en/config/general/)：`authentication` 与 `skip-auth-prefixes` 参考；本项目只支持全局认证列表及来源 CIDR 豁免的 SOCKS5 子集。
 - [Mihomo 官方 SOCKS 入站文档](https://wiki.metacubex.one/en/config/inbound/listeners/socks/)：监听器级 `users` 覆盖语义参考，当前未实现。
 - [Mihomo 官方 Rule Providers 文档](https://wiki.metacubex.one/en/config/rule-providers/) 与[内容格式说明](https://wiki.metacubex.one/en/config/rule-providers/content/)：官方文档说明 provider 生命周期、请求头和 classical/domain/ipcidr 内容格式；本项目只实现受限的缓存与刷新子集，不支持完整生命周期、MRS/自定义格式或全部上游语义。

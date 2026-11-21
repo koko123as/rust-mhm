@@ -35,8 +35,9 @@
 
 - [x] HTTP CONNECT 出站，支持可选 Basic 认证；本地假代理端到端验证隧道和转发。
 - [x] SOCKS5 TCP CONNECT 出站，支持无认证或用户名/密码认证；本地假代理端到端验证。
-- [x] 严格配置支持静态 `select` 组子集：代理/组前向及嵌套引用、`DIRECT`/`REJECT`、成员与名称校验、引用环路检测；配置加载时按有效 `default-selected` 或首成员折叠为既有路由动作，并可用于规则及 `RULE-SET` 动作。
-- [ ] 运行时手动切换、选择 API、`url-test`、`fallback`、`load-balance` 与健康检查；当前静态解析不保留可变组状态，也不代表完整 Mihomo 组兼容。
+- [x] 严格配置支持有限 `select` 组子集：代理/组前向及嵌套引用、`DIRECT`/`REJECT`、成员与名称校验、引用环路检测；`default-selected` 无效或缺省时回退首成员，组名可用于规则及 `RULE-SET` 动作。
+- [x] 核心库的 `RuleSet` 保留可变进程内选择状态，并提供手动选择/读取成员方法；嵌套组及 `RULE-SET` 组动作按当前选择解析。克隆共享状态，独立构建的 `RuleSet` 隔离。
+- [ ] 服务级组控制 API、状态持久化、`url-test`、`fallback`、`load-balance` 与健康检查；现有 CLI/服务没有手动选择入口，有限库模型不代表完整 Mihomo 组兼容。
 - [ ] 扩展真实 Mihomo 代理类型及协议互操作测试；当前代理 schema 是严格子集。
 - [ ] 重试与多级代理尚未实现。
 
