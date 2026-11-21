@@ -43,7 +43,8 @@
 
 - [ ] 单独设计 DNS 解析策略、缓存和与 IP 规则的交互边界。
 - [x] SOCKS5 入站 `UDP ASSOCIATE` 的有限切片：控制 TCP 生命周期、loopback relay、IPv4/IPv6/域名目标、逐数据报规则判定与 DIRECT UDP 往返；只接收控制 peer 的来源 IP，固定客户端 UDP 端点；非 DIRECT、畸形与分片数据报均丢弃。
-- [ ] SOCKS5/HTTP 代理 UDP 出站、UDP 分片、完整 Mihomo UDP 入站配置及与 DNS 策略的交互。
+- [x] 有限 SOCKS5 UDP 代理出站：按数据报策略选择具名 SOCKS5 上游，持有 UDP ASSOCIATE TCP 控制连接，目标域名交给代理解析；队列有界，失败不回退 DIRECT。
+- [ ] HTTP 代理 UDP、UDP 分片、完整 Mihomo UDP 入站配置及与 DNS 策略的交互。
 - [ ] DNS、连接监控和控制 API 各自拆阶段；未实现前明确显示不支持。
 
 ## Phase 5 — 平台数据面与产品集成

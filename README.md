@@ -68,9 +68,9 @@ rules:
 
 HTTP 响应必须成功且不超过 4 MiB；完整请求及流式下载受 `connect_timeout_ms` 超时限制，最多跟随 5 次重定向。每个 HTTP provider 会将响应原文原子写入缓存：可用 `path` 指定位置（相对配置文件目录或绝对路径），省略时写入配置目录下 `.rust-mhm-cache/` 的 provider 专属文件。缓存路径不得直接覆盖配置文件，也不能被多个 provider 共用；由于自定义路径可能写入配置目录以外的位置，只应加载可信配置。启动时先尝试联网；若下载失败，则回退到已存在且通过校验的缓存，没有有效缓存时启动失败。`file` 与 `http` 的 `interval` 均以秒为单位，默认 86400，允许 1 到 31536000 秒；候选内容与整套路由规则都验证通过后，才会原子更新运行中的路由表。读取、下载或校验失败时继续使用旧规则，file provider 的缺失或超限文件也不会清空当前活动规则。缓存写入失败只记录警告，当前进程仍采用通过校验的新规则；若随后离线重启，缓存可能还是上一份快照。可用官方单数 `header` 字段设置一个或多个 HTTP 请求头值；为避免自定义凭据被转发给重定向站点，带自定义头的 provider 不跟随重定向。CLI 使用异步配置加载；库调用方可使用 `Config::load_async`，仅使用 file provider 的场景也可用 `Config::load`。MRS/自定义格式、完整 Mihomo provider 语义和整个配置文件热重载仍未实现。
 
-代理类型目前只支持 `http`（HTTP CONNECT 隧道，不是通用正向 HTTP 转发，也不支持 TLS-to-proxy）和 `socks5`（SOCKS5 TCP CONNECT）。规则的第三列用代理名选择出站，例如 `MATCH,upstream`。省略规则时按本项目约定使用 `MATCH,DIRECT`。
+代理类型目前只支持 `http`（HTTP CONNECT 隧道，不是通用正向 HTTP 转发，也不支持 TLS-to-proxy）和 `socks5`（TCP CONNECT，以及入站 UDP 数据报使用的有限 UDP ASSOCIATE）。HTTP 代理没有 UDP 转发能力。规则的第三列用代理名选择出站，例如 `MATCH,upstream`。省略规则时按本项目约定使用 `MATCH,DIRECT`。
 
-SOCKS5 入站现支持有限的 RFC 1928 `UDP ASSOCIATE`：为每个已认证的 TCP 控制连接建立 loopback UDP relay，控制连接关闭时结束关联；仅允许来自控制连接客户端 IP 的数据报，并在首个合法数据报后固定客户端 UDP 端点。IPv4、IPv6 和域名目标按每个数据报应用路由规则；只有 `DIRECT` 会转发，`REJECT` 与具名代理动作会丢弃，绝不会回退直连。UDP 分片、SOCKS5/HTTP 代理 UDP 出站、DNS 策略、Mihomo 的 `udp` 配置字段及完整入站语义均未实现。relay 地址仍限制在 loopback；远端 UDP 出站通过临时系统端口发送，只把已联系目标的响应转回客户端。
+SOCKS5 入站现支持有限的 RFC 1928 `UDP ASSOCIATE`：为每个已认证的 TCP 控制连接建立 loopback UDP relay，控制连接关闭时结束关联；仅允许来自控制连接客户端 IP 的数据报，并在首个合法数据报后固定客户端 UDP 端点。IPv4、IPv6 和域名目标按每个数据报应用路由规则：`DIRECT` 通过临时系统 UDP socket 发送，具名 SOCKS5 代理使用上游 `UDP ASSOCIATE`（域名交给代理端解析）；`REJECT` 与 HTTP 代理 UDP 动作会丢弃，绝不回退直连。上游 SOCKS5 控制连接随入站关联保持，队列有界。UDP 分片、HTTP 代理 UDP 出站、DNS 策略、Mihomo 的 `udp` 配置字段及完整入站语义均未实现；畸形和分片帧也会丢弃。relay 地址仍限制在 loopback。
 
 `skip-auth-prefixes` 命中时将协商无认证方法；该功能应谨慎配置，避免把不可信来源列入豁免范围。SOCKS5 入站认证和 SOCKS5 出站认证按 RFC 1929 传输明文凭据，因此仅应在可信本机网络使用。**仍未实现：** HTTP 入站、HTTPS/其他代理出站、代理组、Mihomo DNS 策略、TUN、订阅、REST API、UI 与 Android 服务。IP-CIDR 不会为域名目标先行解析。该项目不接受完整 Mihomo YAML；见 [兼容性台账](COMPATIBILITY.md)。
 
@@ -104,4 +104,4 @@ SOCKS5 子集参考 [RFC 1928](https://www.rfc-editor.org/rfc/rfc1928) 和 [RFC 
 
 ## 验证状态
 
-Linux x86_64 上此前通过格式检查、workspace 全目标编译、73 项 workspace 测试、零警告 Clippy、CLI 帮助检查与 Rust 1.85.0 锁定依赖测试；当前本地工作区已通过核心 crate 的 76 项测试、全目标检查与零警告 Clippy，新增 UDP 改动尚待完整 workspace 和 CI 验证。提交 `e7cba48` 的 [GitHub Actions 跨平台 run](https://github.com/koko123as/rust-mhm/actions/runs/44945822264) 与提交 `e7a6184` 的 [file-provider 热重载 run](https://github.com/koko123as/rust-mhm/actions/runs/44946737973) 均已通过 Linux、Windows、macOS 和 Rust 1.85 所有任务。网络测试只使用本地假服务，不依赖外网；Android、真实第三方代理、长时负载及 Android VPN 集成尚未验证。
+Linux x86_64 上提交 `d4bf016` 的 DIRECT-only UDP ASSOCIATE 阶段已通过完整本地门禁和 [Linux、Windows、macOS 与 Rust 1.85 CI](https://github.com/koko123as/rust-mhm/actions/runs/44947943108)。当前 SOCKS5 UDP 代理出站切片已通过格式、workspace 全目标检查、78 项 workspace 测试、零警告 Clippy、CLI 帮助和 Rust 1.85 锁定依赖测试；本阶段跨平台 CI 尚待提交后验证。既有 [file-provider 热重载 CI](https://github.com/koko123as/rust-mhm/actions/runs/44946737973) 也全项通过。网络测试只使用本地假服务，不依赖外网；Android、真实第三方代理、长时负载及 Android VPN 集成尚未验证。

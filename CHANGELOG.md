@@ -2,7 +2,9 @@
 
 ## Unreleased
 
-- 增加受限 SOCKS5 UDP ASSOCIATE 入站：关联随 TCP 控制连接结束，支持 loopback relay、客户端端点固定、IPv4/IPv6/域名目标解析和逐数据报规则判断；仅 DIRECT 转发，REJECT/具名代理/畸形/分片数据报丢弃，不实现代理 UDP 出站。
+- 增加受限 SOCKS5 UDP 代理出站：按数据报路由到具名 SOCKS5 上游，保留目标域名供代理解析，并维持上游 TCP 控制连接直至入站关联结束；HTTP 代理 UDP 与分片仍不支持，也不回退直连。
+- 增加 SOCKS5 UDP ASSOCIATE 认证与上游 relay 协商测试，以及经本地假 SOCKS5 UDP relay 的域名请求/响应端到端测试。
+- 增加受限 SOCKS5 UDP ASSOCIATE 入站：关联随 TCP 控制连接结束，支持 loopback relay、客户端端点固定、IPv4/IPv6/域名目标和逐数据报规则判断；可选择 DIRECT 或具名 SOCKS5 UDP 出站，REJECT/HTTP 代理/畸形/分片数据报丢弃且不回退直连。
 - 增加 UDP 帧解析、地址族、端点绑定、loopback 回环和控制连接生命周期测试，并验证 REJECT 与代理路由不泄漏为 DIRECT。
 - 本地 file rule-provider 支持可选 `interval`（默认 24 小时，范围 1–31536000 秒）周期重读；只有文件读取、载荷及完整路由校验成功后才更新活动路由，畸形、超限或暂时缺失的文件会保留旧路由。
 - Windows HTTP provider 缓存替换改用 `MoveFileExW` 的替换标志，确保刷新可覆盖已有快照；缓存冲突路径比较适配 Windows 大小写不敏感语义，并增加跨平台覆盖测试及 Windows 条件测试。

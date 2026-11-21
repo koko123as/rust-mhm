@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
@@ -10,7 +10,7 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional},
     net::{TcpListener, TcpStream, UdpSocket},
-    sync::{Semaphore, watch},
+    sync::{Semaphore, mpsc, watch},
     task::JoinSet,
     time::{Instant, sleep_until, timeout},
 };
@@ -268,6 +268,7 @@ async fn handle_connection_with_rules(
             client,
             timeouts,
             routing,
+            outbounds,
             peer,
             (request.target.port != 0).then_some(request.target.port),
         )
@@ -455,6 +456,7 @@ async fn handle_udp_association(
     mut client: TcpStream,
     timeouts: ConnectionTimeouts,
     routing: watch::Receiver<Arc<RuleSet>>,
+    outbounds: Arc<Vec<ProxyOutbound>>,
     peer: SocketAddr,
     expected_client_port: Option<u16>,
 ) -> io::Result<()> {
@@ -483,18 +485,14 @@ async fn handle_udp_association(
             None
         }
     };
-    if egress_v4.is_none() && egress_v6.is_none() {
-        send_reply(&mut client, REP_GENERAL_FAILURE, None).await?;
-        return Err(io::Error::new(
-            io::ErrorKind::AddrNotAvailable,
-            "no UDP egress socket could be bound",
-        ));
-    }
-
     send_reply(&mut client, REP_SUCCEEDED, Some(relay.local_addr()?)).await?;
 
     let mut client_endpoint = None;
     let mut allowed_destinations = VecDeque::new();
+    let mut proxy_sessions: HashMap<String, (u64, mpsc::Sender<Vec<u8>>)> = HashMap::new();
+    let mut proxy_tasks = JoinSet::<(String, u64)>::new();
+    let (proxy_response_sender, mut proxy_responses) = mpsc::channel::<Vec<u8>>(256);
+    let mut next_proxy_session_id = 0u64;
     let mut relay_buffer = vec![0u8; 65_535];
     let mut v4_buffer = vec![0u8; 65_535];
     let mut v6_buffer = vec![0u8; 65_535];
@@ -528,7 +526,67 @@ async fn handle_udp_association(
                     RouteAction::Direct => {}
                     RouteAction::Reject => continue,
                     RouteAction::Proxy(name) => {
-                        debug!(proxy = %name, "dropping UDP datagram; UDP proxying is not implemented");
+                        let Some(proxy) = outbounds.iter().find(|proxy| proxy.name == name) else {
+                            debug!(proxy = %name, "dropping UDP datagram; configured proxy was not found");
+                            continue;
+                        };
+                        if proxy.kind != "socks5" {
+                            debug!(proxy = %name, "dropping UDP datagram; this proxy type has no UDP transport");
+                            continue;
+                        }
+                        if !proxy_sessions.contains_key(&name) {
+                            let association = timeout(timeouts.connect, proxy.udp_associate()).await;
+                            let (control, proxy_relay) = match association {
+                                Ok(Ok(association)) => association,
+                                Ok(Err(error)) => {
+                                    debug!(proxy = %name, error = %error, "could not establish SOCKS5 UDP association");
+                                    continue;
+                                }
+                                Err(_) => {
+                                    debug!(proxy = %name, "SOCKS5 UDP association timed out");
+                                    continue;
+                                }
+                            };
+                            next_proxy_session_id = next_proxy_session_id.wrapping_add(1);
+                            let session_id = next_proxy_session_id;
+                            let proxy_name = name.clone();
+                            let (request_sender, requests) = mpsc::channel(64);
+                            let responses = proxy_response_sender.clone();
+                            proxy_tasks.spawn(async move {
+                                run_proxy_udp_association(
+                                    control,
+                                    proxy_relay,
+                                    requests,
+                                    responses,
+                                )
+                                .await;
+                                (proxy_name, session_id)
+                            });
+                            proxy_sessions.insert(name.clone(), (session_id, request_sender));
+                        }
+                        let Some(packet) = encode_udp_target_datagram(&datagram.target, datagram.payload) else {
+                            continue;
+                        };
+                        let Some((session_id, sender)) = proxy_sessions
+                            .get(&name)
+                            .map(|(session_id, sender)| (*session_id, sender.clone()))
+                        else {
+                            continue;
+                        };
+                        match sender.try_send(packet) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                debug!(proxy = %name, "dropping UDP datagram; proxy queue is full");
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                if proxy_sessions
+                                    .get(&name)
+                                    .is_some_and(|(active_id, _)| *active_id == session_id)
+                                {
+                                    proxy_sessions.remove(&name);
+                                }
+                            }
+                        }
                         continue;
                     }
                 }
@@ -579,6 +637,25 @@ async fn handle_udp_association(
                     &v4_buffer[..length],
                 ).await?;
             },
+            result = proxy_responses.recv() => {
+                if let (Some(packet), Some(endpoint)) = (result, client_endpoint) {
+                    relay.send_to(&packet, endpoint).await?;
+                }
+            },
+            result = proxy_tasks.join_next(), if !proxy_tasks.is_empty() => {
+                match result {
+                    Some(Ok((name, session_id))) => {
+                        if proxy_sessions
+                            .get(&name)
+                            .is_some_and(|(active_id, _)| *active_id == session_id)
+                        {
+                            proxy_sessions.remove(&name);
+                        }
+                    }
+                    Some(Err(error)) => warn!(error = %error, "SOCKS5 UDP proxy session task failed"),
+                    None => {}
+                }
+            },
             result = async {
                 match egress_v6.as_ref() {
                     Some(socket) => socket.recv_from(&mut v6_buffer).await,
@@ -593,6 +670,49 @@ async fn handle_udp_association(
                     source,
                     &v6_buffer[..length],
                 ).await?;
+            },
+        }
+    }
+}
+
+async fn run_proxy_udp_association(
+    mut control: TcpStream,
+    proxy_relay: UdpSocket,
+    mut requests: mpsc::Receiver<Vec<u8>>,
+    responses: mpsc::Sender<Vec<u8>>,
+) {
+    let mut control_byte = [0u8; 1];
+    let mut response_buffer = vec![0u8; 65_535];
+    loop {
+        tokio::select! {
+            result = control.read(&mut control_byte) => match result {
+                Ok(0) => return,
+                Ok(_) => {},
+                Err(error) => {
+                    debug!(error = %error, "SOCKS5 UDP proxy control connection failed");
+                    return;
+                }
+            },
+            request = requests.recv() => match request {
+                Some(packet) => {
+                    if let Err(error) = proxy_relay.send(&packet).await {
+                        debug!(error = %error, "could not send UDP datagram to SOCKS5 proxy relay");
+                        return;
+                    }
+                }
+                None => return,
+            },
+            result = proxy_relay.recv(&mut response_buffer) => match result {
+                Ok(length) if decode_udp_datagram(&response_buffer[..length]).is_some() => {
+                    if let Err(error) = responses.try_send(response_buffer[..length].to_vec()) {
+                        debug!(error = %error, "dropping SOCKS5 proxy UDP response; response queue is unavailable");
+                    }
+                }
+                Ok(_) => debug!("dropping malformed or fragmented SOCKS5 proxy UDP response"),
+                Err(error) => {
+                    debug!(error = %error, "SOCKS5 proxy UDP relay failed");
+                    return;
+                }
             },
         }
     }
@@ -641,6 +761,40 @@ fn decode_udp_datagram(packet: &[u8]) -> Option<UdpDatagram<'_>> {
         target: RequestTarget { host, port },
         payload: &packet[cursor..],
     })
+}
+
+fn encode_udp_target_datagram(target: &RequestTarget, payload: &[u8]) -> Option<Vec<u8>> {
+    let address_size = match &target.host {
+        TargetHost::Ip(IpAddr::V4(_)) => 4,
+        TargetHost::Ip(IpAddr::V6(_)) => 16,
+        TargetHost::Domain(domain) if !domain.is_empty() && domain.len() <= u8::MAX as usize => {
+            1 + domain.len()
+        }
+        TargetHost::Domain(_) => return None,
+    };
+    let header_size = 3 + 1 + address_size + 2;
+    if header_size + payload.len() > MAX_ENCAPSULATED_UDP_PACKET_SIZE {
+        return None;
+    }
+    let mut packet = Vec::with_capacity(header_size + payload.len());
+    packet.extend_from_slice(&[0, 0, 0]);
+    match &target.host {
+        TargetHost::Ip(IpAddr::V4(address)) => {
+            packet.push(0x01);
+            packet.extend_from_slice(&address.octets());
+        }
+        TargetHost::Ip(IpAddr::V6(address)) => {
+            packet.push(0x04);
+            packet.extend_from_slice(&address.octets());
+        }
+        TargetHost::Domain(domain) => {
+            packet.extend_from_slice(&[0x03, domain.len() as u8]);
+            packet.extend_from_slice(domain.as_bytes());
+        }
+    }
+    packet.extend_from_slice(&target.port.to_be_bytes());
+    packet.extend_from_slice(payload);
+    Some(packet)
 }
 
 fn encode_udp_datagram(source: SocketAddr, payload: &[u8]) -> Option<Vec<u8>> {
@@ -1253,6 +1407,14 @@ mod tests {
         let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let echo_address = echo.local_addr().unwrap();
         let proxy_names = vec!["upstream".to_owned()];
+        let outbound = ProxyOutbound {
+            name: "upstream".into(),
+            kind: "http".into(),
+            server: "127.0.0.1".into(),
+            port: 9,
+            username: None,
+            password: None,
+        };
 
         for action in ["REJECT", "upstream"] {
             let rules = RuleSet::parse_with_proxies(
@@ -1262,7 +1424,8 @@ mod tests {
             .unwrap();
             let client_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let client_udp_address = client_udp.local_addr().unwrap();
-            let (mut control, server_task) = start_one_connection_with_rules(rules).await;
+            let (mut control, server_task) =
+                start_one_connection_with_rules_and_outbounds(rules, vec![outbound.clone()]).await;
             negotiate_no_auth(&mut control).await;
             let mut request = vec![SOCKS_VERSION, CMD_UDP_ASSOCIATE, 0, 0x01, 127, 0, 0, 1];
             request.extend_from_slice(&client_udp_address.port().to_be_bytes());
@@ -1282,6 +1445,120 @@ mod tests {
             control.shutdown().await.unwrap();
             server_task.await.unwrap().unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn socks5_proxy_udp_route_preserves_domain_and_relays_response() {
+        let proxy_relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let proxy_relay_address = proxy_relay.local_addr().unwrap();
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            let (mut control, _) = proxy_listener.accept().await.unwrap();
+            let mut greeting = [0u8; 2];
+            control.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [SOCKS_VERSION, 1]);
+            let mut method = [0u8; 1];
+            control.read_exact(&mut method).await.unwrap();
+            assert_eq!(method, [METHOD_NO_AUTH]);
+            control
+                .write_all(&[SOCKS_VERSION, METHOD_NO_AUTH])
+                .await
+                .unwrap();
+
+            let mut request = [0u8; 10];
+            control.read_exact(&mut request).await.unwrap();
+            assert_eq!(request, [0x05, 0x03, 0, 1, 0, 0, 0, 0, 0, 0]);
+            let mut reply = vec![SOCKS_VERSION, REP_SUCCEEDED, 0, 1, 127, 0, 0, 1];
+            reply.extend_from_slice(&proxy_relay_address.port().to_be_bytes());
+            control.write_all(&reply).await.unwrap();
+
+            let mut request_buffer = [0u8; 1024];
+            let (length, client) = timeout(
+                Duration::from_secs(2),
+                proxy_relay.recv_from(&mut request_buffer),
+            )
+            .await
+            .expect("the proxy relay should receive the routed UDP packet")
+            .unwrap();
+            let request = decode_udp_datagram(&request_buffer[..length]).unwrap();
+            assert_eq!(
+                request.target.host,
+                TargetHost::Domain("private.invalid".into())
+            );
+            assert_eq!(request.target.port, 53);
+            assert_eq!(request.payload, b"dns-query");
+
+            let response = encode_udp_target_datagram(
+                &RequestTarget {
+                    host: TargetHost::Ip("192.0.2.53".parse().unwrap()),
+                    port: 53,
+                },
+                b"dns-answer",
+            )
+            .unwrap();
+            proxy_relay.send_to(&response, client).await.unwrap();
+
+            let mut byte = [0u8; 1];
+            assert_eq!(control.read(&mut byte).await.unwrap(), 0);
+        });
+
+        let proxy_names = vec!["upstream".to_owned()];
+        let rules =
+            RuleSet::parse_with_proxies(&["DST-PORT,53,upstream".into()], &proxy_names).unwrap();
+        let outbound = ProxyOutbound {
+            name: "upstream".into(),
+            kind: "socks5".into(),
+            server: "127.0.0.1".into(),
+            port: proxy_address.port(),
+            username: None,
+            password: None,
+        };
+        let client_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_udp_address = client_udp.local_addr().unwrap();
+        let (mut control, server_task) =
+            start_one_connection_with_rules_and_outbounds(rules, vec![outbound]).await;
+        negotiate_no_auth(&mut control).await;
+        let mut association_request = vec![SOCKS_VERSION, CMD_UDP_ASSOCIATE, 0, 1, 127, 0, 0, 1];
+        association_request.extend_from_slice(&client_udp_address.port().to_be_bytes());
+        control.write_all(&association_request).await.unwrap();
+        let (version, reply, relay_address) = read_reply_with_bound_address(&mut control).await;
+        assert_eq!((version, reply), (SOCKS_VERSION, REP_SUCCEEDED));
+
+        let domain = b"private.invalid";
+        let mut packet = vec![0, 0, 0, 3, domain.len() as u8];
+        packet.extend_from_slice(domain);
+        packet.extend_from_slice(&53u16.to_be_bytes());
+        packet.extend_from_slice(b"dns-query");
+        client_udp.send_to(&packet, relay_address).await.unwrap();
+
+        let mut response_buffer = [0u8; 1024];
+        let (length, source) = timeout(
+            Duration::from_secs(2),
+            client_udp.recv_from(&mut response_buffer),
+        )
+        .await
+        .expect("the SOCKS5 proxy response should return through the inbound relay")
+        .unwrap();
+        assert_eq!(source, relay_address);
+        let response = decode_udp_datagram(&response_buffer[..length]).unwrap();
+        assert_eq!(
+            response.target.host,
+            TargetHost::Ip("192.0.2.53".parse().unwrap())
+        );
+        assert_eq!(response.target.port, 53);
+        assert_eq!(response.payload, b"dns-answer");
+
+        control.shutdown().await.unwrap();
+        timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("closing the inbound control connection should cancel upstream UDP")
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(1), proxy_task)
+            .await
+            .expect("the upstream SOCKS5 control connection should close with the association")
+            .unwrap();
     }
 
     #[tokio::test]
