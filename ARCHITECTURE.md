@@ -26,7 +26,7 @@ DIRECT TCP dial      SOCKS5 REP 0x02 <--------------+
 
 连接及完整代理握手均受统一的 `connect_timeout_ms` 超时约束；拒绝动作不会发起上游连接。
 
-`select` 组配置加载时会校验全部组成员引用与环路，并为每个组创建以 `default-selected`（无效或缺省时取首成员）初始化的选择状态。路由规则保留组名；每次请求按当前选择递归解析为 `DIRECT`、`REJECT` 或具名代理动作。`RuleSet::select_proxy_group_member` 与 `selected_proxy_group_member` 仅操作库内进程状态：同一 `RuleSet` 的克隆共享状态，另一次 `Config::routing_rules()` 创建独立状态。状态不持久化，现有 CLI/服务没有控制入口。
+`select` 组配置加载时会校验全部组成员引用与环路，并为每个组创建以 `default-selected`（无效或缺省时取首成员）初始化的选择状态。路由规则保留组名；每次请求按当前选择递归解析为 `DIRECT`、`REJECT` 或具名代理动作。`RuleSet::select_proxy_group_member` 与 `selected_proxy_group_member` 操作进程内状态：同一 `RuleSet` 的克隆共享状态，另一次 `Config::routing_rules()` 创建独立状态。可选控制模块通过共享路由状态提供 loopback Bearer 认证 API；它不持久化选择，provider 刷新会在组和成员仍存在时继承当前选择，否则回到新配置默认值。
 
 ## 当前 UDP ASSOCIATE 路径
 
@@ -51,18 +51,19 @@ UDP `REJECT` 与不支持 UDP 的 HTTP 代理动作都丢弃，不会回退直�
 - `rust-mhm-core::routing`：纯决策层；处理 `DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`DOMAIN-WILDCARD`、有限的 `DOMAIN-REGEX`、`IP-CIDR`/`IP-CIDR6`、`SRC-IP-CIDR`、`SRC-PORT`、`DST-PORT`，并按原位置展开 inline classical `RULE-SET`；组名作为符号化动作保留，路由时读取进程内选择状态，公开方法可手动更改/读取成员。
 - `rust-mhm-core::outbound`：HTTP CONNECT（可选 Basic 认证）、SOCKS5 TCP CONNECT 与 SOCKS5 UDP ASSOCIATE（可选 RFC 1929 用户名/密码认证）；不实现 HTTP UDP 或代理组。
 - `rust-mhm-core::server`：SOCKS5 入站（可选 RFC 1929 认证）、TCP CONNECT 转发、有限 UDP ASSOCIATE 入站、DIRECT/SOCKS5 UDP 逐数据报路由、客户端端点固定、错误映射与连接并发限制。
+- `rust-mhm-core::control`：可选的 loopback 控制 API；Bearer 密钥保护 `GET /proxies`、`GET /proxies/{name}` 和 `PUT /proxies/{name}`，只读/切换 `select` 组；请求体、并发数和处理时限均有上限。
 - `rust-mhm`：命令行配置加载、日志初始化和服务启动；不承载协议/路由业务。
 
 ## 配置与路由边界
 
-顶层只识别 `listen`、`connect_timeout_ms`、`max_connections`、`rules`、`rule-providers`、`proxies`、`proxy-groups`、`authentication` 与 `skip-auth-prefixes`。`proxy-groups` 仅接受严格的 `type: select` 子集和 `name`、`proxies`、可选 `default-selected` 字段；成员须为已配置代理、组、`DIRECT` 或 `REJECT`，组引用可前向或嵌套，但不能重复、缺失或形成环路。组名不能与代理/其他组冲突。有效 `default-selected` 映射到该成员；缺省或不属于成员的值按已查阅的 Mihomo 文档行为回退到首成员。`RuleSet` 保留可变的进程内选择状态，并在每次路由时解析嵌套组；克隆共享该状态，独立构建的 `RuleSet` 不共享。状态不持久化，现有 CLI/服务未提供组控制入口。`url-test`、`fallback`、`load-balance`、健康检查与过滤器不在该子集内。其余配置严格拒绝未知字段。
+顶层还可选接受 `external-controller` 与 `secret`，二者必须同时设置；控制器地址必须是 loopback IP socket，secret 为 1–256 字节可见 ASCII。`proxy-groups` 仅接受严格的 `type: select` 子集和 `name`、`proxies`、可选 `default-selected` 字段；成员须为已配置代理、组、`DIRECT` 或 `REJECT`，组引用可前向或嵌套，但不能重复、缺失或形成环路。组名不能与代理/其他组冲突。有效 `default-selected` 映射到该成员；缺省或不属于成员的值按已查阅的 Mihomo 文档行为回退到首成员。`RuleSet` 保留可变的进程内选择状态，并在每次路由时解析嵌套组；克隆共享该状态，独立构建的 `RuleSet` 不共享。`url-test`、`fallback`、`load-balance`、健康检查与过滤器不在该子集内。其余配置严格拒绝未知字段。
 
 provider 当前支持 `type: inline`/`file`/`http` 与 `behavior: classical`/`domain`/`ipcidr` 子集；file 相对路径以配置文件目录为基准，启动时读取并可按 `interval` 周期重读。HTTP 类型可使用 HTTP 或 HTTPS URL，并可选 `path`（相对配置目录或绝对缓存路径）、`interval`（秒，默认 86400，范围 1–31536000）及官方单数 `header`（HTTP 头名到单值或值列表的映射）；file/HTTP 的 interval 默认值和范围相同。file/HTTP 数据限 4 MiB，并解析有限 YAML `payload` 或逐行文本。HTTP 启动时先下载；下载失败时回退到有效缓存，无有效缓存则启动失败。成功响应写入原子替换的持久缓存；省略 `path` 时写到配置目录下 `.rust-mhm-cache/` 的 provider 专属文件。缓存路径不得直接覆盖配置文件，provider 之间也不得共用；显式路径可能写到配置目录外，因此配置必须可信。无自定义请求头时最多跟随 5 次重定向；配置了请求头时禁用重定向，避免凭据转发到不同站点。HTTP 请求受 `connect_timeout_ms` 超时约束。CLI 使用 `Config::load_async`；`Config::from_yaml_str` 不接受 file/HTTP，`Config::load` 不接受 HTTP。启动后由后台任务按间隔刷新，只有新 payload 和整套路由均通过校验才切换共享路由表；失败保留当前规则。这里仅有 provider 级刷新，并非整个配置文件热重载；MRS/自定义格式及完整上游 provider 生命周期尚未实现。`authentication` 是 `username:password` 字符串列表；列表非空时通常强制 RFC 1929 子协商。来源 IP 命中 `skip-auth-prefixes` 的 IPv4/IPv6 CIDR 时改为无认证协商。代理对象字段为 `name`、`type`（`http` 或 `socks5`）、`server`、`port` 和可选的成对 `username`/`password`。规则第三列可用 `DIRECT`、`REJECT`、配置中的代理名或组名；组名以符号化动作保留并按当前 `RuleSet` 进程内选择解析，未声明的动作/代理名/组名失败。缺少 `MATCH` 时追加本项目约定的 `MATCH,DIRECT`。
 
-SOCKS5 入站仅在配置非空 `authentication` 且 peer 不匹配豁免 CIDR 时要求 RFC 1929 用户名/密码，登录失败即关闭连接；该子协商本身没有加密。HTTP Basic 和 SOCKS5 用户密码在未加密代理链路上均可被观察，因此应限于可信主机/网络。HTTP 出站使用 HTTP/1.x `CONNECT` 并发送目标 authority；SOCKS5 TCP 与 UDP 出站都将域名地址类型交给代理端解析；DIRECT 域名目标仍由 Tokio/系统解析。HTTP 代理仅有 TCP `CONNECT`；SOCKS5 另支持受限 UDP ASSOCIATE。尚无代理链、健康检查、重试、TLS-to-proxy 或服务级代理组控制 API；UDP 入站/出站和本项目有限的手动 `select` 选择状态均不是完整 Mihomo 配置或语义实现。
+SOCKS5 入站仅在配置非空 `authentication` 且 peer 不匹配豁免 CIDR 时要求 RFC 1929 用户名/密码，登录失败即关闭连接；该子协商本身没有加密。HTTP Basic 和 SOCKS5 用户密码在未加密代理链路上均可被观察，因此应限于可信主机/网络。HTTP 出站使用 HTTP/1.x `CONNECT` 并发送目标 authority；SOCKS5 TCP 与 UDP 出站都将域名地址类型交给代理端解析；DIRECT 域名目标仍由 Tokio/系统解析。HTTP 代理仅有 TCP `CONNECT`；SOCKS5 另支持受限 UDP ASSOCIATE。服务级组控制 API 仅绑定 loopback、使用 Bearer 密钥，支持三个组端点但没有 TLS、WebSocket、持久化或完整 Mihomo 控制面能力；手动 `select` 状态也不是完整 Mihomo 配置或语义实现。
 
 规则层不执行 DNS 查询。`IP-CIDR` 只匹配 SOCKS5 请求中给出的字面目标 IP；`SRC-IP-CIDR` 与 `SRC-PORT` 分别匹配接受连接时取得的客户端 peer IP 与来源端口。域名目标不会为了路由先解析。域名规则接受 ASCII DNS A-label（如 `xn--...`），按小写规范化并去掉一个末尾根点；`DOMAIN-REGEX` 使用 Rust `regex` crate 语法，表达式在配置加载时编译。上述均是本项目约定，不是完整上游行为承诺。HTTP CONNECT 的目标域名另作 ASCII DNS 名校验，以避免未经验证的控制字符进入 HTTP 请求头。
 
 ## 生命周期与资源
 
-监听地址默认并限制为 loopback；每个活动连接或 UDP 关联占用一个有界 semaphore permit 和 Tokio task。服务退出时停止接受连接并取消现有连接任务及 provider 刷新任务。代理出站握手及连接均受配置超时；provider 刷新失败会保留最后一份有效路由表。当前尚无完整配置文件热重载、MRS/自定义格式、HTTP UDP 出站、UDP 分片、TUN 文件描述符、服务级代理组控制 API、`url-test`、`fallback`、`load-balance` 或健康检查。
+监听地址默认并限制为 loopback；每个活动连接或 UDP 关联占用一个有界 semaphore permit 和 Tokio task。服务退出时停止接受连接并取消现有连接任务、provider 刷新任务和控制 API 任务。代理出站握手及连接均受配置超时；provider 刷新失败会保留最后一份有效路由表。当前尚无完整配置文件热重载、MRS/自定义格式、HTTP UDP 出站、UDP 分片、TUN 文件描述符、控制 API 持久化、`url-test`、`fallback`、`load-balance` 或健康检查。

@@ -50,6 +50,10 @@ pub struct Config {
     authentication: Vec<String>,
     #[serde(default, rename = "skip-auth-prefixes")]
     skip_auth_prefixes: Vec<String>,
+    #[serde(default, rename = "external-controller")]
+    external_controller: Option<String>,
+    #[serde(default)]
+    secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -111,6 +115,8 @@ impl Default for Config {
             proxy_groups: Vec::new(),
             authentication: Vec::new(),
             skip_auth_prefixes: Vec::new(),
+            external_controller: None,
+            secret: None,
         }
     }
 }
@@ -184,6 +190,23 @@ impl Config {
         self.listen
             .parse::<SocketAddr>()
             .map_err(|_| ConfigError::InvalidListenAddress(self.listen.clone()))
+    }
+
+    pub(crate) fn external_controller_addr(&self) -> Result<Option<SocketAddr>, ConfigError> {
+        let Some(address) = &self.external_controller else {
+            return Ok(None);
+        };
+        let parsed = address
+            .parse::<SocketAddr>()
+            .map_err(|_| ConfigError::InvalidControllerAddress(address.clone()))?;
+        if !parsed.ip().is_loopback() {
+            return Err(ConfigError::NonLoopbackControllerAddress(address.clone()));
+        }
+        Ok(Some(parsed))
+    }
+
+    pub(crate) fn external_controller_secret(&self) -> Option<String> {
+        self.secret.clone()
     }
 
     pub fn connect_timeout_ms(&self) -> u64 {
@@ -468,6 +491,30 @@ impl Config {
         if !listen_addr.ip().is_loopback() {
             return Err(ConfigError::NonLoopbackListenAddress(self.listen.clone()));
         }
+        match (&self.external_controller, &self.secret) {
+            (None, None) => {}
+            (Some(_), None) => {
+                return Err(ConfigError::InvalidControllerConfig(
+                    "external-controller requires a non-empty secret".to_owned(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(ConfigError::InvalidControllerConfig(
+                    "secret requires external-controller".to_owned(),
+                ));
+            }
+            (Some(_), Some(secret))
+                if secret.is_empty()
+                    || secret.len() > 256
+                    || !secret.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) =>
+            {
+                return Err(ConfigError::InvalidControllerConfig(
+                    "secret must contain 1 to 256 visible ASCII bytes".to_owned(),
+                ));
+            }
+            (Some(_), Some(_)) => {}
+        }
+        let _ = self.external_controller_addr()?;
         if !(MIN_CONNECT_TIMEOUT_MS..=MAX_CONNECT_TIMEOUT_MS).contains(&self.connect_timeout_ms) {
             return Err(ConfigError::InvalidConnectTimeout(self.connect_timeout_ms));
         }
@@ -1292,6 +1339,12 @@ pub enum ConfigError {
     InvalidListenAddress(String),
     #[error("listen address must be a loopback IP address: {0}")]
     NonLoopbackListenAddress(String),
+    #[error("invalid external-controller socket address: {0}")]
+    InvalidControllerAddress(String),
+    #[error("external-controller address must be a loopback IP address: {0}")]
+    NonLoopbackControllerAddress(String),
+    #[error("invalid external-controller configuration: {0}")]
+    InvalidControllerConfig(String),
     #[error(
         "connect_timeout_ms must be between {MIN_CONNECT_TIMEOUT_MS} and {MAX_CONNECT_TIMEOUT_MS}; got {0}"
     )]
@@ -1486,6 +1539,44 @@ mod tests {
     fn rejects_non_loopback_listener() {
         let error = Config::from_yaml_str("listen: '0.0.0.0:1080'\n").unwrap_err();
         assert!(matches!(error, ConfigError::NonLoopbackListenAddress(_)));
+    }
+
+    #[test]
+    fn external_controller_requires_loopback_and_a_visible_ascii_secret() {
+        let config = Config::from_yaml_str(
+            "external-controller: '127.0.0.1:9090'\nsecret: 'local-control-key'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.external_controller_addr().unwrap(),
+            Some("127.0.0.1:9090".parse().unwrap())
+        );
+        assert_eq!(
+            config.external_controller_secret().as_deref(),
+            Some("local-control-key")
+        );
+
+        let ipv6 =
+            Config::from_yaml_str("external-controller: '[::1]:9090'\nsecret: local-control-key\n")
+                .unwrap();
+        assert_eq!(
+            ipv6.external_controller_addr().unwrap(),
+            Some("[::1]:9090".parse().unwrap())
+        );
+
+        for source in [
+            "external-controller: '0.0.0.0:9090'\nsecret: local-key\n",
+            "external-controller: not-a-socket\nsecret: local-key\n",
+            "external-controller: '127.0.0.1:9090'\n",
+            "secret: local-key\n",
+            "external-controller: '127.0.0.1:9090'\nsecret: ''\n",
+            "external-controller: '127.0.0.1:9090'\nsecret: 'has space'\n",
+        ] {
+            assert!(
+                Config::from_yaml_str(source).is_err(),
+                "invalid controller config should be rejected: {source}"
+            );
+        }
     }
 
     #[test]

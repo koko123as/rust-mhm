@@ -10,7 +10,9 @@
 | Crate | 用途 | 当前版本 | 许可证/取舍 |
 |---|---|---:|---|
 | Tokio | TCP listener/stream、异步 I/O、运行时、信号与超时 | 1.54.1 | MIT；只启用本切片需要的 features，不启用 `full`。运行时带来基础调度开销，后续需测量。 |
+| Axum | 可选 loopback 控制 API 的 HTTP 路由、JSON 请求提取与服务器 | 0.8.9（Cargo.lock） | MIT OR Apache-2.0；关闭默认 features，仅启用 `http1`、`json`、`tokio`。控制 API 只操作服务共享的组选择状态。 |
 | Serde | 配置反序列化和严格字段检查 | 1.0.229 | MIT OR Apache-2.0；只作配置模型，不进入数据面。 |
+| serde_json | 控制 API 请求/响应 JSON | 1.0.154（Cargo.lock） | MIT OR Apache-2.0；只用于小型控制面消息，不进入转发数据面。 |
 | yaml_serde | YAML 解码 | 0.10.7 | MIT OR Apache-2.0；采用 YAML 组织维护的实现，避免依赖已停止维护的 `serde_yaml`。 |
 | thiserror | 结构化配置/服务错误 | 2.0.21 | MIT OR Apache-2.0；仅派生错误类型。 |
 | regex | `DOMAIN-REGEX` 规则解析时编译及运行时匹配 | 1.13.2 | MIT OR Apache-2.0；只用于路由规则，不参与转发数据面。 |

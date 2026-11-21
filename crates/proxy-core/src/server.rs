@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
+    future::Future,
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
@@ -17,6 +18,7 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::config::{AuthSkipPrefix, Config, ConfigError};
+use crate::control;
 use crate::outbound::ProxyOutbound;
 use crate::routing::{RequestTarget, RouteAction, RuleSet, TargetHost};
 
@@ -75,6 +77,13 @@ pub enum ServerError {
 
 /// Bind the configured loopback listener and serve until Ctrl-C.
 pub async fn run(config: Config) -> Result<(), ServerError> {
+    run_until(config, tokio::signal::ctrl_c()).await
+}
+
+async fn run_until(
+    config: Config,
+    shutdown_signal: impl Future<Output = io::Result<()>>,
+) -> Result<(), ServerError> {
     let listen_addr = config.listen_addr()?;
     let (routing_sender, routing) = watch::channel(Arc::new(config.routing_rules()?));
     let outbounds = Arc::new(config.proxy_outbounds().to_vec());
@@ -94,6 +103,24 @@ pub async fn run(config: Config) -> Result<(), ServerError> {
         skip_auth_prefixes,
     };
     let mut tasks: JoinSet<io::Result<()>> = JoinSet::new();
+    let mut controller_task = if let Some(controller_addr) = config.external_controller_addr()? {
+        let controller_listener = TcpListener::bind(controller_addr).await?;
+        let bound_address = controller_listener.local_addr()?;
+        let secret = config
+            .external_controller_secret()
+            .expect("validated external-controller configuration has a secret");
+        let controller_routing = routing_sender.subscribe();
+        info!(listen = %bound_address, "loopback control API started");
+        Some(tokio::spawn(control::serve(
+            controller_listener,
+            controller_routing,
+            secret,
+        )))
+    } else {
+        None
+    };
+    let controller_enabled = controller_task.is_some();
+    let mut controller_failure = None;
     let refreshes = config.rule_provider_refreshes();
     if !refreshes.is_empty() {
         let refresh_config = config.clone();
@@ -103,7 +130,6 @@ pub async fn run(config: Config) -> Result<(), ServerError> {
             Ok(())
         });
     }
-    let shutdown_signal = tokio::signal::ctrl_c();
     tokio::pin!(shutdown_signal);
 
     info!(
@@ -139,11 +165,35 @@ pub async fn run(config: Config) -> Result<(), ServerError> {
                 info!("shutdown requested");
                 break;
             }
+            result = async {
+                controller_task
+                    .as_mut()
+                    .expect("controller task is enabled")
+                    .await
+            }, if controller_enabled => {
+                controller_failure = Some(controller_exit_error(result));
+                break;
+            }
         }
     }
 
     tasks.shutdown().await;
+    if let Some(task) = controller_task.take() {
+        task.abort();
+        let _ = task.await;
+    }
+    if let Some(error) = controller_failure {
+        return Err(error.into());
+    }
     Ok(())
+}
+
+fn controller_exit_error(result: Result<io::Result<()>, tokio::task::JoinError>) -> io::Error {
+    match result {
+        Ok(Ok(())) => io::Error::other("control API stopped unexpectedly"),
+        Ok(Err(error)) => error,
+        Err(error) => io::Error::other(error),
+    }
 }
 
 fn try_spawn_connection(
@@ -199,6 +249,8 @@ async fn refresh_rule_provider_loop(
             match config.refresh_rule_provider(name).await {
                 Ok(()) => match config.routing_rules() {
                     Ok(updated_rules) => {
+                        let previous_rules = Arc::clone(&routing.borrow());
+                        updated_rules.inherit_proxy_group_selections_from(&previous_rules);
                         routing.send_replace(Arc::new(updated_rules));
                         info!(provider = %name, "rule-provider refreshed");
                     }
@@ -1075,6 +1127,214 @@ mod tests {
             }
         });
         (address, task)
+    }
+
+    async fn unused_loopback_address() -> SocketAddr {
+        TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn live_control_api_changes_socks_routing_and_shutdown_releases_listeners() {
+        let listen_address = unused_loopback_address().await;
+        let controller_address = unused_loopback_address().await;
+        let config = Config::from_yaml_str(&format!(
+            "listen: '{listen_address}'\nexternal-controller: '{controller_address}'\nsecret: local-test-secret\nproxy-groups:\n  - name: selected\n    type: select\n    proxies: [DIRECT, REJECT]\nrules:\n  - MATCH,selected\n"
+        ))
+        .unwrap();
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        let shutdown_signal = async move {
+            shutdown_receiver.await.map_err(io::Error::other)?;
+            Ok(())
+        };
+        let server = tokio::spawn(run_until(config, shutdown_signal));
+        let client = reqwest::Client::new();
+        let group_url = format!("http://{controller_address}/proxies/selected");
+        let initial = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(response) = client
+                    .get(&group_url)
+                    .bearer_auth("local-test-secret")
+                    .send()
+                    .await
+                {
+                    if response.status().is_success() {
+                        break response;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("control API should become available");
+        let initial: serde_json::Value =
+            serde_json::from_str(&initial.text().await.unwrap()).unwrap();
+        assert_eq!(initial["now"], "DIRECT");
+
+        let response = client
+            .put(&group_url)
+            .bearer_auth("local-test-secret")
+            .header("content-type", "application/json")
+            .body(r#"{"name":"REJECT"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+
+        let mut socks = TcpStream::connect(listen_address).await.unwrap();
+        socks
+            .write_all(&[SOCKS_VERSION, 1, METHOD_NO_AUTH])
+            .await
+            .unwrap();
+        let mut method = [0; 2];
+        socks.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [SOCKS_VERSION, METHOD_NO_AUTH]);
+        socks
+            .write_all(&[SOCKS_VERSION, CMD_CONNECT, 0, 0x01, 127, 0, 0, 1, 0, 80])
+            .await
+            .unwrap();
+        assert_eq!(
+            read_reply(&mut socks).await,
+            (SOCKS_VERSION, REP_CONNECTION_NOT_ALLOWED)
+        );
+
+        shutdown_sender.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("service should shut down")
+            .unwrap()
+            .unwrap();
+        let listener = TcpListener::bind(controller_address).await.unwrap();
+        drop(listener);
+        let listener = TcpListener::bind(listen_address).await.unwrap();
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn controller_abnormal_exit_is_reported_as_a_service_error() {
+        let unexpected_stop = tokio::spawn(async { Ok::<(), io::Error>(()) }).await;
+        assert!(
+            controller_exit_error(unexpected_stop)
+                .to_string()
+                .contains("stopped unexpectedly")
+        );
+
+        let failed_stop =
+            tokio::spawn(async { Err::<(), _>(io::Error::other("listener failed")) }).await;
+        assert_eq!(
+            controller_exit_error(failed_stop).to_string(),
+            "listener failed"
+        );
+
+        let pending = tokio::spawn(async { std::future::pending::<io::Result<()>>().await });
+        pending.abort();
+        assert_eq!(
+            controller_exit_error(pending.await).kind(),
+            io::ErrorKind::Other
+        );
+    }
+
+    #[tokio::test]
+    async fn control_selection_survives_scheduled_provider_refresh() {
+        let directory = std::env::temp_dir().join(format!(
+            "rust-mhm-control-refresh-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let provider_path = directory.join("provider.rules");
+        std::fs::write(&provider_path, "payload:\n  - DOMAIN-SUFFIX,old.example\n").unwrap();
+        let config_path = directory.join("config.yaml");
+        std::fs::write(
+            &config_path,
+            "proxy-groups:\n  - name: selected\n    type: select\n    proxies: [DIRECT, REJECT]\n    default-selected: REJECT\nrule-providers:\n  local:\n    type: file\n    behavior: classical\n    path: provider.rules\n    interval: 1\nrules:\n  - RULE-SET,local,REJECT\n  - MATCH,selected\n",
+        )
+        .unwrap();
+
+        let config = Config::load_async(&config_path).await.unwrap();
+        let refreshes = config.rule_provider_refreshes();
+        let (sender, mut routing) = watch::channel(Arc::new(config.routing_rules().unwrap()));
+        let controller_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let controller_address = controller_listener.local_addr().unwrap();
+        let controller = tokio::spawn(control::serve(
+            controller_listener,
+            sender.subscribe(),
+            "local-test-secret".to_owned(),
+        ));
+        let refresh = tokio::spawn(refresh_rule_provider_loop(config, refreshes, sender));
+        let client = reqwest::Client::new();
+        let group_url = format!("http://{controller_address}/proxies/selected");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(response) = client
+                    .get(&group_url)
+                    .bearer_auth("local-test-secret")
+                    .send()
+                    .await
+                {
+                    if response.status().is_success() {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("control API should become available");
+
+        let response = client
+            .put(&group_url)
+            .bearer_auth("local-test-secret")
+            .header("content-type", "application/json")
+            .body(r#"{"name":"DIRECT"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        let new_target = RequestTarget {
+            host: TargetHost::Domain("cdn.new.example".into()),
+            port: 443,
+        };
+        assert_eq!(routing.borrow().route(&new_target), RouteAction::Direct);
+
+        std::fs::write(&provider_path, "payload:\n  - DOMAIN-SUFFIX,new.example\n").unwrap();
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                routing.changed().await.unwrap();
+                if routing.borrow().route(&new_target) == RouteAction::Reject {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("provider refresh should replace the routing table");
+        assert_eq!(
+            routing.borrow().route(&RequestTarget {
+                host: TargetHost::Domain("unmatched.example".into()),
+                port: 443,
+            }),
+            RouteAction::Direct
+        );
+        let response = client
+            .get(&group_url)
+            .bearer_auth("local-test-secret")
+            .send()
+            .await
+            .unwrap();
+        let status: serde_json::Value =
+            serde_json::from_str(&response.text().await.unwrap()).unwrap();
+        assert_eq!(status["now"], "DIRECT");
+
+        refresh.abort();
+        let _ = refresh.await;
+        controller.abort();
+        let _ = controller.await;
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]

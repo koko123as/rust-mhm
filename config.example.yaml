@@ -2,6 +2,10 @@
 listen: "127.0.0.1:1080"
 connect_timeout_ms: 10000
 max_connections: 256
+# Optional: loopback-only control API; both fields are required when enabled.
+# Use a private visible-ASCII secret and restrict access to this config file.
+# external-controller: "127.0.0.1:9090"
+# secret: "replace-with-a-private-token"
 rules:
   - DOMAIN,ads.example,REJECT
   - DOMAIN-SUFFIX,example.org,DIRECT

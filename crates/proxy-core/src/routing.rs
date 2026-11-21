@@ -32,6 +32,13 @@ pub(crate) struct ProxyGroupDefinition {
     pub(crate) default_selected: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyGroupSnapshot {
+    pub name: String,
+    pub selected: String,
+    pub members: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 enum RuleAction {
     Fixed(RouteAction),
@@ -420,6 +427,68 @@ impl RuleSet {
             .cloned()
     }
 
+    /// Return an owned snapshot of the configured selection groups.
+    pub fn proxy_group_snapshots(&self) -> Vec<ProxyGroupSnapshot> {
+        let selections = self
+            .proxy_groups
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut groups = selections
+            .definitions
+            .iter()
+            .filter_map(|(name, definition)| {
+                selections
+                    .selected
+                    .get(name)
+                    .map(|selected| ProxyGroupSnapshot {
+                        name: name.clone(),
+                        selected: selected.clone(),
+                        members: definition.members.clone(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        groups.sort_by(|left, right| left.name.cmp(&right.name));
+        groups
+    }
+
+    /// Return one configured group and its current selection, if it exists.
+    pub fn proxy_group_snapshot(&self, group: &str) -> Option<ProxyGroupSnapshot> {
+        let selections = self
+            .proxy_groups
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let definition = selections.definitions.get(group)?;
+        let selected = selections.selected.get(group)?;
+        Some(ProxyGroupSnapshot {
+            name: group.to_owned(),
+            selected: selected.clone(),
+            members: definition.members.clone(),
+        })
+    }
+
+    /// Preserve valid user selections when replacing rules after a provider refresh.
+    pub(crate) fn inherit_proxy_group_selections_from(&self, previous: &Self) {
+        let previous_selections = previous
+            .proxy_groups
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .selected
+            .clone();
+        let mut current = self
+            .proxy_groups
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (group, selected) in previous_selections {
+            if current
+                .definitions
+                .get(&group)
+                .is_some_and(|definition| definition.members.contains(&selected))
+            {
+                current.selected.insert(group, selected);
+            }
+        }
+    }
+
     fn resolve_action(&self, action: &RuleAction) -> RouteAction {
         match action {
             RuleAction::Fixed(action) => action.clone(),
@@ -635,6 +704,61 @@ mod tests {
             .map(|line| (*line).to_owned())
             .collect::<Vec<_>>();
         RuleSet::parse(&lines).unwrap()
+    }
+
+    #[test]
+    fn refreshed_rules_keep_valid_selections_and_default_when_a_member_disappears() {
+        let lines = vec!["MATCH,selected".to_owned()];
+        let definitions = HashMap::from([(
+            "selected".to_owned(),
+            ProxyGroupDefinition {
+                members: vec!["DIRECT".to_owned(), "REJECT".to_owned()],
+                default_selected: "DIRECT".to_owned(),
+            },
+        )]);
+        let previous = RuleSet::parse_with_rule_providers_and_groups(
+            &lines,
+            &[],
+            &definitions,
+            &HashMap::new(),
+        )
+        .unwrap();
+        previous
+            .select_proxy_group_member("selected", "REJECT")
+            .unwrap();
+
+        let refreshed = RuleSet::parse_with_rule_providers_and_groups(
+            &lines,
+            &[],
+            &definitions,
+            &HashMap::new(),
+        )
+        .unwrap();
+        refreshed.inherit_proxy_group_selections_from(&previous);
+        assert_eq!(
+            refreshed.route(&domain_target("example.org", 443)),
+            RouteAction::Reject
+        );
+
+        let changed_definitions = HashMap::from([(
+            "selected".to_owned(),
+            ProxyGroupDefinition {
+                members: vec!["DIRECT".to_owned()],
+                default_selected: "DIRECT".to_owned(),
+            },
+        )]);
+        let changed = RuleSet::parse_with_rule_providers_and_groups(
+            &lines,
+            &[],
+            &changed_definitions,
+            &HashMap::new(),
+        )
+        .unwrap();
+        changed.inherit_proxy_group_selections_from(&previous);
+        assert_eq!(
+            changed.route(&domain_target("example.org", 443)),
+            RouteAction::Direct
+        );
     }
 
     fn domain_target(domain: &str, port: u16) -> RequestTarget {

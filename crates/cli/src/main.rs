@@ -23,7 +23,7 @@ fn parse_config_path(mut args: impl Iterator<Item = OsString>) -> Result<OsStrin
     };
     if first == "--help" || first == "-h" {
         println!(
-            "Usage: rust-mhm [CONFIG.yaml]\n\nRuns the SOCKS5 TCP proxy with DIRECT, HTTP CONNECT, and SOCKS5 outbounds."
+            "Usage: rust-mhm [CONFIG.yaml]\n\nRuns the SOCKS5 proxy with DIRECT, HTTP CONNECT, and SOCKS5 outbounds. An optional loopback control API can inspect and change select-group members."
         );
         std::process::exit(0);
     }

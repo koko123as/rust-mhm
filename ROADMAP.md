@@ -37,7 +37,8 @@
 - [x] SOCKS5 TCP CONNECT 出站，支持无认证或用户名/密码认证；本地假代理端到端验证。
 - [x] 严格配置支持有限 `select` 组子集：代理/组前向及嵌套引用、`DIRECT`/`REJECT`、成员与名称校验、引用环路检测；`default-selected` 无效或缺省时回退首成员，组名可用于规则及 `RULE-SET` 动作。
 - [x] 核心库的 `RuleSet` 保留可变进程内选择状态，并提供手动选择/读取成员方法；嵌套组及 `RULE-SET` 组动作按当前选择解析。克隆共享状态，独立构建的 `RuleSet` 隔离。
-- [ ] 服务级组控制 API、状态持久化、`url-test`、`fallback`、`load-balance` 与健康检查；现有 CLI/服务没有手动选择入口，有限库模型不代表完整 Mihomo 组兼容。
+- [x] 可选 loopback 组控制 API：Bearer 密钥保护，支持列出组状态和选择成员；请求体、并发和 handler 时限有界。规则 provider 刷新时保留仍然有效的手动选择；若组/成员消失则使用新默认值。
+- [ ] 选择状态持久化、`url-test`、`fallback`、`load-balance`、健康检查与组过滤器；控制 API 目前仅为有限手动 `select` 子集，不代表完整 Mihomo API。
 - [ ] 扩展真实 Mihomo 代理类型及协议互操作测试；当前代理 schema 是严格子集。
 - [ ] 重试与多级代理尚未实现。
 
@@ -47,7 +48,7 @@
 - [x] SOCKS5 入站 `UDP ASSOCIATE` 的有限切片：控制 TCP 生命周期、loopback relay、IPv4/IPv6/域名目标、逐数据报规则判定与 DIRECT UDP 往返；只接收控制 peer 的来源 IP，固定客户端 UDP 端点；非 DIRECT、畸形与分片数据报均丢弃。
 - [x] 有限 SOCKS5 UDP 代理出站：按数据报策略选择具名 SOCKS5 上游，持有 UDP ASSOCIATE TCP 控制连接，目标域名交给代理解析；队列有界，失败不回退 DIRECT。
 - [ ] HTTP 代理 UDP、UDP 分片、完整 Mihomo UDP 入站配置及与 DNS 策略的交互。
-- [ ] DNS、连接监控和控制 API 各自拆阶段；未实现前明确显示不支持。
+- [ ] DNS 策略与连接监控接口另行拆阶段；当前的 loopback 组控制 API 不包含完整运行时监控或通用管理 API。
 
 ## Phase 5 — 平台数据面与产品集成
 
