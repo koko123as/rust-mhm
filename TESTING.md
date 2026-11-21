@@ -27,4 +27,4 @@ cargo +1.85.0 test --workspace --locked
 
 TCP 域名 CIDR 路由切片通过本地完整门禁（103 项测试；格式、workspace 全目标检查、零警告 Clippy、CLI 帮助与 Rust 1.85 锁定测试），并通过 [Linux、Windows、macOS 与 Rust 1.85 CI](https://github.com/koko123as/rust-mhm/actions/runs/44954299373)。
 
-本地 `select` 状态持久化切片通过完整门禁（109 项 workspace 测试；格式、全目标检查、零警告 Clippy、CLI 帮助与 Rust 1.85 锁定测试）；跨平台 CI 尚待本阶段提交触发并完成。
+本地 `select` 状态持久化切片通过完整门禁（109 项 workspace 测试；格式、全目标检查、零警告 Clippy、CLI 帮助与 Rust 1.85 锁定测试），并通过 [Linux、Windows、macOS 与 Rust 1.85 CI](https://github.com/koko123as/rust-mhm/actions/runs/44956259709)。
