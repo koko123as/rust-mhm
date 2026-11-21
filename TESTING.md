@@ -34,3 +34,5 @@ TCP 域名 CIDR 路由切片通过本地完整门禁（103 项测试；格式、
 本地 `select` 状态持久化切片通过完整门禁（109 项 workspace 测试；格式、全目标检查、零警告 Clippy、CLI 帮助与 Rust 1.85 锁定测试），并通过 [Linux、Windows、macOS 与 Rust 1.85 CI](https://github.com/koko123as/rust-mhm/actions/runs/44956259709)。
 
 有限 fallback 切片通过本地完整门禁（118 项 workspace 测试、格式、全目标检查、零警告 Clippy、CLI 帮助与 Rust 1.85 锁定测试）。全候选失败端到端用例使用两台 loopback HTTP 假代理明确返回 502，避免平台临时端口复用竞态；修复后 [Linux、Windows、macOS 与 Rust 1.85 CI](https://github.com/koko123as/rust-mhm/actions/runs/44958214245) 全项通过。
+
+有限 load-balance round-robin 切片通过本地完整门禁（122 项 workspace 测试；格式、workspace 全目标检查、零警告 Clippy、CLI 帮助与 Rust 1.85 锁定测试）。最新工具链 CI 将 `AtomicUsize::fetch_update` 标为弃用后，游标改用 `compare_exchange_weak` 循环；提交 `628ece3` 对应的 [Linux、Windows、macOS 与 Rust 1.85 CI](https://github.com/koko123as/rust-mhm/actions/runs/44959469886) 四项任务全部通过。
