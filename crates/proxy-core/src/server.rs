@@ -272,8 +272,8 @@ async fn probe_url_test_group_once(
     group: &UrlTestGroup,
     clients: &[(String, reqwest::Client)],
     request_timeout: Duration,
-) -> Option<(String, Duration)> {
-    let mut fastest: Option<(String, Duration)> = None;
+) -> Vec<(String, Duration)> {
+    let mut samples = Vec::with_capacity(clients.len());
     for (member, client) in clients {
         let started = Instant::now();
         let response = match timeout(request_timeout, client.get(&group.url).send()).await {
@@ -281,15 +281,28 @@ async fn probe_url_test_group_once(
             _ => continue,
         };
         drop(response);
-        let elapsed = started.elapsed();
-        if fastest
-            .as_ref()
-            .is_none_or(|(_, fastest_elapsed)| elapsed < *fastest_elapsed)
-        {
-            fastest = Some((member.clone(), elapsed));
-        }
+        samples.push((member.clone(), started.elapsed()));
     }
-    fastest
+    samples
+}
+
+fn choose_url_test_member(
+    samples: &[(String, Duration)],
+    previous: Option<(String, bool)>,
+    tolerance: Duration,
+) -> Option<(String, Duration)> {
+    let fastest = samples.iter().min_by_key(|(_, elapsed)| *elapsed)?.clone();
+    let Some((current_member, _)) = previous.filter(|(_, succeeded)| *succeeded) else {
+        return Some(fastest);
+    };
+    let Some(current_sample) = samples.iter().find(|(member, _)| member == &current_member) else {
+        return Some(fastest);
+    };
+    if current_sample.1.saturating_sub(fastest.1) <= tolerance {
+        Some(current_sample.clone())
+    } else {
+        Some(fastest)
+    }
 }
 
 async fn url_test_group_loop(
@@ -304,10 +317,16 @@ async fn url_test_group_loop(
         return;
     }
     loop {
-        match probe_url_test_group_once(&group, &clients, request_timeout).await {
+        let samples = probe_url_test_group_once(&group, &clients, request_timeout).await;
+        let previous = rules.url_test_group_status(&group.name);
+        match choose_url_test_member(&samples, previous.clone(), group.tolerance) {
             Some((member, elapsed)) => {
-                if rules.update_url_test_group_member(&group.name, &member) {
-                    debug!(group = %group.name, member = %member, latency_ms = elapsed.as_millis(), "URL-Test selected the fastest healthy member");
+                if rules.update_url_test_group_member(&group.name, &member)
+                    && previous
+                        .as_ref()
+                        .is_none_or(|(current, succeeded)| current != &member || !succeeded)
+                {
+                    debug!(group = %group.name, member = %member, latency_ms = elapsed.as_millis(), "URL-Test selected a healthy member under tolerance");
                 }
             }
             None => {
@@ -1650,6 +1669,63 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn url_test_tolerance_preserves_a_healthy_member_until_the_boundary_is_exceeded() {
+        let samples = vec![
+            ("near".to_owned(), Duration::from_millis(45)),
+            ("fast".to_owned(), Duration::from_millis(20)),
+            ("far".to_owned(), Duration::from_millis(71)),
+        ];
+        assert_eq!(
+            choose_url_test_member(&samples, None, Duration::from_millis(100)),
+            Some(("fast".to_owned(), Duration::from_millis(20)))
+        );
+        assert_eq!(
+            choose_url_test_member(
+                &samples,
+                Some(("near".to_owned(), false)),
+                Duration::from_millis(100)
+            ),
+            Some(("fast".to_owned(), Duration::from_millis(20)))
+        );
+        assert_eq!(
+            choose_url_test_member(
+                &samples,
+                Some(("near".to_owned(), true)),
+                Duration::from_millis(25)
+            ),
+            Some(("near".to_owned(), Duration::from_millis(45)))
+        );
+        assert_eq!(
+            choose_url_test_member(
+                &samples,
+                Some(("near".to_owned(), true)),
+                Duration::from_millis(24)
+            ),
+            Some(("fast".to_owned(), Duration::from_millis(20)))
+        );
+        assert_eq!(
+            choose_url_test_member(
+                &samples,
+                Some(("far".to_owned(), true)),
+                Duration::from_millis(50)
+            ),
+            Some(("fast".to_owned(), Duration::from_millis(20)))
+        );
+        assert_eq!(
+            choose_url_test_member(
+                &samples,
+                Some(("not-healthy".to_owned(), true)),
+                Duration::from_millis(100)
+            ),
+            Some(("fast".to_owned(), Duration::from_millis(20)))
+        );
+        assert_eq!(
+            choose_url_test_member(&[], Some(("near".to_owned(), true)), Duration::ZERO),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn url_test_chooses_fastest_successful_http_proxy_for_routing() {
         let slow_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1721,9 +1797,12 @@ mod tests {
         let group = config.url_test_groups().pop().unwrap();
         let clients =
             build_url_test_clients(&group, config.proxy_outbounds(), Duration::from_secs(1));
-        let Some((member, _)) =
-            probe_url_test_group_once(&group, &clients, Duration::from_secs(1)).await
-        else {
+        let samples = probe_url_test_group_once(&group, &clients, Duration::from_secs(1)).await;
+        let Some((member, _)) = choose_url_test_member(
+            &samples,
+            rules.url_test_group_status("automatic"),
+            group.tolerance,
+        ) else {
             panic!("authenticated SOCKS5 proxy should pass its URL-Test probe");
         };
         assert_eq!(member, "socks");
@@ -1759,7 +1838,7 @@ mod tests {
         assert!(
             probe_url_test_group_once(&group, &clients, Duration::from_millis(500))
                 .await
-                .is_none()
+                .is_empty()
         );
         assert_eq!(
             rules.route(&RequestTarget {

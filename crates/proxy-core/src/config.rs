@@ -74,6 +74,8 @@ struct ProxyGroupConfig {
     url: Option<String>,
     #[serde(default)]
     interval: Option<u64>,
+    #[serde(default)]
+    tolerance: Option<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +84,7 @@ pub(crate) struct UrlTestGroup {
     pub(crate) members: Vec<String>,
     pub(crate) url: String,
     pub(crate) interval: Duration,
+    pub(crate) tolerance: Duration,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -321,6 +324,7 @@ impl Config {
                         .interval
                         .expect("validated URL-Test group has interval"),
                 ),
+                tolerance: Duration::from_millis(u64::from(group.tolerance.unwrap_or(0))),
             })
             .collect()
     }
@@ -788,9 +792,9 @@ impl Config {
                         group.name, MAX_URL_TEST_INTERVAL_SECS
                     )));
                 }
-            } else if group.url.is_some() || group.interval.is_some() {
+            } else if group.url.is_some() || group.interval.is_some() || group.tolerance.is_some() {
                 return Err(ConfigError::InvalidProxyGroup(format!(
-                    "url and interval are only supported for url-test group {}",
+                    "url, interval, and tolerance are only supported for url-test group {}",
                     group.name
                 )));
             }
@@ -2769,6 +2773,7 @@ rules:
         assert_eq!(groups[0].members, ["first", "DIRECT"]);
         assert_eq!(groups[0].url, "https://www.gstatic.com/generate_204");
         assert_eq!(groups[0].interval, Duration::from_secs(300));
+        assert_eq!(groups[0].tolerance, Duration::ZERO);
         let rules = config.routing_rules().unwrap();
         assert_eq!(
             rules.route(&RequestTarget {
@@ -2792,13 +2797,13 @@ rules:
             "proxy-groups:\n  - { name: fragment, type: url-test, proxies: [DIRECT], url: 'http://example.org/check#fragment', interval: 300 }\n",
             "proxy-groups:\n  - { name: reject-member, type: url-test, proxies: [REJECT], url: 'http://example.org/check', interval: 300 }\n",
             "proxy-groups:\n  - { name: default-member, type: url-test, proxies: [DIRECT], url: 'http://example.org/check', interval: 300, default-selected: DIRECT }\n",
+            "proxy-groups:\n  - { name: misplaced-tolerance, type: select, proxies: [DIRECT], tolerance: 1 }\n",
         ];
         for source in invalid_groups {
             assert!(Config::from_yaml_str(source).is_err(), "accepted: {source}");
         }
 
         for field in [
-            "tolerance: 50",
             "timeout: 1000",
             "lazy: false",
             "expected-status: 204",
@@ -2818,6 +2823,20 @@ rules:
         )
         .unwrap_err();
         assert!(matches!(nested_member, ConfigError::InvalidProxyGroup(_)));
+
+        let maximum_tolerance = Config::from_yaml_str(
+            "proxy-groups:\n  - { name: maximum, type: url-test, proxies: [DIRECT], url: 'http://example.org/check', interval: 300, tolerance: 65535 }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            maximum_tolerance.url_test_groups()[0].tolerance,
+            Duration::from_millis(u64::from(u16::MAX))
+        );
+        let excessive_tolerance = Config::from_yaml_str(
+            "proxy-groups:\n  - { name: excessive, type: url-test, proxies: [DIRECT], url: 'http://example.org/check', interval: 300, tolerance: 65536 }\n",
+        )
+        .unwrap_err();
+        assert!(matches!(excessive_tolerance, ConfigError::Yaml(_)));
     }
 
     #[test]

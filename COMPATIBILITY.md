@@ -27,12 +27,12 @@
 | `type: select` | 有限支持 | 严格配置接受组名、`type`、非空 `proxies` 和可选 `default-selected`；不接受未实现的额外 Mihomo 字段。 |
 | `type: fallback` | 有限支持 | 仅 TCP CONNECT 建立连接时按配置顺序尝试候选；失败才继续，连接成功即停止；`REJECT` 立即终止。嵌套 fallback 展平；没有主动探测、健康状态或运行时故障切换。 |
 | `type: load-balance` | 有限支持 | 仅接受缺省策略或 `strategy: round-robin`；每次路由决策选择并轮换一个有序成员。TCP 失败不在该请求内重试，UDP 每个数据报单独路由；没有健康探测、`url`/`interval`、一致性哈希或粘性会话。同一 `RuleSet` 的克隆共享游标，独立构建实例隔离；provider 刷新仅在组类型和有序成员未变时继承游标，成员或顺序变化则重置。游标为进程内状态，不进入手动选择 API 或状态文件。 |
-| `type: url-test` | 有限支持 | 必须显式给出 HTTP(S) `url` 和 1–31536000 秒 `interval`；仅接受已配置代理或 `DIRECT` 成员。服务启动立即按顺序串行探测，每个请求受 `connect_timeout_ms` 限制，按请求到响应头的耗时选取最短且返回 2xx 的成员，随后在每轮完成后等待 interval；全员失败时保留上次选择。首次探测完成前使用首成员。状态只在进程内，不进状态文件或控制 API。 |
+| `type: url-test` | 有限支持 | 必须显式给出 HTTP(S) `url` 和 1–31536000 秒 `interval`；仅接受已配置代理或 `DIRECT` 成员。可选 `tolerance` 为 0–65535 毫秒、默认 0。服务启动立即按顺序串行探测，每个请求受 `connect_timeout_ms` 限制；首次成功轮选择最快 2xx 成员，之后若当前成员仍成功且延迟不超过最快候选加 tolerance 则保留，否则选最快成功成员；全员失败保留上次选择。当前成员与是否已成功探测只在进程内，组类型及有序成员不变时跨 provider 刷新继承，不进状态文件或控制 API。 |
 | 组成员 | 有限支持 | 普通组可引用配置代理、其他组、`DIRECT` 或 `REJECT`；允许前向引用和嵌套引用，拒绝未知/重复成员、组名冲突及任何引用环路。URL-Test 是例外，只接受具名出站或 `DIRECT`，不接受组、`REJECT` 或 provider 成员。 |
 | 默认成员 | 有限支持 | `select` 成员匹配 `default-selected` 时初始化为该项；缺省或不属于该组的值时取首成员。URL-Test 在首轮成功探测前使用首成员；嵌套组会在每次路由时按当前选择递归解析。 |
 | 手动选择状态 | 有限支持 | `RuleSet` 提供 `select_proxy_group_member` / `selected_proxy_group_member` 方法；校验成员后更新选择。同一 `RuleSet` 的克隆共享状态，独立调用 `Config::routing_rules()` 创建的实例隔离。默认只在进程内生效；显式配置本项目自有 `proxy-group-state-file` 后，可将有效组/成员映射保存为版本化本地 JSON，并在重启时恢复。损坏或过期状态忽略并回退默认；这不是 Mihomo 持久化语义兼容。 |
 | 控制 API | 有限支持 | 仅在显式配置 `external-controller` 与 `secret` 时启用；仅允许 loopback 地址，使用 `Authorization: Bearer <secret>`。实现 `GET /proxies`、`GET /proxies/{name}` 与 `PUT /proxies/{name}`，只列出/切换 `select` 组；fallback 与 load-balance 不作为手动选择状态暴露。请求体最多 4 KiB、最多 32 个并发请求、处理时限 10 秒。 |
-| 其他自动策略语义 | 不支持 | fallback 与 load-balance 不做主动探测或周期健康检查；URL-Test 不支持上游 `tolerance`、`timeout`、`lazy`、`max-failed-times` 等字段，也没有组过滤器、健康状态 API 或完整 Mihomo 策略语义。 |
+| 其他自动策略语义 | 不支持 | fallback 与 load-balance 不做主动探测或周期健康检查；URL-Test 不支持上游 `timeout`、`lazy`、`max-failed-times` 等字段，也没有组过滤器、健康状态 API 或完整 Mihomo 策略语义。 |
 
 本项目的 fallback 只在处理 TCP CONNECT 时尝试建立上游连接；失败则按列表继续，直到成功或候选耗尽。一个 CONNECT 请求内的所有尝试共用配置的 `connect_timeout_ms` 总时限。`REJECT` 会停止后续尝试；UDP 数据报经 fallback 组会被明确丢弃，不会回退直连。该切片不执行周期健康检查，也不识别官方 `url` / `interval` 探测字段。Mihomo 官方文档描述当前节点超时后按顺序选择首个可用节点，并提供 `url`、`interval` 等健康检查相关字段，因此本项目行为范围显著更窄，不能视为等价。
 
@@ -75,7 +75,7 @@
 - [Mihomo 官方 Proxy Groups 通用字段文档](https://wiki.metacubex.one/en/config/proxy-groups/)：组可引用代理或其他组；`default-selected` 缺省或找不到组内节点时使用首成员。本项目只采纳该默认成员规则的静态子集。
 - [Mihomo 官方 Select 组文档](https://wiki.metacubex.one/en/config/proxy-groups/select/)：`select` 组语法参考；本项目只接受严格字段子集，不包含其余上游配置项。
 - [Mihomo 官方 Fallback 组文档](https://wiki.metacubex.one/en/config/proxy-groups/fallback/) 与[代理组通用字段文档](https://wiki.metacubex.one/en/config/proxy-groups/)：官方描述当前节点超时后按顺序选择首个可用节点，并列出 `url` / `interval` 等健康检查字段。本项目只在单次 TCP CONNECT 期间按序尝试连接，不做主动探测或周期健康检查，UDP fallback 明确丢弃。
-- [Mihomo 官方 Url-Test 组文档](https://wiki.metacubex.one/en/config/proxy-groups/url-test/) 与[Proxy Groups 通用字段文档](https://wiki.metacubex.one/en/config/proxy-groups/)：`url` 是健康检查目标，`interval` 以秒计且非零时启用周期测试，`tolerance` 以毫秒计；通用字段还列出默认开启的 `lazy`（组未选中时不测试）、毫秒级 `timeout` 和默认 5 次的 `max-failed-times`。Url-Test 示例使用 `https://www.gstatic.com/generate_204`、300 秒间隔和 50 毫秒 tolerance。本项目目前只支持此台账所述的严格 HTTP(S) URL-Test 子集，不接受其他相关字段。
+- [Mihomo 官方 Url-Test 组文档](https://wiki.metacubex.one/en/config/proxy-groups/url-test/) 与[Proxy Groups 通用字段文档](https://wiki.metacubex.one/en/config/proxy-groups/)：`url` 是健康检查目标，`interval` 以秒计且非零时启用周期测试，`tolerance` 以毫秒计；通用字段还列出默认开启的 `lazy`（组未选中时不测试）、毫秒级 `timeout` 和默认 5 次的 `max-failed-times`。Url-Test 示例使用 `https://www.gstatic.com/generate_204`、300 秒间隔和 50 毫秒 tolerance。上游 [URL-Test 实现](https://github.com/MetaCubeX/mihomo/blob/Meta/adapter/outboundgroup/urltest.go) 将 tolerance 作为 `uint16` 毫秒值；有成功样本的当前快节点会保留，除非缺失/不健康或延迟超过最快候选加上 tolerance。本项目只实现严格 HTTP(S) 子集及可选 `tolerance`（0–65535 毫秒，默认 0），其余 `lazy`、`timeout`、`max-failed-times` 等相关字段仍严格拒绝，不代表完整上游健康检查语义。
 - [Mihomo 官方 Load-Balance 组文档](https://wiki.metacubex.one/en/config/proxy-groups/load-balance/)：描述 `round-robin`、按目标地址的 `consistent-hashing` 与按来源/目标地址并带 10 分钟缓存的 `sticky-sessions`，并提及 `hash-key: in-user`。本项目只实现每次路由决策轮换一次成员的 round-robin 子集；不接受 `url` / `interval` 健康检查字段，不实现哈希、粘性会话或失败后重试。
 - [Mihomo 官方 API 文档](https://wiki.metacubex.one/en/api/)：运行时可通过 `/proxies/{proxies_name}` 的 `PUT` 选择节点；本项目实现了同形的有限 `GET`/`PUT` 组路由，但仅支持 loopback、Bearer 密钥和 `select` 组，不声称完整 API 兼容。
 - [Mihomo 官方全局配置](https://wiki.metacubex.one/en/config/general/)：`authentication` 与 `skip-auth-prefixes` 参考；本项目只支持全局认证列表及来源 CIDR 豁免的 SOCKS5 子集。

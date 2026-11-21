@@ -90,6 +90,7 @@ struct ProxyGroupSelections {
     definitions: HashMap<String, ProxyGroupDefinition>,
     selected: BTreeMap<String, String>,
     url_test_selected: BTreeMap<String, String>,
+    url_test_has_succeeded: BTreeMap<String, bool>,
     persistence_path: Option<PathBuf>,
     round_robin_next: HashMap<String, Arc<AtomicUsize>>,
 }
@@ -115,6 +116,7 @@ impl ProxyGroupSelections {
             definitions: definitions.clone(),
             selected,
             url_test_selected,
+            url_test_has_succeeded: BTreeMap::new(),
             persistence_path: None,
             round_robin_next,
         }
@@ -634,7 +636,25 @@ impl RuleSet {
         selections
             .url_test_selected
             .insert(group.to_owned(), member.to_owned());
+        selections
+            .url_test_has_succeeded
+            .insert(group.to_owned(), true);
         true
+    }
+
+    pub(crate) fn url_test_group_status(&self, group: &str) -> Option<(String, bool)> {
+        let selections = self
+            .proxy_groups
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Some((
+            selections.url_test_selected.get(group)?.clone(),
+            selections
+                .url_test_has_succeeded
+                .get(group)
+                .copied()
+                .unwrap_or(false),
+        ))
     }
 
     #[cfg(test)]
@@ -752,9 +772,26 @@ impl RuleSet {
                 (group.clone(), member.clone())
             })
             .collect();
+        let url_test_has_succeeded = new_definitions
+            .iter()
+            .filter(|(_, definition)| definition.kind == ProxyGroupKind::UrlTest)
+            .filter(|(group, definition)| {
+                previous_state.definitions.get(*group).is_some_and(|old| {
+                    old.kind == ProxyGroupKind::UrlTest
+                        && old.members == definition.members
+                        && previous_state
+                            .url_test_has_succeeded
+                            .get(*group)
+                            .copied()
+                            .unwrap_or(false)
+                })
+            })
+            .map(|(group, _)| (group.clone(), true))
+            .collect();
         previous_state.definitions = new_definitions;
         previous_state.selected = selected;
         previous_state.url_test_selected = url_test_selected;
+        previous_state.url_test_has_succeeded = url_test_has_succeeded;
         previous_state.round_robin_next = round_robin_next;
         drop(previous_state);
         self.proxy_groups = previous.proxy_groups.clone();
@@ -1132,6 +1169,10 @@ mod tests {
             previous.route(&target),
             RouteAction::Proxy("first".to_owned())
         );
+        assert_eq!(
+            previous.url_test_group_status("automatic"),
+            Some(("first".to_owned(), false))
+        );
         assert_eq!(previous.selected_proxy_group_member("automatic"), None);
         assert!(previous.proxy_group_snapshot("automatic").is_none());
         assert!(matches!(
@@ -1140,6 +1181,10 @@ mod tests {
         ));
         assert!(!previous.update_url_test_group_member("automatic", "missing"));
         assert!(previous.update_url_test_group_member("automatic", "second"));
+        assert_eq!(
+            previous.url_test_group_status("automatic"),
+            Some(("second".to_owned(), true))
+        );
         assert_eq!(
             clone.route(&target),
             RouteAction::Proxy("second".to_owned())
@@ -1161,6 +1206,10 @@ mod tests {
             refreshed.route(&target),
             RouteAction::Proxy("second".to_owned())
         );
+        assert_eq!(
+            refreshed.url_test_group_status("automatic"),
+            Some(("second".to_owned(), true))
+        );
 
         let changed_definitions = HashMap::from([(
             "automatic".to_owned(),
@@ -1181,6 +1230,10 @@ mod tests {
         assert_eq!(
             changed.route(&target),
             RouteAction::Proxy("first".to_owned())
+        );
+        assert_eq!(
+            changed.url_test_group_status("automatic"),
+            Some(("first".to_owned(), false))
         );
 
         let directory = tempfile::tempdir().unwrap();

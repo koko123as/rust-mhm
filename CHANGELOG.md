@@ -2,10 +2,10 @@
 
 ## Unreleased
 
-- 新增严格配置的有限 `type: url-test` 组：仅接受 HTTP(S) `url`、必填秒级 `interval` 与具名出站/`DIRECT` 成员，拒绝凭据、片段、未知字段及未实现的上游选项。
-- 服务启动后立即串行探测候选，接受 2xx 响应并选择响应头延迟最低者；每轮结束后等待 interval。全员失败保留上次选择，首次探测完成前使用首成员。
-- URL-Test 自动选择状态与手动 `select` 状态分离；仅在组类型及有序成员不变时跨 provider 刷新继承，不进入控制 API 或 `proxy-group-state-file`。服务关闭会取消探测任务。
-- 新增 HTTP、HTTP 代理与带认证 SOCKS5 代理探测、最低延迟选择、全失败保留、状态隔离/刷新继承、配置拒绝及取消关闭测试；文档明确本切片不是完整 Mihomo 健康检查兼容。
+- 新增严格配置的有限 `type: url-test` 组：仅接受 HTTP(S) `url`、必填秒级 `interval`、可选 `tolerance`（0–65535 毫秒，默认 0）与具名出站/`DIRECT` 成员，拒绝凭据、片段、未知字段及其他未实现的上游选项。
+- 服务启动后立即串行探测候选并记录成功 2xx 响应头延迟；首次成功轮选择最快成员。后续若当前成员仍成功且延迟不超过最快候选加 tolerance 则保留，否则切换到最快成功成员；全员失败保留上次选择。每轮完成后等待 interval。
+- URL-Test 当前成员与成功探测标记和手动 `select` 状态分离；仅在组类型及有序成员不变时跨 provider 刷新继承，不进入控制 API 或 `proxy-group-state-file`。服务关闭会取消探测任务。
+- 新增 HTTP、HTTP 代理与带认证 SOCKS5 代理探测、首次最快、tolerance 边界内保留/超限切换、当前失败切换、全失败保留、状态隔离/刷新继承、配置边界及取消关闭测试；文档明确本切片不是完整 Mihomo 健康检查兼容。
 - 新增严格配置的有限 `type: load-balance` 组：只接受缺省策略或 `strategy: round-robin`，并拒绝未实现策略及 `url`/`interval` 健康检查字段。
 - 每次路由决策只轮换并解析一个有序成员；TCP 本次连接失败不重试其他成员，UDP 按每个数据报重新路由。round-robin 游标为进程内状态，provider 刷新只在组类型和有序成员保持不变时继承。
 - load-balance 不作为控制 API 手动选择组，也不写入 `proxy-group-state-file`；一致性哈希、粘性会话、主动健康检查和完整 Mihomo 自动策略仍未实现。

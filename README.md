@@ -11,7 +11,7 @@
 - `REJECT` 在拨号前返回 SOCKS5 connection-not-allowed；代理握手与连接共用配置的出站超时。
 - 默认监听 `127.0.0.1:1080`，拒绝非 loopback 监听；连接并发有界。
 - 严格配置支持有限 `select`、`fallback` 与 `load-balance` 代理组：`select` 可嵌套引用代理组，`default-selected` 未填写或不是成员时取首成员；`fallback` 只在 TCP CONNECT 建立失败时按配置顺序尝试下一个候选，成功即停止，`REJECT` 候选会终止尝试，嵌套 fallback 会展平；有限 `load-balance` 只实现 round-robin，每次路由决策（包括每个 UDP 数据报）轮换一个成员，失败不会在该次请求内重试。fallback 与 load-balance 没有主动健康探测或完整 Mihomo 自动策略语义；UDP fallback 数据报明确丢弃。核心库和可选 loopback 控制 API 只允许手动选择 `select` 组；API 需 Bearer 密钥。可选 `proxy-group-state-file` 只持久化 `select` 选择；启动只恢复仍有效的成员，损坏或过期条目回退默认。
-- 有限 `url-test` 组只接受已配置出站或 `DIRECT` 成员、HTTP(S) `url` 和必填 `interval`（秒）；启动后按成员顺序串行探测，并在每轮完成后等待配置间隔，每个请求受项目连接超时限制。选择返回 2xx 的最低响应头延迟成员；全员失败保留上次选择，首轮成功前使用首成员。探测运行态不进入 `select` 控制 API 或状态文件；`tolerance`、`timeout`、`lazy`、`max-failed-times` 等上游字段及其他完整 Mihomo 组语义仍未实现。
+- 有限 `url-test` 组只接受已配置出站或 `DIRECT` 成员、HTTP(S) `url`、必填秒级 `interval` 和可选 `tolerance`（0–65535 毫秒，默认 0）；启动后按成员顺序串行探测，并在每轮完成后等待配置间隔，每个请求受项目连接超时限制。首次成功轮选择最低 2xx 响应头延迟成员；之后保留仍探测成功且延迟不超过最快成员加 tolerance 的当前成员，否则切换到最快成功成员；全员失败保留上次选择。探测运行态及是否已成功探测不进入 `select` 控制 API 或状态文件；`timeout`、`lazy`、`max-failed-times` 等上游字段及其他完整 Mihomo 组语义仍未实现。
 - 未知 YAML 字段、代理类型、规则类型、动作、重复代理/组名和未配置的成员引用均显式报错。
 
 配置示例（账号字段是明文配置；实际使用时应限制配置文件权限，不要提交真实凭据）：
@@ -95,7 +95,7 @@ HTTP 响应必须成功且不超过 4 MiB；完整请求及流式下载受 `conn
 
 SOCKS5 入站现支持有限的 RFC 1928 `UDP ASSOCIATE`：为每个已认证的 TCP 控制连接建立 loopback UDP relay，控制连接关闭时结束关联；仅允许来自控制连接客户端 IP 的数据报，并在首个合法数据报后固定客户端 UDP 端点。IPv4、IPv6 和域名目标按每个数据报应用路由规则：`DIRECT` 通过临时系统 UDP socket 发送，具名 SOCKS5 代理使用上游 `UDP ASSOCIATE`（域名交给代理端解析）；`REJECT` 与 HTTP 代理 UDP 动作会丢弃，绝不回退直连。上游 SOCKS5 控制连接随入站关联保持，队列有界。UDP 分片、HTTP 代理 UDP 出站、DNS 策略、Mihomo 的 `udp` 配置字段及完整入站语义均未实现；畸形和分片帧也会丢弃。relay 地址仍限制在 loopback。
 
-`skip-auth-prefixes` 命中时将协商无认证方法；该功能应谨慎配置，避免把不可信来源列入豁免范围。SOCKS5 入站认证和 SOCKS5 出站认证按 RFC 1929 传输明文凭据，因此仅应在可信本机网络使用。**仍未实现：** HTTP 入站、HTTPS/其他代理出站、完整 Mihomo URL-Test 字段与行为、fallback/load-balance 主动健康检查、一致性哈希/粘性会话、完整 Mihomo DNS 策略、TUN、订阅、完整 REST/WebSocket API、UI 与 Android 服务。fallback 只有上述有限 TCP 顺序切换；UDP 数据报会丢弃，不含 `url`/`interval` 探测与周期健康状态。load-balance 只提供每次路由决策一次轮换成员的 round-robin，不会在失败后于同一请求重试。当前只有受密钥保护的 loopback `select` 组状态/切换 API；可选的本地组状态文件是本项目扩展，不是完整 Mihomo 控制面或持久化兼容。域名 CIDR 规则仅有上述 TCP 有界系统解析切片，不提供 DNS 策略、缓存或 hosts/fake-IP。该项目不接受完整 Mihomo YAML；见 [兼容性台账](COMPATIBILITY.md)。
+`skip-auth-prefixes` 命中时将协商无认证方法；该功能应谨慎配置，避免把不可信来源列入豁免范围。SOCKS5 入站认证和 SOCKS5 出站认证按 RFC 1929 传输明文凭据，因此仅应在可信本机网络使用。**仍未实现：** HTTP 入站、HTTPS/其他代理出站、除有限 tolerance 子集外的完整 Mihomo URL-Test 字段与行为、fallback/load-balance 主动健康检查、一致性哈希/粘性会话、完整 Mihomo DNS 策略、TUN、订阅、完整 REST/WebSocket API、UI 与 Android 服务。fallback 只有上述有限 TCP 顺序切换；UDP 数据报会丢弃，不含 `url`/`interval` 探测与周期健康状态。load-balance 只提供每次路由决策一次轮换成员的 round-robin，不会在失败后于同一请求重试。当前只有受密钥保护的 loopback `select` 组状态/切换 API；可选的本地组状态文件是本项目扩展，不是完整 Mihomo 控制面或持久化兼容。域名 CIDR 规则仅有上述 TCP 有界系统解析切片，不提供 DNS 策略、缓存或 hosts/fake-IP。该项目不接受完整 Mihomo YAML；见 [兼容性台账](COMPATIBILITY.md)。
 
 ## 快速开始
 
