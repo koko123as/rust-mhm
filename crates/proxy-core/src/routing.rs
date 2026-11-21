@@ -27,6 +27,7 @@ pub enum RouteAction {
     Direct,
     Reject,
     Proxy(String),
+    Fallback(Vec<RouteAction>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,8 +44,15 @@ pub struct RequestTarget {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProxyGroupDefinition {
+    pub(crate) kind: ProxyGroupKind,
     pub(crate) members: Vec<String>,
     pub(crate) default_selected: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProxyGroupKind {
+    Select,
+    Fallback,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +91,7 @@ impl ProxyGroupSelections {
     fn from_definitions(definitions: &HashMap<String, ProxyGroupDefinition>) -> Self {
         let selected = definitions
             .iter()
+            .filter(|(_, definition)| definition.kind == ProxyGroupKind::Select)
             .map(|(name, definition)| (name.clone(), definition.default_selected.clone()))
             .collect();
         Self {
@@ -96,18 +105,42 @@ impl ProxyGroupSelections {
         if !visiting.insert(name.to_owned()) {
             return None;
         }
-        let Some(selected) = self.selected.get(name) else {
-            visiting.remove(name);
-            return None;
-        };
-        let action = match selected.as_str() {
-            "DIRECT" => Some(RouteAction::Direct),
-            "REJECT" => Some(RouteAction::Reject),
-            member if self.definitions.contains_key(member) => self.resolve(member, visiting),
-            proxy => Some(RouteAction::Proxy(proxy.to_owned())),
-        };
+        let action = self.resolve_group_members(name, visiting);
         visiting.remove(name);
         action
+    }
+
+    fn resolve_group_members(
+        &self,
+        name: &str,
+        visiting: &mut HashSet<String>,
+    ) -> Option<RouteAction> {
+        let definition = self.definitions.get(name)?;
+        match definition.kind {
+            ProxyGroupKind::Select => {
+                let selected = self.selected.get(name)?;
+                self.resolve_member(selected, visiting)
+            }
+            ProxyGroupKind::Fallback => {
+                let mut candidates = Vec::new();
+                for member in &definition.members {
+                    match self.resolve_member(member, visiting)? {
+                        RouteAction::Fallback(mut nested) => candidates.append(&mut nested),
+                        action => candidates.push(action),
+                    }
+                }
+                Some(RouteAction::Fallback(candidates))
+            }
+        }
+    }
+
+    fn resolve_member(&self, member: &str, visiting: &mut HashSet<String>) -> Option<RouteAction> {
+        match member {
+            "DIRECT" => Some(RouteAction::Direct),
+            "REJECT" => Some(RouteAction::Reject),
+            group if self.definitions.contains_key(group) => self.resolve(group, visiting),
+            proxy => Some(RouteAction::Proxy(proxy.to_owned())),
+        }
     }
 }
 
@@ -165,6 +198,8 @@ pub enum RuleError {
     UnknownProxyGroup { name: String },
     #[error("member {member} is not configured in proxy group {group}")]
     InvalidProxyGroupMember { group: String, member: String },
+    #[error("proxy group is not manually selectable: {name}")]
+    ProxyGroupNotSelectable { name: String },
     #[error("could not persist proxy group selection state: {reason}")]
     ProxyGroupStatePersistence { reason: String },
 }
@@ -414,7 +449,10 @@ impl RuleSet {
                     if selections
                         .definitions
                         .get(&group)
-                        .is_some_and(|definition| definition.members.contains(&member))
+                        .is_some_and(|definition| {
+                            definition.kind == ProxyGroupKind::Select
+                                && definition.members.contains(&member)
+                        })
                     {
                         selections.selected.insert(group, member);
                     } else {
@@ -491,6 +529,11 @@ impl RuleSet {
                 name: group.to_owned(),
             });
         };
+        if definition.kind != ProxyGroupKind::Select {
+            return Err(RuleError::ProxyGroupNotSelectable {
+                name: group.to_owned(),
+            });
+        }
         if !definition
             .members
             .iter()
@@ -534,6 +577,9 @@ impl RuleSet {
             .definitions
             .iter()
             .filter_map(|(name, definition)| {
+                if definition.kind != ProxyGroupKind::Select {
+                    return None;
+                }
                 selections
                     .selected
                     .get(name)
@@ -555,6 +601,9 @@ impl RuleSet {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let definition = selections.definitions.get(group)?;
+        if definition.kind != ProxyGroupKind::Select {
+            return None;
+        }
         let selected = selections.selected.get(group)?;
         Some(ProxyGroupSnapshot {
             name: group.to_owned(),
@@ -577,6 +626,7 @@ impl RuleSet {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let selected = new_definitions
             .iter()
+            .filter(|(_, definition)| definition.kind == ProxyGroupKind::Select)
             .map(|(group, definition)| {
                 let member = previous_state
                     .selected
@@ -878,6 +928,7 @@ mod tests {
         let definitions = HashMap::from([(
             "selected".to_owned(),
             ProxyGroupDefinition {
+                kind: ProxyGroupKind::Select,
                 members: vec!["DIRECT".to_owned(), "REJECT".to_owned()],
                 default_selected: "DIRECT".to_owned(),
             },
@@ -920,6 +971,7 @@ mod tests {
         let changed_definitions = HashMap::from([(
             "selected".to_owned(),
             ProxyGroupDefinition {
+                kind: ProxyGroupKind::Select,
                 members: vec!["DIRECT".to_owned()],
                 default_selected: "DIRECT".to_owned(),
             },
@@ -1292,6 +1344,7 @@ mod tests {
         let definitions = HashMap::from([(
             "selected".to_owned(),
             ProxyGroupDefinition {
+                kind: ProxyGroupKind::Select,
                 members: vec!["DIRECT".to_owned(), "REJECT".to_owned()],
                 default_selected: "DIRECT".to_owned(),
             },

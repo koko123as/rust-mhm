@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- 新增严格配置的有限 `type: fallback` 组：TCP CONNECT 建连失败后按配置顺序尝试下一个候选，成功即停止，`REJECT` 会终止尝试，嵌套 fallback 展平。
+- 所有候选共享单个 `connect_timeout_ms` 连接总时限；fallback 遇到 UDP 数据报时明确丢弃，不回退直连。控制 API 与持久化状态仍只处理手动 `select` 组。
+- 新增本地假代理端到端测试，覆盖首候选失败后成功、首候选成功不尝试后续、全部失败、REJECT 终止、嵌套 select 改变后续请求候选及候选共享总时限。
+- 文档明确本切片不含主动健康探测、`url`/`interval` 周期检查或完整 Mihomo fallback 语义；官方差异参考 Mihomo Fallback 与 Proxy Groups 文档。
 - 新增本项目自有可选 `proxy-group-state-file`：以版本化 JSON 保存手动 `select` 选择；相对路径基于配置文件目录，拒绝覆盖配置或 provider 数据文件/缓存。
 - 启动时只恢复当前配置仍存在的组和成员；缺失、损坏、超限或未知/过期状态安全回退默认值。未配置时仍保持进程内状态行为。
 - API 手动切换通过同目录临时文件原子替换状态快照后再更新运行选择；写入失败返回 500 且不改变内存状态。provider 刷新继续继承有效选择。
@@ -16,7 +20,7 @@
 - 控制 API 请求体限制为 4 KiB、并发请求限制为 32、处理时限为 10 秒；配置要求 `external-controller` 与 `secret` 同时设置，且仅允许 loopback IP socket。
 - provider 刷新在新组仍含当前已选成员时继承进程内选择；组或成员被移除时采用新配置默认成员。
 - 新增控制 API 认证、非法/超大请求、服务启动/关闭与真实 SOCKS 路由联动测试，以及手动选择跨 provider 刷新的端到端测试。
-- `url-test`、`fallback`、`load-balance`、健康检查与过滤器仍未实现。
+- 更早阶段尚未实现 `url-test`、`fallback`、`load-balance`、健康检查与过滤器；本轮已新增前述有限 TCP fallback 切片，完整健康探测/自动策略仍待后续实现。
 - 增加受限 SOCKS5 UDP 代理出站：按数据报路由到具名 SOCKS5 上游，保留目标域名供代理解析，并维持上游 TCP 控制连接直至入站关联结束；HTTP 代理 UDP 与分片仍不支持，也不回退直连。
 - 增加 SOCKS5 UDP ASSOCIATE 认证与上游 relay 协商测试，以及经本地假 SOCKS5 UDP relay 的域名请求/响应端到端测试。
 - 增加受限 SOCKS5 UDP ASSOCIATE 入站：关联随 TCP 控制连接结束，支持 loopback relay、客户端端点固定、IPv4/IPv6/域名目标和逐数据报规则判断；可选择 DIRECT 或具名 SOCKS5 UDP 出站，REJECT/HTTP 代理/畸形/分片数据报丢弃且不回退直连。

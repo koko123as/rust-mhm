@@ -39,7 +39,8 @@
 - [x] 核心库的 `RuleSet` 保留可变进程内选择状态，并提供手动选择/读取成员方法；嵌套组及 `RULE-SET` 组动作按当前选择解析。克隆共享状态，独立构建的 `RuleSet` 隔离。
 - [x] 可选 loopback 组控制 API：Bearer 密钥保护，支持列出组状态和选择成员；请求体、并发和 handler 时限有界。规则 provider 刷新时保留仍然有效的手动选择；若组/成员消失则使用新默认值。
 - [x] 可选 `proxy-group-state-file` 本地状态文件：启动只恢复当前配置中仍存在的组及成员，缺失/损坏/过期状态安全回退；API 切换先原子写盘再更新运行状态，写入失败明确报错。
-- [ ] `url-test`、`fallback`、`load-balance`、健康检查与组过滤器；控制 API 仍仅为有限手动 `select` 子集，不代表完整 Mihomo API。
+- [x] 有限 `fallback` 组：TCP CONNECT 建立失败后按序尝试候选、成功即停止、`REJECT` 终止、嵌套 fallback 展平；候选共享一个 `connect_timeout_ms` 总时限；UDP 数据报明确丢弃。端到端覆盖首候选失败/成功、候选全失败、REJECT、嵌套 select 状态变化与总时限。
+- [ ] Mihomo 风格的主动健康探测及周期状态切换、`url-test`、`load-balance` 与组过滤器；当前 fallback 只检查单次 TCP CONNECT 建连结果，不是完整 Mihomo 语义。控制 API 仍仅为有限手动 `select` 子集，不代表完整 Mihomo API。
 - [ ] 扩展真实 Mihomo 代理类型及协议互操作测试；当前代理 schema 是严格子集。
 - [ ] 重试与多级代理尚未实现。
 

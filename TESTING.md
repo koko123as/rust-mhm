@@ -21,7 +21,9 @@ cargo +1.85.0 test --workspace --locked
 
 ## 未覆盖/未验证
 
-尚未覆盖长时间并发压力、通用 DNS 策略/缓存或真实网络故障；TCP 域名 CIDR 仅使用受限系统解析器快照，未验证 DNS 策略、缓存、hosts、fake-IP 或完整 Mihomo 行为。HTTP provider 测试使用 loopback 假服务；file provider 使用临时本地文件；没有基于 Mihomo 配置语料的兼容性测试。file/HTTP provider 的缓存与刷新仅覆盖本项目受限 YAML/逐行文本格式，未验证 MRS、自定义格式、真实远端服务、完整 Mihomo 生命周期或整个配置文件热重载。控制 API 目前仅有 loopback 本地服务测试，未覆盖长时压力、真实 Mihomo 客户端互操作、TLS/WebSocket 或完整控制面；本地组状态文件不代表 Mihomo 持久化语义兼容。状态文件路径冲突测试覆盖配置文件、file provider 数据、HTTP provider 缓存和目录；尚未做断电/系统崩溃后的目录项耐久性测试。URL-test、fallback、load-balance、健康检查与自动策略仍未实现。
+fallback 配置测试覆盖 `default-selected` 拒绝、嵌套 fallback 展平、嵌套 select 解析及 fallback 不进入 select 快照；控制 API 测试确认 fallback 不可手动选择。TCP 假 HTTP CONNECT 代理覆盖首候选失败后次候选成功、首候选成功时不拨后续、全部失败、`REJECT` 终止、运行中的嵌套 select 变化影响后续请求，以及多个候选共享单个 `connect_timeout_ms` deadline。UDP fallback 测试确认组内即使包含 `DIRECT` 也会静默丢弃，不泄漏直连。
+
+尚未覆盖长时间并发压力、通用 DNS 策略/缓存或真实网络故障；TCP 域名 CIDR 仅使用受限系统解析器快照，未验证 DNS 策略、缓存、hosts、fake-IP 或完整 Mihomo 行为。HTTP provider 测试使用 loopback 假服务；file provider 使用临时本地文件；没有基于 Mihomo 配置语料的兼容性测试。file/HTTP provider 的缓存与刷新仅覆盖本项目受限 YAML/逐行文本格式，未验证 MRS、自定义格式、真实远端服务、完整 Mihomo 生命周期或整个配置文件热重载。控制 API 目前仅有 loopback 本地服务测试，未覆盖长时压力、真实 Mihomo 客户端互操作、TLS/WebSocket 或完整控制面；本地组状态文件不代表 Mihomo 持久化语义兼容。状态文件路径冲突测试覆盖配置文件、file provider 数据、HTTP provider 缓存和目录；尚未做断电/系统崩溃后的目录项耐久性测试。当前有限 fallback 仅覆盖本地 TCP CONNECT 建连失败后的顺序尝试，不包含官方 `url`/`interval` 健康探测、周期状态切换、完整 UDP 语义或互操作；`url-test`、`load-balance` 和其他自动策略仍未实现。
 
 本地实际构建环境为 Linux x86_64。提交 `d4bf016` 的 DIRECT-only UDP 阶段已通过格式、workspace 全目标检查、76 项测试、零警告 Clippy、CLI 帮助、Rust 1.85.0 锁定测试和 [Linux、Windows、macOS 与 Rust 1.85 CI](https://github.com/koko123as/rust-mhm/actions/runs/44947943108)。此前 SOCKS5 UDP 代理出站切片的 [Linux、Windows、macOS 与 Rust 1.85 CI](https://github.com/koko123as/rust-mhm/actions/runs/44948797643) 全项通过。上一阶段静态 `select` 组切片通过本地完整门禁（81 项 workspace 测试）与 [Linux、Windows、macOS、Rust 1.85 CI](https://github.com/koko123as/rust-mhm/actions/runs/44949696886)。本阶段进程内手动选择切片通过本地完整门禁（85 项 workspace 测试），并在[本阶段 CI](https://github.com/koko123as/rust-mhm/actions/runs/44950947867) 的 Ubuntu、Windows、macOS、Rust 1.85 四项任务中全部通过。Android 与移动设备未验证；尚无性能基准、负载/长稳测试或真实第三方代理互操作测试。
 

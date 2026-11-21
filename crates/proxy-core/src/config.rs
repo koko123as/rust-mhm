@@ -13,7 +13,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::outbound::ProxyOutbound;
-use crate::routing::{ProxyGroupDefinition, RuleError, RuleSet};
+use crate::routing::{ProxyGroupDefinition, ProxyGroupKind, RuleError, RuleSet};
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:1080";
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 10_000;
@@ -699,15 +699,25 @@ impl Config {
                     group.name
                 )));
             }
-            if group.group_type != "select" {
+            let kind = match group.group_type.as_str() {
+                "select" => ProxyGroupKind::Select,
+                "fallback" => ProxyGroupKind::Fallback,
+                _ => {
+                    return Err(ConfigError::InvalidProxyGroup(format!(
+                        "unsupported group type '{}' for {} (only select and fallback are supported)",
+                        group.group_type, group.name
+                    )));
+                }
+            };
+            if kind == ProxyGroupKind::Fallback && group.default_selected.is_some() {
                 return Err(ConfigError::InvalidProxyGroup(format!(
-                    "unsupported group type '{}' for {} (only select is supported)",
-                    group.group_type, group.name
+                    "default-selected is only supported for select group {}",
+                    group.name
                 )));
             }
             if group.proxies.is_empty() {
                 return Err(ConfigError::InvalidProxyGroup(format!(
-                    "select group {} must contain at least one member",
+                    "proxy group {} must contain at least one member",
                     group.name
                 )));
             }
@@ -745,15 +755,25 @@ impl Config {
             .proxy_groups
             .iter()
             .map(|group| {
-                let default_selected = group
-                    .default_selected
-                    .as_deref()
-                    .filter(|candidate| group.proxies.iter().any(|member| member == *candidate))
-                    .unwrap_or_else(|| group.proxies[0].as_str())
-                    .to_owned();
+                let kind = match group.group_type.as_str() {
+                    "select" => ProxyGroupKind::Select,
+                    "fallback" => ProxyGroupKind::Fallback,
+                    _ => unreachable!("group types are validated before construction"),
+                };
+                let default_selected = if kind == ProxyGroupKind::Select {
+                    group
+                        .default_selected
+                        .as_deref()
+                        .filter(|candidate| group.proxies.iter().any(|member| member == *candidate))
+                        .unwrap_or_else(|| group.proxies[0].as_str())
+                        .to_owned()
+                } else {
+                    group.proxies[0].clone()
+                };
                 (
                     group.name.clone(),
                     ProxyGroupDefinition {
+                        kind,
                         members: group.proxies.clone(),
                         default_selected,
                     },
@@ -2545,6 +2565,82 @@ rules:
     }
 
     #[test]
+    fn fallback_groups_resolve_ordered_candidates_and_nested_select_members() {
+        let config = Config::from_yaml_str(
+            r#"
+proxies:
+  - { name: first, type: http, server: 127.0.0.1, port: 8080 }
+  - { name: second, type: socks5, server: 127.0.0.1, port: 1080 }
+proxy-groups:
+  - name: automatic
+    type: fallback
+    proxies: [first, inner-fallback, DIRECT, REJECT]
+  - name: nested
+    type: select
+    proxies: [second, DIRECT]
+    default-selected: second
+  - name: inner-fallback
+    type: fallback
+    proxies: [nested]
+  - name: outer
+    type: select
+    proxies: [automatic, first]
+    default-selected: automatic
+rules:
+  - DOMAIN,automatic.example,automatic
+  - MATCH,outer
+"#,
+        )
+        .unwrap();
+        let rules = config.routing_rules().unwrap();
+        let target = |domain: &str| RequestTarget {
+            host: TargetHost::Domain(domain.to_owned()),
+            port: 443,
+        };
+        let expected = RouteAction::Fallback(vec![
+            RouteAction::Proxy("first".to_owned()),
+            RouteAction::Proxy("second".to_owned()),
+            RouteAction::Direct,
+            RouteAction::Reject,
+        ]);
+
+        assert_eq!(rules.route(&target("automatic.example")), expected);
+        assert_eq!(rules.route(&target("other.example")), expected);
+        assert_eq!(rules.selected_proxy_group_member("automatic"), None);
+        assert_eq!(rules.proxy_group_snapshot("automatic"), None);
+        assert_eq!(rules.selected_proxy_group_member("inner-fallback"), None);
+        assert_eq!(rules.proxy_group_snapshot("inner-fallback"), None);
+        assert_eq!(
+            rules
+                .proxy_group_snapshots()
+                .into_iter()
+                .map(|group| group.name)
+                .collect::<Vec<_>>(),
+            ["nested", "outer"]
+        );
+        assert!(matches!(
+            rules.select_proxy_group_member("automatic", "first"),
+            Err(RuleError::ProxyGroupNotSelectable { .. })
+        ));
+
+        rules.select_proxy_group_member("nested", "DIRECT").unwrap();
+        assert_eq!(
+            rules.route(&target("automatic.example")),
+            RouteAction::Fallback(vec![
+                RouteAction::Proxy("first".to_owned()),
+                RouteAction::Direct,
+                RouteAction::Direct,
+                RouteAction::Reject,
+            ])
+        );
+        rules.select_proxy_group_member("outer", "first").unwrap();
+        assert_eq!(
+            rules.route(&target("other.example")),
+            RouteAction::Proxy("first".to_owned())
+        );
+    }
+
+    #[test]
     fn manual_selection_updates_nested_groups_and_direct_reject_actions() {
         let config = Config::from_yaml_str(
             r#"
@@ -2709,14 +2805,19 @@ rules:
     }
 
     #[test]
-    fn rejects_invalid_select_group_types_members_names_and_cycles() {
+    fn rejects_invalid_proxy_group_types_members_names_and_cycles() {
         let invalid_groups = [
             "proxy-groups:\n  - { name: empty, type: select, proxies: [] }\n",
+            "proxy-groups:\n  - { name: empty-fallback, type: fallback, proxies: [] }\n",
             "proxy-groups:\n  - { name: unknown, type: select, proxies: [missing] }\n",
             "proxy-groups:\n  - { name: duplicate, type: select, proxies: [DIRECT, DIRECT] }\n",
+            "proxy-groups:\n  - { name: fallback-duplicate, type: fallback, proxies: [DIRECT, DIRECT] }\n",
+            "proxy-groups:\n  - { name: fallback-default, type: fallback, proxies: [DIRECT], default-selected: DIRECT }\n",
             "proxy-groups:\n  - { name: unsupported, type: url-test, proxies: [DIRECT] }\n",
             "proxy-groups:\n  - { name: cycle, type: select, proxies: [cycle] }\n",
+            "proxy-groups:\n  - { name: fallback-cycle, type: fallback, proxies: [fallback-cycle] }\n",
             "proxy-groups:\n  - { name: first, type: select, proxies: [second] }\n  - { name: second, type: select, proxies: [first] }\n",
+            "proxy-groups:\n  - { name: first-fallback, type: fallback, proxies: [second] }\n  - { name: second-select, type: select, proxies: [first-fallback] }\n",
             "proxy-groups:\n  - { name: same, type: select, proxies: [DIRECT] }\n  - { name: same, type: select, proxies: [REJECT] }\n",
             "proxies:\n  - { name: same, type: http, server: localhost, port: 80 }\nproxy-groups:\n  - { name: same, type: select, proxies: [DIRECT] }\n",
             "proxy-groups:\n  - { name: DIRECT, type: select, proxies: [REJECT] }\n",
@@ -2734,6 +2835,12 @@ rules:
         assert!(matches!(
             Config::from_yaml_str(
                 "proxy-groups:\n  - name: strict\n    type: select\n    proxies: [DIRECT]\n    url: https://example.org/\n"
+            ),
+            Err(ConfigError::Yaml(_))
+        ));
+        assert!(matches!(
+            Config::from_yaml_str(
+                "proxy-groups:\n  - name: strict-fallback\n    type: fallback\n    proxies: [DIRECT]\n    url: https://example.org/\n"
             ),
             Err(ConfigError::Yaml(_))
         ));

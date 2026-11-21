@@ -157,6 +157,10 @@ async fn select_proxy_group(
             StatusCode::BAD_REQUEST,
             "member is not configured in this group",
         ),
+        Err(RuleError::ProxyGroupNotSelectable { .. }) => error_response(
+            StatusCode::BAD_REQUEST,
+            "proxy group is not manually selectable",
+        ),
         Err(RuleError::ProxyGroupStatePersistence { reason }) => {
             warn!(group = %group, error = %reason, "could not persist proxy group selection");
             error_response(
@@ -259,6 +263,41 @@ mod tests {
             .unwrap();
         let status: Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
         assert_eq!(status["now"], "REJECT");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fallback_groups_are_not_exposed_as_manually_selectable() {
+        let config = Config::from_yaml_str(
+            "proxy-groups:\n  - { name: selected, type: select, proxies: [DIRECT, REJECT] }\n  - { name: automatic, type: fallback, proxies: [selected, DIRECT] }\nrules:\n  - MATCH,automatic\n",
+        )
+        .unwrap();
+        let (base_url, server, _) = start_controller(config.routing_rules().unwrap()).await;
+        wait_for_server().await;
+        let client = reqwest::Client::new();
+
+        let response = client
+            .get(format!("{base_url}/proxies"))
+            .bearer_auth(TEST_SECRET)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let listing: Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+        assert!(listing["proxies"]["selected"].is_object());
+        assert!(listing["proxies"]["automatic"].is_null());
+
+        let response = client
+            .put(format!("{base_url}/proxies/automatic"))
+            .bearer_auth(TEST_SECRET)
+            .header("content-type", "application/json")
+            .body(r#"{"name":"DIRECT"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+        assert_eq!(body["message"], "proxy group is not manually selectable");
         server.abort();
     }
 

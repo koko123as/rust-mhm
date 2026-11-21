@@ -338,11 +338,22 @@ async fn handle_connection_with_rules(
 
     let routing_table = Arc::clone(&routing.borrow());
     let connect_result = timeout(timeouts.connect, async {
+        let deadline = Instant::now() + timeouts.connect;
         let RouteDecision {
             action,
             resolved_ips,
         } = route_tcp_target(&routing_table, &target, Some(peer)).await?;
         match action {
+            RouteAction::Fallback(candidates) => {
+                connect_fallback_candidates(
+                    &candidates,
+                    &target,
+                    resolved_ips.as_deref(),
+                    &outbounds,
+                    deadline,
+                )
+                .await
+            }
             RouteAction::Direct => connect_target(&target, resolved_ips.as_deref())
                 .await
                 .map(Some),
@@ -379,6 +390,71 @@ async fn handle_connection_with_rules(
     send_reply(&mut client, REP_SUCCEEDED, Some(bound_address)).await?;
     copy_bidirectional(&mut client, &mut upstream).await?;
     Ok(())
+}
+
+async fn connect_fallback_candidates(
+    candidates: &[RouteAction],
+    target: &RequestTarget,
+    resolved_ips: Option<&[IpAddr]>,
+    outbounds: &[ProxyOutbound],
+    deadline: Instant,
+) -> io::Result<Option<TcpStream>> {
+    let mut last_error = None;
+    for (index, candidate) in candidates.iter().enumerate() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let remaining_candidates = u32::try_from(candidates.len() - index).unwrap_or(u32::MAX);
+        let candidate_budget = remaining / remaining_candidates;
+        match timeout(
+            candidate_budget,
+            connect_route_action(candidate, target, resolved_ips, outbounds),
+        )
+        .await
+        {
+            Ok(Ok(Some(stream))) => return Ok(Some(stream)),
+            Ok(Ok(None)) => return Ok(None),
+            Ok(Err(error)) => last_error = Some(error),
+            Err(_) => {
+                last_error = Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "proxy-group fallback candidate timed out",
+                ));
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "proxy-group fallback connection deadline expired",
+        )
+    }))
+}
+
+async fn connect_route_action(
+    action: &RouteAction,
+    target: &RequestTarget,
+    resolved_ips: Option<&[IpAddr]>,
+    outbounds: &[ProxyOutbound],
+) -> io::Result<Option<TcpStream>> {
+    match action {
+        RouteAction::Direct => connect_target(target, resolved_ips).await.map(Some),
+        RouteAction::Reject => Ok(None),
+        RouteAction::Proxy(name) => {
+            let proxy = outbounds
+                .iter()
+                .find(|proxy| proxy.name == *name)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "configured proxy not found")
+                })?;
+            proxy.connect(target).await.map(Some)
+        }
+        RouteAction::Fallback(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "nested fallback candidates were not flattened",
+        )),
+    }
 }
 
 #[derive(Debug)]
@@ -589,6 +665,10 @@ async fn handle_udp_association(
                 match action {
                     RouteAction::Direct => {}
                     RouteAction::Reject => continue,
+                    RouteAction::Fallback(_) => {
+                        debug!("dropping UDP datagram; fallback groups support TCP CONNECT only");
+                        continue;
+                    }
                     RouteAction::Proxy(name) => {
                         let Some(proxy) = outbounds.iter().find(|proxy| proxy.name == name) else {
                             debug!(proxy = %name, "dropping UDP datagram; configured proxy was not found");
@@ -1148,6 +1228,26 @@ mod tests {
         skip_auth_prefixes: Vec<AuthSkipPrefix>,
         handshake_timeout: Duration,
     ) -> (TcpStream, tokio::task::JoinHandle<io::Result<()>>) {
+        start_one_connection_with_timeouts(
+            rules,
+            outbounds,
+            authentication,
+            skip_auth_prefixes,
+            ConnectionTimeouts {
+                connect: Duration::from_secs(2),
+                handshake: handshake_timeout,
+            },
+        )
+        .await
+    }
+
+    async fn start_one_connection_with_timeouts(
+        rules: RuleSet,
+        outbounds: Vec<ProxyOutbound>,
+        authentication: Vec<(String, String)>,
+        skip_auth_prefixes: Vec<AuthSkipPrefix>,
+        timeouts: ConnectionTimeouts,
+    ) -> (TcpStream, tokio::task::JoinHandle<io::Result<()>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (_, routing) = watch::channel(Arc::new(rules));
@@ -1158,10 +1258,7 @@ mod tests {
             let (stream, peer) = listener.accept().await?;
             handle_connection_with_rules(
                 stream,
-                ConnectionTimeouts {
-                    connect: Duration::from_secs(2),
-                    handshake: handshake_timeout,
-                },
+                timeouts,
                 routing,
                 outbounds,
                 authentication,
@@ -1172,6 +1269,57 @@ mod tests {
         });
         let client = TcpStream::connect(address).await.unwrap();
         (client, task)
+    }
+
+    fn fallback_config(
+        proxies: &[(&str, SocketAddr)],
+        groups: &str,
+        connect_timeout_ms: u64,
+    ) -> Config {
+        let mut source = format!("connect_timeout_ms: {connect_timeout_ms}\nproxies:\n");
+        for (name, address) in proxies {
+            source.push_str(&format!(
+                "  - {{ name: {name}, type: http, server: {}, port: {} }}\n",
+                address.ip(),
+                address.port()
+            ));
+        }
+        source.push_str("proxy-groups:\n");
+        source.push_str(groups);
+        source.push_str("rules:\n  - MATCH,failover\n");
+        Config::from_yaml_str(&source).unwrap()
+    }
+
+    fn closed_local_address() -> SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap()
+    }
+
+    async fn start_http_echo_proxy(listener: TcpListener) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                headers.push(stream.read_u8().await.unwrap());
+            }
+            assert!(
+                String::from_utf8(headers)
+                    .unwrap()
+                    .starts_with("CONNECT example.com:443 HTTP/1.1\r\n")
+            );
+            stream
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+            let mut buffer = [0u8; 128];
+            loop {
+                let count = stream.read(&mut buffer).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                stream.write_all(&buffer[..count]).await.unwrap();
+            }
+        })
     }
 
     async fn negotiate_no_auth(client: &mut TcpStream) {
@@ -1879,6 +2027,46 @@ mod tests {
             control.shutdown().await.unwrap();
             server_task.await.unwrap().unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn fallback_udp_route_drops_datagrams_instead_of_using_direct() {
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_address = echo.local_addr().unwrap();
+        let config = Config::from_yaml_str(
+            "proxy-groups:\n  - { name: failover, type: fallback, proxies: [DIRECT, REJECT] }\nrules:\n  - MATCH,failover\n",
+        )
+        .unwrap();
+        let client_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_udp_address = client_udp.local_addr().unwrap();
+        let (mut control, server_task) =
+            start_one_connection_with_rules(config.routing_rules().unwrap()).await;
+        negotiate_no_auth(&mut control).await;
+        let mut request = vec![SOCKS_VERSION, CMD_UDP_ASSOCIATE, 0, 0x01, 127, 0, 0, 1];
+        request.extend_from_slice(&client_udp_address.port().to_be_bytes());
+        control.write_all(&request).await.unwrap();
+        let (version, reply, relay_address) = read_reply_with_bound_address(&mut control).await;
+        assert_eq!((version, reply), (SOCKS_VERSION, REP_SUCCEEDED));
+
+        let packet = udp_request_packet(echo_address, b"fallback-must-drop");
+        client_udp.send_to(&packet, relay_address).await.unwrap();
+        let mut buffer = [0u8; 1024];
+        assert!(
+            timeout(Duration::from_millis(100), echo.recv_from(&mut buffer))
+                .await
+                .is_err()
+        );
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                client_udp.recv_from(&mut buffer)
+            )
+            .await
+            .is_err()
+        );
+
+        control.shutdown().await.unwrap();
+        server_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -2686,6 +2874,261 @@ mod tests {
                 .is_err()
         );
         server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fallback_tries_the_next_proxy_after_the_first_connection_fails() {
+        let success_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let success_address = success_listener.local_addr().unwrap();
+        let success_task = start_http_echo_proxy(success_listener).await;
+        let failed_address = closed_local_address();
+        let config = fallback_config(
+            &[("first", failed_address), ("second", success_address)],
+            "  - { name: failover, type: fallback, proxies: [first, second] }\n",
+            2_000,
+        );
+        let rules = config.routing_rules().unwrap();
+        let outbounds = config.proxy_outbounds().to_vec();
+        let (mut client, server_task) =
+            start_one_connection_with_rules_and_outbounds(rules, outbounds).await;
+
+        negotiate_no_auth(&mut client).await;
+        send_domain_connect(&mut client, "example.com", 443).await;
+        assert_eq!(
+            read_reply(&mut client).await,
+            (SOCKS_VERSION, REP_SUCCEEDED)
+        );
+        client.write_all(b"fallback-ok").await.unwrap();
+        let mut echoed = [0u8; 11];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"fallback-ok");
+        client.shutdown().await.unwrap();
+        server_task.await.unwrap().unwrap();
+        success_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fallback_does_not_try_later_proxies_after_a_success() {
+        let first_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_address = first_listener.local_addr().unwrap();
+        let first_task = start_http_echo_proxy(first_listener).await;
+        let later_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let later_address = later_listener.local_addr().unwrap();
+        let config = fallback_config(
+            &[("first", first_address), ("second", later_address)],
+            "  - { name: failover, type: fallback, proxies: [first, second] }\n",
+            2_000,
+        );
+        let (mut client, server_task) = start_one_connection_with_rules_and_outbounds(
+            config.routing_rules().unwrap(),
+            config.proxy_outbounds().to_vec(),
+        )
+        .await;
+
+        negotiate_no_auth(&mut client).await;
+        send_domain_connect(&mut client, "example.com", 443).await;
+        assert_eq!(
+            read_reply(&mut client).await,
+            (SOCKS_VERSION, REP_SUCCEEDED)
+        );
+        client.shutdown().await.unwrap();
+        server_task.await.unwrap().unwrap();
+        first_task.await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(100), later_listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_reports_failure_when_every_proxy_is_unavailable() {
+        let first = closed_local_address();
+        let second = closed_local_address();
+        assert_ne!(first, second);
+        let config = fallback_config(
+            &[("first", first), ("second", second)],
+            "  - { name: failover, type: fallback, proxies: [first, second] }\n",
+            2_000,
+        );
+        let (mut client, server_task) = start_one_connection_with_rules_and_outbounds(
+            config.routing_rules().unwrap(),
+            config.proxy_outbounds().to_vec(),
+        )
+        .await;
+
+        negotiate_no_auth(&mut client).await;
+        send_domain_connect(&mut client, "example.com", 443).await;
+        assert_eq!(
+            read_reply(&mut client).await,
+            (SOCKS_VERSION, REP_CONNECTION_REFUSED)
+        );
+        assert!(server_task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn fallback_reject_candidate_stops_before_later_proxies() {
+        let later_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let later_address = later_listener.local_addr().unwrap();
+        let config = fallback_config(
+            &[("second", later_address)],
+            "  - { name: failover, type: fallback, proxies: [REJECT, second] }\n",
+            2_000,
+        );
+        let (mut client, server_task) = start_one_connection_with_rules_and_outbounds(
+            config.routing_rules().unwrap(),
+            config.proxy_outbounds().to_vec(),
+        )
+        .await;
+
+        negotiate_no_auth(&mut client).await;
+        send_domain_connect(&mut client, "example.com", 443).await;
+        assert_eq!(
+            read_reply(&mut client).await,
+            (SOCKS_VERSION, REP_CONNECTION_NOT_ALLOWED)
+        );
+        server_task.await.unwrap().unwrap();
+        assert!(
+            timeout(Duration::from_millis(100), later_listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_select_changes_the_fallback_candidate_for_later_connections() {
+        let second_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_address = second_listener.local_addr().unwrap();
+        let second_task = start_http_echo_proxy(second_listener).await;
+        let backup_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backup_address = backup_listener.local_addr().unwrap();
+        let backup_task = start_http_echo_proxy(backup_listener).await;
+        let first_address = closed_local_address();
+        let config_source = format!(
+            "proxies:\n  - {{ name: first, type: http, server: {}, port: {} }}\n  - {{ name: second, type: http, server: {}, port: {} }}\n  - {{ name: backup, type: http, server: {}, port: {} }}\nproxy-groups:\n  - {{ name: chosen, type: select, proxies: [first, second], default-selected: first }}\n  - {{ name: failover, type: fallback, proxies: [chosen, backup] }}\nrules:\n  - MATCH,failover\n",
+            first_address.ip(),
+            first_address.port(),
+            second_address.ip(),
+            second_address.port(),
+            backup_address.ip(),
+            backup_address.port(),
+        );
+        let config = Config::from_yaml_str(&config_source).unwrap();
+        let rules = Arc::new(config.routing_rules().unwrap());
+        let outbounds = Arc::new(config.proxy_outbounds().to_vec());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = listener.local_addr().unwrap();
+        let (routing_sender, routing) = watch::channel(Arc::clone(&rules));
+        let server_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, peer) = listener.accept().await?;
+                handle_connection_with_rules(
+                    stream,
+                    ConnectionTimeouts {
+                        connect: Duration::from_secs(2),
+                        handshake: Duration::from_secs(2),
+                    },
+                    routing.clone(),
+                    Arc::clone(&outbounds),
+                    Arc::new(Vec::new()),
+                    Arc::new(Vec::new()),
+                    peer,
+                )
+                .await?;
+            }
+            Ok::<(), io::Error>(())
+        });
+
+        let mut first_client = TcpStream::connect(proxy_address).await.unwrap();
+        negotiate_no_auth(&mut first_client).await;
+        send_domain_connect(&mut first_client, "example.com", 443).await;
+        assert_eq!(
+            read_reply(&mut first_client).await,
+            (SOCKS_VERSION, REP_SUCCEEDED)
+        );
+        first_client.write_all(b"backup-route").await.unwrap();
+        let mut first_echo = [0u8; 12];
+        first_client.read_exact(&mut first_echo).await.unwrap();
+        assert_eq!(&first_echo, b"backup-route");
+        first_client.shutdown().await.unwrap();
+
+        rules.select_proxy_group_member("chosen", "second").unwrap();
+        let mut second_client = TcpStream::connect(proxy_address).await.unwrap();
+        negotiate_no_auth(&mut second_client).await;
+        send_domain_connect(&mut second_client, "example.com", 443).await;
+        assert_eq!(
+            read_reply(&mut second_client).await,
+            (SOCKS_VERSION, REP_SUCCEEDED)
+        );
+        second_client.write_all(b"selected-route").await.unwrap();
+        let mut second_echo = [0u8; 14];
+        second_client.read_exact(&mut second_echo).await.unwrap();
+        assert_eq!(&second_echo, b"selected-route");
+        second_client.shutdown().await.unwrap();
+
+        drop(routing_sender);
+        server_task.await.unwrap().unwrap();
+        second_task.await.unwrap();
+        backup_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fallback_candidates_share_one_connection_timeout_deadline() {
+        let mut addresses = Vec::new();
+        let mut stalled_tasks = Vec::new();
+        let (attempted_sender, mut attempted_receiver) = mpsc::channel(4);
+        for index in 0..4 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            addresses.push(listener.local_addr().unwrap());
+            let attempted = attempted_sender.clone();
+            stalled_tasks.push(tokio::spawn(async move {
+                let (_stream, _) = listener.accept().await.unwrap();
+                attempted.send(index).await.unwrap();
+                std::future::pending::<()>().await;
+            }));
+        }
+        let config = fallback_config(
+            &[
+                ("first", addresses[0]),
+                ("second", addresses[1]),
+                ("third", addresses[2]),
+                ("fourth", addresses[3]),
+            ],
+            "  - { name: failover, type: fallback, proxies: [first, second, third, fourth] }\n",
+            300,
+        );
+        let (mut client, server_task) = start_one_connection_with_timeouts(
+            config.routing_rules().unwrap(),
+            config.proxy_outbounds().to_vec(),
+            Vec::new(),
+            Vec::new(),
+            ConnectionTimeouts {
+                connect: Duration::from_millis(300),
+                handshake: Duration::from_secs(2),
+            },
+        )
+        .await;
+        let started = Instant::now();
+        negotiate_no_auth(&mut client).await;
+        send_domain_connect(&mut client, "example.com", 443).await;
+        assert_eq!(
+            read_reply(&mut client).await,
+            (SOCKS_VERSION, REP_GENERAL_FAILURE)
+        );
+        assert!(started.elapsed() < Duration::from_millis(900));
+        for expected in 0..4 {
+            assert_eq!(
+                timeout(Duration::from_millis(100), attempted_receiver.recv())
+                    .await
+                    .unwrap(),
+                Some(expected)
+            );
+        }
+        let _ = server_task.await.unwrap();
+        for task in stalled_tasks {
+            task.abort();
+            let _ = task.await;
+        }
     }
 
     #[tokio::test]
