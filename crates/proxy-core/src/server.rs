@@ -1295,6 +1295,21 @@ mod tests {
         listener.local_addr().unwrap()
     }
 
+    async fn start_http_reject_proxy(listener: TcpListener) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                headers.push(stream.read_u8().await.unwrap());
+            }
+            assert!(headers.starts_with(b"CONNECT example.com:443 HTTP/1.1\r\n"));
+            stream
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        })
+    }
+
     async fn start_http_echo_proxy(listener: TcpListener) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -2942,12 +2957,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fallback_reports_failure_when_every_proxy_is_unavailable() {
-        let first = closed_local_address();
-        let second = closed_local_address();
-        assert_ne!(first, second);
+    async fn fallback_reports_failure_when_every_proxy_rejects_connect() {
+        let first_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_address = first_listener.local_addr().unwrap();
+        let first_task = start_http_reject_proxy(first_listener).await;
+        let second_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_address = second_listener.local_addr().unwrap();
+        let second_task = start_http_reject_proxy(second_listener).await;
         let config = fallback_config(
-            &[("first", first), ("second", second)],
+            &[("first", first_address), ("second", second_address)],
             "  - { name: failover, type: fallback, proxies: [first, second] }\n",
             2_000,
         );
@@ -2961,9 +2979,11 @@ mod tests {
         send_domain_connect(&mut client, "example.com", 443).await;
         assert_eq!(
             read_reply(&mut client).await,
-            (SOCKS_VERSION, REP_CONNECTION_REFUSED)
+            (SOCKS_VERSION, REP_GENERAL_FAILURE)
         );
         assert!(server_task.await.unwrap().is_err());
+        first_task.await.unwrap();
+        second_task.await.unwrap();
     }
 
     #[tokio::test]
