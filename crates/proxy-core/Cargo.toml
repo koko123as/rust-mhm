@@ -1,0 +1,12 @@
+[package]
+name = "rust-mhm-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+yaml_serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

@@ -1,0 +1,4 @@
+# This is rust-mhm's limited prototype schema, not a Mihomo config file.
+listen: "127.0.0.1:1080"
+connect_timeout_ms: 10000
+max_connections: 256

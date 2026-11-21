@@ -1,0 +1,16 @@
+[workspace]
+members = ["crates/proxy-core", "crates/cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+tokio = { version = "1.54.1", default-features = false, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+serde = { version = "1.0.229", features = ["derive"] }
+yaml_serde = "0.10.7"
+thiserror = "2.0.21"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
