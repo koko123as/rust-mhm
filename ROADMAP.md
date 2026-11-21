@@ -6,7 +6,11 @@
 
 - [x] 创建 Rust workspace 与核心库/CLI 边界。
 - [x] 选择并记录最小依赖；未知 YAML 字段拒绝处理。
-- [ ] 在本地完成格式检查、编译和测试。
+- [x] Linux x86_64：`cargo fmt --all -- --check` 通过。
+- [x] Linux x86_64：`cargo check --workspace --all-targets` 通过。
+- [x] Linux x86_64：`cargo test --workspace` 通过（10 项）。
+- [x] Linux x86_64：`cargo clippy --workspace --all-targets -- -D warnings` 通过（零警告）。
+- [x] Linux x86_64：`cargo run -q -p rust-mhm -- --help` 通过。
 - [ ] 建立 Linux/Windows/macOS CI；在目标平台实际跑过前不标记为已验证。
 
 ## Phase 1 — SOCKS5 到 DIRECT 的 TCP 切片（当前）

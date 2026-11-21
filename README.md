@@ -50,4 +50,6 @@ SOCKS5 子集按 [RFC 1928](https://www.rfc-editor.org/rfc/rfc1928) 实现。上
 
 ## 验证状态
 
-当前开发环境为 Linux x86_64。本地 Rust 编译与测试将在本轮执行；Windows、macOS、Android、Slint UI 和 Android VPN 集成尚未验证。
+验证环境为 Linux x86_64。本轮已通过 `cargo fmt --all -- --check`、`cargo check --workspace --all-targets`、`cargo test --workspace`（10 项通过）、`cargo clippy --workspace --all-targets -- -D warnings`（零警告）和 `cargo run -q -p rust-mhm -- --help`。
+
+Windows、macOS、Android、Slint UI 和 Android VPN 集成尚未验证；本地通过不代表这些平台已构建或测试。
