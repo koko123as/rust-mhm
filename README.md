@@ -102,4 +102,4 @@ SOCKS5 子集参考 [RFC 1928](https://www.rfc-editor.org/rfc/rfc1928) 和 [RFC 
 
 ## 验证状态
 
-Linux x86_64 上已验证格式检查、workspace 全目标编译、73 项 workspace 测试、零警告 Clippy、CLI 帮助检查与 Rust 1.85.0 锁定依赖测试。提交 `e7cba48` 的 [GitHub Actions 跨平台 run](https://github.com/koko123as/rust-mhm/actions/runs/44945822264) 中 Linux、Windows、macOS 与 Rust 1.85 所有任务均通过；当前 file-provider 热重载改动尚未推送，因此仍待新 CI 验证。网络测试只使用本地假服务，不依赖外网；Android、真实第三方代理、长时负载及 Android VPN 集成尚未验证。
+Linux x86_64 上已验证格式检查、workspace 全目标编译、73 项 workspace 测试、零警告 Clippy、CLI 帮助检查与 Rust 1.85.0 锁定依赖测试。提交 `e7cba48` 的 [GitHub Actions 跨平台 run](https://github.com/koko123as/rust-mhm/actions/runs/44945822264) 与提交 `e7a6184` 的 [file-provider 热重载 run](https://github.com/koko123as/rust-mhm/actions/runs/44946737973) 均已通过 Linux、Windows、macOS 和 Rust 1.85 所有任务。网络测试只使用本地假服务，不依赖外网；Android、真实第三方代理、长时负载及 Android VPN 集成尚未验证.

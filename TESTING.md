@@ -21,4 +21,4 @@ cargo +1.85.0 test --workspace --locked
 
 尚未覆盖长时间并发压力、DNS 策略或真实网络故障。HTTP provider 测试使用 loopback 假服务；file provider 使用临时本地文件；没有基于 Mihomo 配置语料的兼容性测试。file/HTTP provider 的缓存与刷新仅覆盖本项目受限 YAML/逐行文本格式，未验证 MRS、自定义格式、真实远端服务、完整 Mihomo 生命周期或整个配置文件热重载，也不支持代理组。
 
-本地实际构建环境为 Linux x86_64；Rust 1.85.0 的 workspace 锁定测试已通过。提交 `e7cba48` 的 [GitHub Actions run](https://github.com/koko123as/rust-mhm/actions/runs/44945822264) 中 Linux、Windows、macOS 与 Rust 1.85 任务均通过；当前 file-provider 热重载改动仍需后续 CI 验证。Android 与移动设备未验证。尚无性能基准、负载/长稳测试或真实第三方代理互操作测试。
+本地实际构建环境为 Linux x86_64；Rust 1.85.0 的 workspace 锁定测试已通过。提交 `e7cba48` 的 [GitHub Actions run](https://github.com/koko123as/rust-mhm/actions/runs/44945822264) 与提交 `e7a6184` 的 [file-provider 热重载 run](https://github.com/koko123as/rust-mhm/actions/runs/44946737973) 中 Linux、Windows、macOS 与 Rust 1.85 任务均通过。Android 与移动设备未验证。尚无性能基准、负载/长稳测试或真实第三方代理互操作测试.
