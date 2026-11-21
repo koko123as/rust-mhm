@@ -731,6 +731,88 @@ mod tests {
         (address, task)
     }
 
+    async fn start_http_redirect(location: String) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") && request.len() < 16 * 1024 {
+                let mut byte = [0u8; 1];
+                if stream.read_exact(&mut byte).await.is_err() {
+                    return;
+                }
+                request.push(byte[0]);
+            }
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        (address, task)
+    }
+
+    async fn start_chunked_http_response(
+        body: Vec<u8>,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") && request.len() < 16 * 1024 {
+                let mut byte = [0u8; 1];
+                if stream.read_exact(&mut byte).await.is_err() {
+                    return;
+                }
+                request.push(byte[0]);
+            }
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            let chunk_header = format!("{:X}\r\n", body.len());
+            let _ = stream.write_all(chunk_header.as_bytes()).await;
+            let _ = stream.write_all(&body).await;
+            let _ = stream.write_all(b"\r\n0\r\n\r\n").await;
+        });
+        (address, task)
+    }
+
+    async fn start_delayed_http_response(
+        delay: std::time::Duration,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") && request.len() < 16 * 1024 {
+                let mut byte = [0u8; 1];
+                if stream.read_exact(&mut byte).await.is_err() {
+                    return;
+                }
+                request.push(byte[0]);
+            }
+            tokio::time::sleep(delay).await;
+            let body = b"payload:\n  - slow.example\n";
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(headers.as_bytes()).await;
+            let _ = stream.write_all(body).await;
+        });
+        (address, task)
+    }
+
     #[test]
     fn defaults_are_loopback_and_bounded() {
         let config = Config::from_yaml_str("").expect("empty config uses safe defaults");
@@ -947,6 +1029,57 @@ rules:
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    #[tokio::test]
+    async fn http_provider_follows_redirects_and_routes_the_result() {
+        let body = b"payload:\n  - .redirected.example\n".to_vec();
+        let (destination, destination_server) = start_http_response("200 OK", body, None).await;
+        let (address, redirect_server) =
+            start_http_redirect(format!("http://{destination}/rules")).await;
+        let directory = temporary_directory();
+        let config_path = directory.join("redirect.yaml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "rule-providers:\n  remote:\n    type: http\n    behavior: domain\n    url: 'http://{address}/start'\nrules:\n  - RULE-SET,remote,REJECT\n  - MATCH,DIRECT\n"
+            ),
+        )
+        .unwrap();
+
+        let config = Config::load_async(&config_path).await.unwrap();
+        assert_eq!(
+            config.routing_rules().unwrap().route(&RequestTarget {
+                host: TargetHost::Domain("cdn.redirected.example".into()),
+                port: 443,
+            }),
+            RouteAction::Reject
+        );
+        redirect_server.await.unwrap();
+        destination_server.await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_provider_download_obeys_connect_timeout() {
+        let (address, server) =
+            start_delayed_http_response(std::time::Duration::from_millis(300)).await;
+        let directory = temporary_directory();
+        let config_path = directory.join("timeout.yaml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "connect_timeout_ms: 100\nrule-providers:\n  remote:\n    type: http\n    behavior: classical\n    url: 'http://{address}/slow'\n"
+            ),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            Config::load_async(&config_path).await,
+            Err(ConfigError::RuleProviderHttp { reason, .. }) if reason.contains("connect_timeout_ms")
+        ));
+        server.await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn file_rule_provider_rejects_missing_and_oversized_files() {
         let directory = temporary_directory();
@@ -1008,6 +1141,22 @@ rules:
         .unwrap();
         assert!(matches!(
             Config::load_async(&oversized_path).await,
+            Err(ConfigError::RuleProviderHttp { reason, .. }) if reason.contains("response exceeds")
+        ));
+        server.await.unwrap();
+
+        let streamed_path = directory.join("streamed-oversized.yaml");
+        let (address, server) =
+            start_chunked_http_response(vec![b'x'; (MAX_RULE_PROVIDER_BYTES + 1) as usize]).await;
+        std::fs::write(
+            &streamed_path,
+            format!(
+                "rule-providers:\n  remote:\n    type: http\n    behavior: classical\n    url: 'http://{address}/chunked'\n"
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            Config::load_async(&streamed_path).await,
             Err(ConfigError::RuleProviderHttp { reason, .. }) if reason.contains("response exceeds")
         ));
         server.await.unwrap();

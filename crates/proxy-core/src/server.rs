@@ -292,12 +292,6 @@ where
 {
     let mut header = [0u8; 4];
     stream.read_exact(&mut header).await?;
-    if header[0] != SOCKS_VERSION || header[2] != 0 {
-        return Err(ProtocolError::Reply(REP_GENERAL_FAILURE));
-    }
-    if header[1] != CMD_CONNECT {
-        return Err(ProtocolError::Reply(REP_COMMAND_NOT_SUPPORTED));
-    }
 
     let host = match header[3] {
         0x01 => {
@@ -328,6 +322,12 @@ where
     let mut port_bytes = [0u8; 2];
     stream.read_exact(&mut port_bytes).await?;
     let port = u16::from_be_bytes(port_bytes);
+    if header[0] != SOCKS_VERSION || header[2] != 0 {
+        return Err(ProtocolError::Reply(REP_GENERAL_FAILURE));
+    }
+    if header[1] != CMD_CONNECT {
+        return Err(ProtocolError::Reply(REP_COMMAND_NOT_SUPPORTED));
+    }
     Ok(RequestTarget { host, port })
 }
 
