@@ -6,7 +6,7 @@
 - 支持通过 `Config::load_async` 在启动时下载 HTTP/HTTPS rule-provider 快照；校验成功状态，最多跟随 5 次重定向，单响应 4 MiB 上限并受 `connect_timeout_ms` 超时约束；CLI 已切换异步配置加载。
 - 增加 HTTP provider 重定向、超时、404、声明长度超限和 chunked 流式超限的本地回环测试。
 - 修复拒绝非 `CONNECT` 请求时先读取完整地址/端口帧，避免 Windows 关闭含未读请求数据的 socket 时以 RST 丢弃 SOCKS5 错误回复。
-- 加入 Linux、Windows、macOS 的 CI 工作流；跨平台任务实际通过前不视为平台验证完成。
+- Linux、Windows、macOS 的 CI 全量任务和 Rust 1.85 锁文件测试已在提交 `37d11d4` 通过；Android 尚未纳入验证。
 - 增加截断 SOCKS5 CONNECT 帧断连与慢速 greeting 握手超时测试；剩余的并发压力、取消边界与完整畸形帧矩阵仍待覆盖。
 - 更新兼容性台账、路线图、测试、架构与开发依赖文档；HTTP provider 持久缓存、刷新间隔、请求头、MRS/自定义格式、自动更新和热重载仍未实现。
 - 增加严格配置的具名 `http` 与 `socks5` TCP 代理出站；支持可选用户名/密码认证。

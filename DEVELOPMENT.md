@@ -3,7 +3,7 @@
 ## 环境
 
 - Rust 1.85+ / Cargo；本仓库采用 Rust 2024 edition。
-- 本轮验证环境为 Linux x86_64。Windows、macOS、Android 尚未在此环境验证。
+- 本地验证环境为 Linux x86_64；GitHub Actions 的 Linux、Windows、macOS 稳定版任务与 Rust 1.85 MSRV 测试均已通过。Android/移动设备尚未验证。
 
 ## 依赖
 

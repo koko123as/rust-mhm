@@ -21,4 +21,4 @@ cargo +1.85.0 test --workspace --locked
 
 尚未覆盖完整畸形/截断 SOCKS5 帧矩阵、长时间并发压力、连接取消边界、DNS 策略或真实网络故障。HTTP provider 测试使用 loopback 假服务；没有基于 Mihomo 配置语料的兼容性测试。file 与 HTTP provider 只在启动载入，不支持持久缓存、刷新、自动更新或热重载，也不支持代理组。
 
-当前 Linux x86_64 实际构建目标；Rust 1.85.0 的 workspace 锁定测试已通过。仓库含 Linux/Windows/macOS CI 工作流，但对应平台检查尚未在此工作区实跑；Android 与移动设备未验证。尚无性能基准、负载/长稳测试或真实第三方代理互操作测试。
+本地实际构建环境为 Linux x86_64；Rust 1.85.0 的 workspace 锁定测试已通过。GitHub Actions 在 Linux、Windows、macOS 与 Rust 1.85 任务均通过（提交 `37d11d4`）；Android 与移动设备未验证。尚无性能基准、负载/长稳测试或真实第三方代理互操作测试。

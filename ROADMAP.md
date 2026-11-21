@@ -8,7 +8,7 @@
 - [x] 选择并记录最小依赖；未知 YAML 字段拒绝处理。
 - [x] Linux x86_64：格式检查、全目标编译、workspace 测试与零警告 Clippy 通过；Rust 1.85.0 锁定依赖 workspace 测试通过。
 - [x] Linux x86_64：CLI 帮助命令通过。
-- [x] 建立 Linux/Windows/macOS CI 工作流和 Rust 1.85 锁文件测试门禁；在目标平台 GitHub Actions 实际跑过前不标记为已验证。
+- [x] Linux/Windows/macOS GitHub Actions 与 Rust 1.85 锁文件测试门禁已通过（提交 `37d11d4`）；Android 与真实设备网络仍未验证。
 
 ## Phase 1 — SOCKS5 到 DIRECT 的 TCP 切片
 

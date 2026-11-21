@@ -96,4 +96,4 @@ SOCKS5 子集参考 [RFC 1928](https://www.rfc-editor.org/rfc/rfc1928) 和 [RFC 
 
 ## 验证状态
 
-Linux x86_64 上已验证：格式检查、workspace 全目标编译、50 项 workspace 测试、零警告 Clippy 与 CLI 帮助检查；workspace 全套测试也在 Rust 1.85.0 上通过。当前网络测试只用本地假服务，不依赖外网。Windows、macOS、Android、真实代理服务、长时负载及 Android VPN 集成尚未验证。
+Linux x86_64 上已验证格式检查、workspace 全目标编译、52 项 workspace 测试、零警告 Clippy 与 CLI 帮助检查；Rust 1.85.0 下的全套测试也通过。GitHub Actions 在 Linux、Windows、macOS 与 Rust 1.85 任务均通过（提交 `37d11d4`）。网络测试只使用本地假服务，不依赖外网；Android、真实第三方代理、长时负载及 Android VPN 集成尚未验证。
