@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- 支持在启动时载入本地 `file` rule-provider：相对配置目录解析路径，4 MiB 上限，支持 YAML payload 或逐行文本，以及有限的 `classical`/`domain`/`ipcidr` 行为。
+- 支持通过 `Config::load_async` 在启动时下载 HTTP/HTTPS rule-provider 快照；校验成功状态，最多跟随 5 次重定向，单响应 4 MiB 上限并受 `connect_timeout_ms` 超时约束；CLI 已切换异步配置加载。
+- 加入 Linux、Windows、macOS 的 CI 工作流；跨平台任务实际通过前不视为平台验证完成。
+- 增加截断 SOCKS5 CONNECT 帧断连与慢速 greeting 握手超时测试；剩余的并发压力、取消边界与完整畸形帧矩阵仍待覆盖。
+- 更新兼容性台账、路线图、测试、架构与开发依赖文档；HTTP provider 持久缓存、刷新间隔、请求头、MRS/自定义格式、自动更新和热重载仍未实现。
 - 增加严格配置的具名 `http` 与 `socks5` TCP 代理出站；支持可选用户名/密码认证。
 - 规则动作可选择配置中的代理名称；重复定义、缺失引用和保留动作名称会被拒绝。
 - HTTP CONNECT 与 SOCKS5 出站握手纳入连接超时；添加基于本地假代理的认证、隧道及双向转发端到端测试。
@@ -11,8 +16,8 @@
 - 路由规则新增有限 `DOMAIN-WILDCARD` 支持：仅支持 `*` 和 `?` 两种通配符。
 - 路由规则新增有限 `SRC-IP-CIDR` 与 `SRC-PORT` 支持：按入站 TCP peer 地址和来源端口匹配。
 - 路由规则新增有限 `DOMAIN-REGEX` 支持：规则加载时编译 Rust `regex` 表达式，对规范化域名执行匹配，拒绝无效或超过 4096 字节的表达式。
-- 增加有限 inline classical `RULE-SET` 支持：在引用位置展开 payload 并由引用动作统一覆盖；file/http、domain/ipcidr provider、缓存和自动更新仍未实现。
-- 完整 rule-provider 生命周期、文件/HTTP 加载、代理组、UDP、DNS 策略、TUN 与平台集成仍未实现；`RULE-SET` 当前仅为 inline classical 子集。
+- 增加有限 inline classical `RULE-SET` 支持：在引用位置展开 payload 并由引用动作统一覆盖；此后已加入有限 file 与 HTTP/HTTPS 启动快照加载。
+- 完整 rule-provider 生命周期（缓存、刷新和自动更新）、代理组、UDP、DNS 策略、TUN 与平台集成仍未实现；`RULE-SET` 仍只支持本项目有限内容格式与规则子集。
 
 ## 0.1.0 — 初始原型
 

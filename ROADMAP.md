@@ -6,16 +6,17 @@
 
 - [x] 创建 Rust workspace 与核心库/CLI 边界。
 - [x] 选择并记录最小依赖；未知 YAML 字段拒绝处理。
-- [x] Linux x86_64：格式检查、全目标编译、workspace 测试与零警告 Clippy 通过。
+- [x] Linux x86_64：格式检查、全目标编译、workspace 测试与零警告 Clippy 通过；Rust 1.85.0 锁定依赖 workspace 测试通过。
 - [x] Linux x86_64：CLI 帮助命令通过。
-- [ ] 建立 Linux/Windows/macOS CI；在目标平台实际跑过前不标记为已验证。
+- [x] 建立 Linux/Windows/macOS CI 工作流和 Rust 1.85 锁文件测试门禁；在目标平台 GitHub Actions 实际跑过前不标记为已验证。
 
 ## Phase 1 — SOCKS5 到 DIRECT 的 TCP 切片
 
 - [x] SOCKS5 无认证协商或按配置强制 RFC 1929 用户名/密码协商；支持 `skip-auth-prefixes` CIDR 豁免、CONNECT 与 IPv4/IPv6/域名目标解析。
 - [x] DIRECT TCP 出站、超时、错误回复和双向转发。
 - [x] 默认 loopback 监听、并发连接上限。
-- [ ] 补充畸形帧、慢速客户端/超时、并发压力和取消回归测试。
+- [x] 补充截断 CONNECT 帧断连与慢速握手超时回归测试。
+- [ ] 补充完整畸形帧矩阵、并发压力和取消边界回归测试。
 
 ## Phase 2 — 受限配置与确定性路由
 
@@ -25,7 +26,9 @@
 - [x] 覆盖域名边界与正则、IPv4/IPv6 目标及来源 CIDR、端口区间、规则顺序和拒绝路径。
 - [x] 有限 inline classical `RULE-SET`：规则按引用位置展开，引用动作覆盖 payload 规则动作。
 - [ ] 与更广泛 Mihomo 规则/配置语料逐项差异测试；当前规则子集不等于完整兼容。
-- [ ] 实现 file/http rule-provider、domain/ipcidr 内容行为、缓存与更新生命周期；当前只支持 inline classical 子集。
+- [x] 支持启动时载入 `file` rule-provider（classical/domain/ipcidr 有限行为），相对配置路径、4 MiB 上限和 YAML payload/逐行文本解析。
+- [x] 支持启动时下载 HTTP/HTTPS rule-provider 快照：异步配置加载、最多 5 次重定向、`connect_timeout_ms` 超时、4 MiB 上限、成功状态检查与有限文本/YAML 解析；测试使用本地假 HTTP 服务。
+- [ ] 实现 HTTP provider 持久缓存、刷新间隔、请求头、MRS/自定义格式与自动更新生命周期；当前所有 provider 都只在启动时静态载入。
 
 ## Phase 3 — TCP 出站与策略组
 

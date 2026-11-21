@@ -35,6 +35,12 @@ const REP_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 const REP_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(Clone, Copy)]
+struct ConnectionTimeouts {
+    connect: Duration,
+    handshake: Duration,
+}
+
 #[derive(Debug, Error)]
 pub enum ServerError {
     #[error(transparent)]
@@ -52,7 +58,10 @@ pub async fn run(config: Config) -> Result<(), ServerError> {
     let skip_auth_prefixes = Arc::new(config.skip_auth_prefixes()?);
     let listener = TcpListener::bind(listen_addr).await?;
     let connection_limit = Arc::new(Semaphore::new(config.max_connections()));
-    let connect_timeout = Duration::from_millis(config.connect_timeout_ms());
+    let timeouts = ConnectionTimeouts {
+        connect: Duration::from_millis(config.connect_timeout_ms()),
+        handshake: HANDSHAKE_TIMEOUT,
+    };
     let mut tasks: JoinSet<io::Result<()>> = JoinSet::new();
     let shutdown_signal = tokio::signal::ctrl_c();
     tokio::pin!(shutdown_signal);
@@ -75,7 +84,7 @@ pub async fn run(config: Config) -> Result<(), ServerError> {
                         let skip_auth_prefixes = Arc::clone(&skip_auth_prefixes);
                         tasks.spawn(async move {
                             let _permit = permit;
-                            handle_connection_with_rules(stream, connect_timeout, routing, outbounds, authentication, skip_auth_prefixes, peer).await
+                            handle_connection_with_rules(stream, timeouts, routing, outbounds, authentication, skip_auth_prefixes, peer).await
                         });
                     }
                     Err(_) => {
@@ -110,7 +119,10 @@ pub async fn handle_connection(client: TcpStream, connect_timeout: Duration) -> 
     let peer = client.peer_addr()?;
     handle_connection_with_rules(
         client,
-        connect_timeout,
+        ConnectionTimeouts {
+            connect: connect_timeout,
+            handshake: HANDSHAKE_TIMEOUT,
+        },
         Arc::new(RuleSet::default()),
         Arc::new(Vec::new()),
         Arc::new(Vec::new()),
@@ -122,7 +134,7 @@ pub async fn handle_connection(client: TcpStream, connect_timeout: Duration) -> 
 
 async fn handle_connection_with_rules(
     mut client: TcpStream,
-    connect_timeout: Duration,
+    timeouts: ConnectionTimeouts,
     routing: Arc<RuleSet>,
     outbounds: Arc<Vec<ProxyOutbound>>,
     authentication: Arc<Vec<(String, String)>>,
@@ -134,7 +146,7 @@ async fn handle_connection_with_rules(
             .iter()
             .any(|prefix| prefix.contains(peer.ip()));
     let target = match timeout(
-        HANDSHAKE_TIMEOUT,
+        timeouts.handshake,
         negotiate(&mut client, &authentication, require_authentication),
     )
     .await
@@ -155,7 +167,7 @@ async fn handle_connection_with_rules(
         return Ok(());
     }
 
-    let connect_result = timeout(connect_timeout, async {
+    let connect_result = timeout(timeouts.connect, async {
         match action {
             RouteAction::Direct => connect_target(&target).await,
             RouteAction::Proxy(name) => {
@@ -396,6 +408,23 @@ mod tests {
         authentication: Vec<(String, String)>,
         skip_auth_prefixes: Vec<AuthSkipPrefix>,
     ) -> (TcpStream, tokio::task::JoinHandle<io::Result<()>>) {
+        start_one_connection_with_handshake_timeout(
+            rules,
+            outbounds,
+            authentication,
+            skip_auth_prefixes,
+            HANDSHAKE_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn start_one_connection_with_handshake_timeout(
+        rules: RuleSet,
+        outbounds: Vec<ProxyOutbound>,
+        authentication: Vec<(String, String)>,
+        skip_auth_prefixes: Vec<AuthSkipPrefix>,
+        handshake_timeout: Duration,
+    ) -> (TcpStream, tokio::task::JoinHandle<io::Result<()>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let routing = Arc::new(rules);
@@ -406,7 +435,10 @@ mod tests {
             let (stream, peer) = listener.accept().await?;
             handle_connection_with_rules(
                 stream,
-                Duration::from_secs(2),
+                ConnectionTimeouts {
+                    connect: Duration::from_secs(2),
+                    handshake: handshake_timeout,
+                },
                 routing,
                 outbounds,
                 authentication,
@@ -512,6 +544,43 @@ mod tests {
         client.shutdown().await.unwrap();
         server_task.await.unwrap().unwrap();
         echo_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn incomplete_greeting_times_out_and_closes_slow_client() {
+        let (mut client, server_task) = start_one_connection_with_handshake_timeout(
+            RuleSet::default(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Duration::from_millis(100),
+        )
+        .await;
+        client.write_all(&[SOCKS_VERSION]).await.unwrap();
+
+        let mut byte = [0u8; 1];
+        let received = timeout(Duration::from_secs(1), client.read(&mut byte))
+            .await
+            .expect("server should close the timed-out connection")
+            .unwrap();
+        assert_eq!(received, 0);
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn truncated_connect_frame_closes_without_success_reply() {
+        let (mut client, server_task) = start_one_connection().await;
+        negotiate_no_auth(&mut client).await;
+        client
+            .write_all(&[SOCKS_VERSION, CMD_CONNECT, 0, 0x01, 127, 0])
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut byte = [0u8; 1];
+        assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+        let error = server_task.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[tokio::test]

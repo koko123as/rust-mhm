@@ -12,7 +12,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let config_path = parse_config_path(std::env::args_os().skip(1))?;
-    let config = Config::load(&config_path)?;
+    let config = Config::load_async(&config_path).await?;
     run(config).await?;
     Ok(())
 }

@@ -34,23 +34,37 @@ rules:
   - MATCH,DIRECT
 ```
 
-rule provider 当前仅支持内联 classical 子集，例如：
+规则 provider 支持 `inline`、本地 `file` 和 HTTP/HTTPS 启动快照，当前行为限定为 `classical`、`domain`、`ipcidr`；本地文件路径相对配置文件所在目录。file 示例：
 
 ```yaml
 rule-providers:
   local-blocklist:
-    type: inline
-    behavior: classical
-    payload:
-      - "DOMAIN-SUFFIX,ads.example"
+    type: file
+    behavior: domain
+    path: rules/blocklist.yaml
 rules:
   - RULE-SET,local-blocklist,REJECT
   - MATCH,DIRECT
 ```
 
+`rules/blocklist.yaml` 可用 YAML `payload` 列表（域名行为每项一个域名，IP 段行为每项一个 CIDR；classical 行为每项一条当前已实现的规则），也可用逐行文本。文件在启动载入时读取，大小上限为 4 MiB。HTTP/HTTPS provider 也能在启动时下载一次快照：
+
+```yaml
+rule-providers:
+  remote-blocklist:
+    type: http
+    behavior: domain
+    url: https://example.net/rules.yaml
+rules:
+  - RULE-SET,remote-blocklist,REJECT
+  - MATCH,DIRECT
+```
+
+HTTP 响应必须成功且不超过 4 MiB；完整请求及流式下载受 `connect_timeout_ms` 超时限制，最多跟随 5 次重定向。CLI 使用异步配置加载；库调用方应使用 `Config::load_async`。provider 只在进程启动时读取一次，目前没有持久缓存、定期刷新、请求头、自定义格式/MRS 或热更新。
+
 代理类型目前只支持 `http`（HTTP CONNECT 隧道，不是通用正向 HTTP 转发，也不支持 TLS-to-proxy）和 `socks5`（SOCKS5 TCP CONNECT）。规则的第三列用代理名选择出站，例如 `MATCH,upstream`。省略规则时按本项目约定使用 `MATCH,DIRECT`。
 
-`skip-auth-prefixes` 命中时将协商无认证方法；该功能应谨慎配置，避免把不可信来源列入豁免范围。SOCKS5 入站认证和 SOCKS5 出站认证按 RFC 1929 传输明文凭据，因此仅应在可信本机网络使用；监听仍被限制为 loopback。rule provider 目前仅支持静态 `type: inline`、`behavior: classical` 的有限规则子集，不读取本地文件或远程 URL，也不自动刷新。**仍未实现：** UDP、HTTP 入站、HTTPS/其他代理出站、代理组、完整 rule-provider 行为、Mihomo DNS 策略、TUN、订阅、REST API、UI 与 Android 服务。IP-CIDR 不会为域名目标先行解析。该项目不接受完整 Mihomo YAML；见 [兼容性台账](COMPATIBILITY.md)。
+`skip-auth-prefixes` 命中时将协商无认证方法；该功能应谨慎配置，避免把不可信来源列入豁免范围。SOCKS5 入站认证和 SOCKS5 出站认证按 RFC 1929 传输明文凭据，因此仅应在可信本机网络使用；规则 provider 只在进程启动时静态载入，尚无缓存/刷新生命周期、热更新或完整 Mihomo provider 兼容。**仍未实现：** UDP、HTTP 入站、HTTPS/其他代理出站、代理组、Mihomo DNS 策略、TUN、订阅、REST API、UI 与 Android 服务。IP-CIDR 不会为域名目标先行解析。该项目不接受完整 Mihomo YAML；见 [兼容性台账](COMPATIBILITY.md)。
 
 ## 快速开始
 
@@ -82,4 +96,4 @@ SOCKS5 子集参考 [RFC 1928](https://www.rfc-editor.org/rfc/rfc1928) 和 [RFC 
 
 ## 验证状态
 
-Linux x86_64 上验证：格式检查、workspace 全目标编译、workspace 测试、零警告 Clippy 与 CLI 帮助检查。当前测试覆盖代理认证与本地双向 TCP 隧道，不依赖外网。Windows、macOS、Android、真实代理服务、长时负载及 Android VPN 集成尚未验证。
+Linux x86_64 上已验证：格式检查、workspace 全目标编译、50 项 workspace 测试、零警告 Clippy 与 CLI 帮助检查；workspace 全套测试也在 Rust 1.85.0 上通过。当前网络测试只用本地假服务，不依赖外网。Windows、macOS、Android、真实代理服务、长时负载及 Android VPN 集成尚未验证。

@@ -1,7 +1,9 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    fs::File,
+    io::Read,
     net::{IpAddr, SocketAddr},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use serde::Deserialize;
@@ -16,6 +18,7 @@ const DEFAULT_MAX_CONNECTIONS: usize = 256;
 const MAX_CONNECTIONS: usize = 4_096;
 const MIN_CONNECT_TIMEOUT_MS: u64 = 100;
 const MAX_CONNECT_TIMEOUT_MS: u64 = 120_000;
+const MAX_RULE_PROVIDER_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,6 +33,8 @@ pub struct Config {
     rules: Vec<String>,
     #[serde(default, rename = "rule-providers")]
     rule_providers: BTreeMap<String, RuleProviderConfig>,
+    #[serde(skip)]
+    config_dir: Option<PathBuf>,
     #[serde(default)]
     proxies: Vec<ProxyOutbound>,
     #[serde(default)]
@@ -46,6 +51,10 @@ struct RuleProviderConfig {
     behavior: String,
     #[serde(default)]
     payload: Vec<String>,
+    #[serde(default)]
+    path: Option<PathBuf>,
+    #[serde(default)]
+    url: Option<String>,
 }
 
 impl Default for Config {
@@ -56,6 +65,7 @@ impl Default for Config {
             max_connections: default_max_connections(),
             rules: default_rules(),
             rule_providers: BTreeMap::new(),
+            config_dir: None,
             proxies: Vec::new(),
             authentication: Vec::new(),
             skip_auth_prefixes: Vec::new(),
@@ -67,14 +77,62 @@ impl Config {
     /// Parse this project's intentionally small YAML schema and validate it.
     pub fn from_yaml_str(source: &str) -> Result<Self, ConfigError> {
         let config: Self = yaml_serde::from_str(source)?;
+        if config
+            .rule_providers
+            .values()
+            .any(|provider| provider.provider_type == "file")
+        {
+            return Err(ConfigError::FileProviderRequiresConfigPath);
+        }
+        if config
+            .rule_providers
+            .values()
+            .any(|provider| provider.provider_type == "http")
+        {
+            return Err(ConfigError::HttpProviderRequiresAsyncLoad);
+        }
         config.validate()?;
         Ok(config)
     }
 
     /// Load a configuration file without logging its contents.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let path = path.as_ref();
         let source = std::fs::read_to_string(path)?;
-        Self::from_yaml_str(&source)
+        let mut config: Self = yaml_serde::from_str(&source)?;
+        if config
+            .rule_providers
+            .values()
+            .any(|provider| provider.provider_type == "http")
+        {
+            return Err(ConfigError::HttpProviderRequiresAsyncLoad);
+        }
+        config.config_dir = Some(
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
+        );
+        config.load_file_rule_providers()?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Load configuration and startup snapshots of its local and HTTP rule providers.
+    pub async fn load_async(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let path = path.as_ref();
+        let source = std::fs::read_to_string(path)?;
+        let mut config: Self = yaml_serde::from_str(&source)?;
+        config.config_dir = Some(
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
+        );
+        config.load_file_rule_providers()?;
+        config.load_http_rule_providers().await?;
+        config.validate()?;
+        Ok(config)
     }
 
     pub fn listen_addr(&self) -> Result<SocketAddr, ConfigError> {
@@ -100,7 +158,7 @@ impl Config {
         let rule_providers = self
             .rule_providers
             .iter()
-            .map(|(name, provider)| (name.clone(), provider.payload.clone()))
+            .map(|(name, provider)| (name.clone(), provider.normalized_payload()))
             .collect::<HashMap<_, _>>();
         Ok(RuleSet::parse_with_rule_providers(
             &self.rules,
@@ -138,6 +196,185 @@ impl Config {
             .collect()
     }
 
+    fn load_file_rule_providers(&mut self) -> Result<(), ConfigError> {
+        let config_dir = self
+            .config_dir
+            .as_ref()
+            .expect("file providers are loaded only from a config file")
+            .clone();
+        for (name, provider) in &mut self.rule_providers {
+            if provider.provider_type != "file" {
+                continue;
+            }
+            let path = provider
+                .path
+                .as_ref()
+                .ok_or_else(|| ConfigError::InvalidRuleProvider {
+                    name: name.clone(),
+                    reason: "type: file requires a path".to_owned(),
+                })?;
+            if !provider.payload.is_empty() {
+                return Err(ConfigError::InvalidRuleProvider {
+                    name: name.clone(),
+                    reason: "type: file cannot define an inline payload".to_owned(),
+                });
+            }
+            let resolved_path = if path.is_absolute() {
+                path.clone()
+            } else {
+                config_dir.join(path)
+            };
+            let file =
+                File::open(&resolved_path).map_err(|error| ConfigError::RuleProviderLoad {
+                    name: name.clone(),
+                    path: resolved_path.display().to_string(),
+                    reason: error.to_string(),
+                })?;
+            let size = file
+                .metadata()
+                .map_err(|error| ConfigError::RuleProviderLoad {
+                    name: name.clone(),
+                    path: resolved_path.display().to_string(),
+                    reason: error.to_string(),
+                })?
+                .len();
+            if size > MAX_RULE_PROVIDER_BYTES {
+                return Err(ConfigError::RuleProviderLoad {
+                    name: name.clone(),
+                    path: resolved_path.display().to_string(),
+                    reason: format!("file exceeds {MAX_RULE_PROVIDER_BYTES} bytes"),
+                });
+            }
+            let mut bytes = Vec::with_capacity(size as usize);
+            file.take(MAX_RULE_PROVIDER_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|error| ConfigError::RuleProviderLoad {
+                    name: name.clone(),
+                    path: resolved_path.display().to_string(),
+                    reason: error.to_string(),
+                })?;
+            if bytes.len() as u64 > MAX_RULE_PROVIDER_BYTES {
+                return Err(ConfigError::RuleProviderLoad {
+                    name: name.clone(),
+                    path: resolved_path.display().to_string(),
+                    reason: format!("file exceeds {MAX_RULE_PROVIDER_BYTES} bytes"),
+                });
+            }
+            let source =
+                String::from_utf8(bytes).map_err(|error| ConfigError::RuleProviderLoad {
+                    name: name.clone(),
+                    path: resolved_path.display().to_string(),
+                    reason: format!("file is not valid UTF-8: {error}"),
+                })?;
+            provider.payload = parse_rule_provider_file(&source).map_err(|reason| {
+                ConfigError::RuleProviderLoad {
+                    name: name.clone(),
+                    path: resolved_path.display().to_string(),
+                    reason,
+                }
+            })?;
+        }
+        Ok(())
+    }
+
+    async fn load_http_rule_providers(&mut self) -> Result<(), ConfigError> {
+        if !self
+            .rule_providers
+            .values()
+            .any(|provider| provider.provider_type == "http")
+        {
+            return Ok(());
+        }
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+            .map_err(|error| ConfigError::RuleProviderHttp {
+                name: "<client>".to_owned(),
+                reason: error.without_url().to_string(),
+            })?;
+        let timeout_duration = std::time::Duration::from_millis(self.connect_timeout_ms);
+        for (name, provider) in &mut self.rule_providers {
+            if provider.provider_type != "http" {
+                continue;
+            }
+            if !provider.payload.is_empty() {
+                return Err(ConfigError::InvalidRuleProvider {
+                    name: name.clone(),
+                    reason: "type: http cannot define an inline payload".to_owned(),
+                });
+            }
+            let url = provider
+                .url
+                .as_deref()
+                .ok_or_else(|| ConfigError::InvalidRuleProvider {
+                    name: name.clone(),
+                    reason: "type: http requires a url".to_owned(),
+                })?;
+            let parsed_url =
+                reqwest::Url::parse(url).map_err(|_| ConfigError::InvalidRuleProvider {
+                    name: name.clone(),
+                    reason: "type: http url must be a valid http or https URL".to_owned(),
+                })?;
+            if !matches!(parsed_url.scheme(), "http" | "https")
+                || parsed_url.host_str().is_none()
+                || !parsed_url.username().is_empty()
+                || parsed_url.password().is_some()
+            {
+                return Err(ConfigError::InvalidRuleProvider {
+                    name: name.clone(),
+                    reason: "type: http url must use http/https and contain no user credentials"
+                        .to_owned(),
+                });
+            }
+            let download = async {
+                let mut response = client
+                    .get(parsed_url)
+                    .send()
+                    .await
+                    .map_err(reqwest_error_reason)?;
+                if !response.status().is_success() {
+                    return Err(format!("server returned HTTP status {}", response.status()));
+                }
+                if response
+                    .content_length()
+                    .is_some_and(|length| length > MAX_RULE_PROVIDER_BYTES)
+                {
+                    return Err(format!("response exceeds {MAX_RULE_PROVIDER_BYTES} bytes"));
+                }
+                let mut bytes = Vec::new();
+                while let Some(chunk) = response.chunk().await.map_err(reqwest_error_reason)? {
+                    if bytes.len() as u64 + chunk.len() as u64 > MAX_RULE_PROVIDER_BYTES {
+                        return Err(format!("response exceeds {MAX_RULE_PROVIDER_BYTES} bytes"));
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                Ok::<_, String>(bytes)
+            };
+            let bytes = tokio::time::timeout(timeout_duration, download)
+                .await
+                .map_err(|_| ConfigError::RuleProviderHttp {
+                    name: name.clone(),
+                    reason: "request exceeded connect_timeout_ms".to_owned(),
+                })?
+                .map_err(|reason| ConfigError::RuleProviderHttp {
+                    name: name.clone(),
+                    reason,
+                })?;
+            let source =
+                String::from_utf8(bytes).map_err(|error| ConfigError::RuleProviderHttp {
+                    name: name.clone(),
+                    reason: format!("response is not valid UTF-8: {error}"),
+                })?;
+            provider.payload = parse_rule_provider_file(&source).map_err(|reason| {
+                ConfigError::RuleProviderHttp {
+                    name: name.clone(),
+                    reason: format!("could not parse response: {reason}"),
+                }
+            })?;
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         let listen_addr = self.listen_addr()?;
         if !listen_addr.ip().is_loopback() {
@@ -170,7 +407,7 @@ impl Config {
         let rule_providers = self
             .rule_providers
             .iter()
-            .map(|(name, provider)| (name.clone(), provider.payload.clone()))
+            .map(|(name, provider)| (name.clone(), provider.normalized_payload()))
             .collect::<HashMap<_, _>>();
         RuleSet::parse_with_rule_providers(&self.rules, &proxy_names, &rule_providers)?;
         let mut usernames = std::collections::HashSet::new();
@@ -204,7 +441,84 @@ impl Config {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuleProviderDocument {
+    payload: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RuleProviderFile {
+    Document(RuleProviderDocument),
+    Payload(Vec<String>),
+}
+
+fn parse_rule_provider_file(source: &str) -> Result<Vec<String>, String> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    if let Ok(document) = yaml_serde::from_str::<RuleProviderFile>(trimmed) {
+        return Ok(match document {
+            RuleProviderFile::Document(document) => document.payload,
+            RuleProviderFile::Payload(payload) => payload,
+        });
+    }
+    Ok(source
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect())
+}
+
+fn reqwest_error_reason(error: reqwest::Error) -> String {
+    let error = error.without_url();
+    let mut reason = error.to_string();
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        reason.push_str(": ");
+        reason.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    reason
+}
+
 impl RuleProviderConfig {
+    fn normalized_payload(&self) -> Vec<String> {
+        match self.behavior.as_str() {
+            "domain" => self
+                .payload
+                .iter()
+                .map(|domain| {
+                    if domain.contains(['*', '?']) {
+                        format!("DOMAIN-WILDCARD,{domain}")
+                    } else {
+                        format!(
+                            "DOMAIN-SUFFIX,{}",
+                            domain.strip_prefix('.').unwrap_or(domain)
+                        )
+                    }
+                })
+                .collect(),
+            "ipcidr" => self
+                .payload
+                .iter()
+                .map(|cidr| {
+                    let address = cidr.split('/').next().unwrap_or_default();
+                    let kind = if address.parse::<std::net::Ipv6Addr>().is_ok() {
+                        "IP-CIDR6"
+                    } else {
+                        "IP-CIDR"
+                    };
+                    format!("{kind},{cidr}")
+                })
+                .collect(),
+            _ => self.payload.clone(),
+        }
+    }
+
     fn validate(&self, name: &str) -> Result<(), ConfigError> {
         let invalid = |reason: String| ConfigError::InvalidRuleProvider {
             name: name.to_owned(),
@@ -216,11 +530,49 @@ impl RuleProviderConfig {
                     .to_owned(),
             ));
         }
-        if self.provider_type != "inline" {
-            return Err(invalid("only type: inline is supported".to_owned()));
+        match self.provider_type.as_str() {
+            "inline" if self.path.is_none() && self.url.is_none() => {}
+            "file"
+                if self
+                    .path
+                    .as_ref()
+                    .is_some_and(|path| !path.as_os_str().is_empty())
+                    && self.url.is_none() => {}
+            "http" if self.path.is_none() => {
+                let Some(url) = self.url.as_deref() else {
+                    return Err(invalid("type: http requires a url".to_owned()));
+                };
+                let Ok(url) = reqwest::Url::parse(url) else {
+                    return Err(invalid("type: http url must be valid".to_owned()));
+                };
+                if !matches!(url.scheme(), "http" | "https")
+                    || url.host_str().is_none()
+                    || !url.username().is_empty()
+                    || url.password().is_some()
+                {
+                    return Err(invalid(
+                        "type: http url must use http/https and contain no user credentials"
+                            .to_owned(),
+                    ));
+                }
+            }
+            "inline" => return Err(invalid("type: inline cannot define path or url".to_owned())),
+            "file" => return Err(invalid("type: file requires a path".to_owned())),
+            "http" => {
+                return Err(invalid(
+                    "HTTP provider cache paths are not yet supported".to_owned(),
+                ));
+            }
+            _ => {
+                return Err(invalid(
+                    "supported types are inline, file, and http".to_owned(),
+                ));
+            }
         }
-        if self.behavior != "classical" {
-            return Err(invalid("only behavior: classical is supported".to_owned()));
+        if !matches!(self.behavior.as_str(), "classical" | "domain" | "ipcidr") {
+            return Err(invalid(
+                "supported behaviors are classical, domain, and ipcidr".to_owned(),
+            ));
         }
         if self
             .payload
@@ -233,12 +585,12 @@ impl RuleProviderConfig {
         }
 
         let validation_rules = self
-            .payload
+            .normalized_payload()
             .iter()
             .map(|rule| format!("{rule},DIRECT"))
             .collect::<Vec<_>>();
         RuleSet::parse(&validation_rules)
-            .map_err(|error| invalid(format!("invalid classical payload: {error}")))?;
+            .map_err(|error| invalid(format!("invalid provider payload: {error}")))?;
         Ok(())
     }
 }
@@ -319,6 +671,18 @@ pub enum ConfigError {
     InvalidProxy(String),
     #[error("invalid rule provider {name}: {reason}")]
     InvalidRuleProvider { name: String, reason: String },
+    #[error("file rule providers require Config::load with a configuration-file path")]
+    FileProviderRequiresConfigPath,
+    #[error("HTTP rule providers require Config::load_async")]
+    HttpProviderRequiresAsyncLoad,
+    #[error("could not load rule provider {name} from {path}: {reason}")]
+    RuleProviderLoad {
+        name: String,
+        path: String,
+        reason: String,
+    },
+    #[error("could not download rule provider {name}: {reason}")]
+    RuleProviderHttp { name: String, reason: String },
     #[error("invalid SOCKS5 authentication configuration: {0}")]
     InvalidAuthentication(String),
 }
@@ -327,6 +691,45 @@ pub enum ConfigError {
 mod tests {
     use super::*;
     use crate::routing::{RequestTarget, RouteAction, TargetHost};
+
+    fn temporary_directory() -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rust-mhm-test-{unique}"));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    async fn start_http_response(
+        status: &'static str,
+        body: Vec<u8>,
+        declared_length: Option<u64>,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") && request.len() < 16 * 1024 {
+                let mut byte = [0u8; 1];
+                if stream.read_exact(&mut byte).await.is_err() {
+                    return;
+                }
+                request.push(byte[0]);
+            }
+            let length = declared_length.unwrap_or(body.len() as u64);
+            let headers = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(headers.as_bytes()).await;
+            let _ = stream.write_all(&body).await;
+        });
+        (address, task)
+    }
 
     #[test]
     fn defaults_are_loopback_and_bounded() {
@@ -440,9 +843,181 @@ rules:
     }
 
     #[test]
+    fn file_rule_providers_load_yaml_and_text_payloads_relative_to_config() {
+        let directory = temporary_directory();
+        std::fs::write(
+            directory.join("domains.yaml"),
+            "payload:\n  - .ads.example\n  - '*.tracker.example'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("networks.txt"),
+            "# IPv4 and IPv6 entries\n198.51.100.0/24\n2001:db8::/32\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("config.yaml"),
+            r#"
+rule-providers:
+  domains:
+    type: file
+    behavior: domain
+    path: domains.yaml
+  networks:
+    type: file
+    behavior: ipcidr
+    path: networks.txt
+rules:
+  - RULE-SET,domains,REJECT
+  - RULE-SET,networks,REJECT
+  - MATCH,DIRECT
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(directory.join("config.yaml")).unwrap();
+        let rules = config.routing_rules().unwrap();
+        for target in [
+            RequestTarget {
+                host: TargetHost::Domain("ads.example".into()),
+                port: 443,
+            },
+            RequestTarget {
+                host: TargetHost::Domain("cdn.tracker.example".into()),
+                port: 443,
+            },
+            RequestTarget {
+                host: TargetHost::Ip("198.51.100.17".parse().unwrap()),
+                port: 443,
+            },
+            RequestTarget {
+                host: TargetHost::Ip("2001:db8::5".parse().unwrap()),
+                port: 443,
+            },
+        ] {
+            assert_eq!(rules.route(&target), RouteAction::Reject);
+        }
+        assert_eq!(
+            rules.route(&RequestTarget {
+                host: TargetHost::Domain("safe.example".into()),
+                port: 443,
+            }),
+            RouteAction::Direct
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_provider_downloads_and_routes_a_startup_snapshot() {
+        let body = b"payload:\n  - .remote.example\n  - '*.static.example'\n".to_vec();
+        let (address, server) = start_http_response("200 OK", body, None).await;
+        let directory = temporary_directory();
+        let config_path = directory.join("config.yaml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "rule-providers:\n  remote:\n    type: http\n    behavior: domain\n    url: 'http://{address}/rules.yaml'\nrules:\n  - RULE-SET,remote,REJECT\n  - MATCH,DIRECT\n"
+            ),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            Config::load(&config_path),
+            Err(ConfigError::HttpProviderRequiresAsyncLoad)
+        ));
+        let config = Config::load_async(&config_path).await.unwrap();
+        let rules = config.routing_rules().unwrap();
+        for domain in ["remote.example", "a.remote.example", "cdn.static.example"] {
+            assert_eq!(
+                rules.route(&RequestTarget {
+                    host: TargetHost::Domain(domain.into()),
+                    port: 443,
+                }),
+                RouteAction::Reject
+            );
+        }
+        assert_eq!(
+            rules.route(&RequestTarget {
+                host: TargetHost::Domain("static.example".into()),
+                port: 443,
+            }),
+            RouteAction::Direct
+        );
+        server.await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn file_rule_provider_rejects_missing_and_oversized_files() {
+        let directory = temporary_directory();
+        std::fs::write(
+            directory.join("missing.yaml"),
+            "rule-providers:\n  local:\n    type: file\n    behavior: classical\n    path: absent.yaml\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            Config::load(directory.join("missing.yaml")),
+            Err(ConfigError::RuleProviderLoad { .. })
+        ));
+
+        std::fs::write(
+            directory.join("large.rules"),
+            vec![b'x'; (MAX_RULE_PROVIDER_BYTES + 1) as usize],
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("large.yaml"),
+            "rule-providers:\n  local:\n    type: file\n    behavior: classical\n    path: large.rules\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            Config::load(directory.join("large.yaml")),
+            Err(ConfigError::RuleProviderLoad { .. })
+        ));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_provider_rejects_error_status_and_oversized_response() {
+        let directory = temporary_directory();
+        let not_found_path = directory.join("not-found.yaml");
+        let (address, server) =
+            start_http_response("404 Not Found", b"not found".to_vec(), None).await;
+        std::fs::write(
+            &not_found_path,
+            format!(
+                "rule-providers:\n  remote:\n    type: http\n    behavior: classical\n    url: 'http://{address}/missing'\n"
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            Config::load_async(&not_found_path).await,
+            Err(ConfigError::RuleProviderHttp { reason, .. }) if reason.contains("404 Not Found")
+        ));
+        server.await.unwrap();
+
+        let oversized_path = directory.join("oversized.yaml");
+        let (address, server) =
+            start_http_response("200 OK", Vec::new(), Some(MAX_RULE_PROVIDER_BYTES + 1)).await;
+        std::fs::write(
+            &oversized_path,
+            format!(
+                "rule-providers:\n  remote:\n    type: http\n    behavior: classical\n    url: 'http://{address}/too-large'\n"
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            Config::load_async(&oversized_path).await,
+            Err(ConfigError::RuleProviderHttp { reason, .. }) if reason.contains("response exceeds")
+        ));
+        server.await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn rule_provider_rejects_unsupported_types_and_invalid_payloads() {
         let file_provider = Config::from_yaml_str(
-            "rule-providers:\n  remote:\n    type: file\n    behavior: classical\n",
+            "rule-providers:\n  remote:\n    type: cloud\n    behavior: classical\n",
         )
         .unwrap_err();
         assert!(matches!(
