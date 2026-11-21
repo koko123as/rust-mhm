@@ -34,7 +34,7 @@ rules:
   - MATCH,DIRECT
 ```
 
-规则 provider 支持 `inline`、本地 `file` 和 HTTP/HTTPS 启动快照，当前行为限定为 `classical`、`domain`、`ipcidr`；本地文件路径相对配置文件所在目录。file 示例：
+规则 provider 支持 `inline`、本地 `file` 和 HTTP/HTTPS，当前行为限定为 `classical`、`domain`、`ipcidr`；本地文件路径相对配置文件所在目录。file provider 支持通过 `interval` 定时重新读取，示例：
 
 ```yaml
 rule-providers:
@@ -42,12 +42,13 @@ rule-providers:
     type: file
     behavior: domain
     path: rules/blocklist.yaml
+    interval: 3600 # 秒；可省略，默认 24 小时
 rules:
   - RULE-SET,local-blocklist,REJECT
   - MATCH,DIRECT
 ```
 
-`rules/blocklist.yaml` 可用 YAML `payload` 列表（域名行为每项一个域名，IP 段行为每项一个 CIDR；classical 行为每项一条当前已实现的规则），也可用逐行文本。文件在启动载入时读取，大小上限为 4 MiB。HTTP/HTTPS provider 也能在启动时下载一次快照：
+`rules/blocklist.yaml` 可用 YAML `payload` 列表（域名行为每项一个域名，IP 段行为每项一个 CIDR；classical 行为每项一条当前已实现的规则），也可用逐行文本。启动时读取和之后每次刷新都限制为 4 MiB。HTTP/HTTPS provider 也能在启动时下载一次快照：
 
 ```yaml
 rule-providers:
@@ -65,7 +66,7 @@ rules:
   - MATCH,DIRECT
 ```
 
-HTTP 响应必须成功且不超过 4 MiB；完整请求及流式下载受 `connect_timeout_ms` 超时限制，最多跟随 5 次重定向。每个 HTTP provider 会将响应原文原子写入缓存：可用 `path` 指定位置（相对配置文件目录或绝对路径），省略时写入配置目录下 `.rust-mhm-cache/` 的 provider 专属文件。缓存路径不得直接覆盖配置文件，也不能被多个 provider 共用；由于自定义路径可能写入配置目录以外的位置，只应加载可信配置。启动时先尝试联网；若下载失败，则回退到已存在且通过校验的缓存，没有有效缓存时启动失败。`interval` 以秒为单位，默认 86400，允许 1 到 31536000 秒；刷新成功并完成规则校验后会原子更新运行中的路由表，失败则继续使用旧规则。缓存写入失败只记录警告，当前进程仍采用通过校验的新规则；若随后离线重启，缓存可能还是上一份快照。可用官方单数 `header` 字段设置一个或多个 HTTP 请求头值；为避免自定义凭据被转发给重定向站点，带自定义头的 provider 不跟随重定向。CLI 使用异步配置加载；库调用方应使用 `Config::load_async`。MRS/自定义格式、完整 Mihomo provider 语义和配置文件热重载仍未实现。
+HTTP 响应必须成功且不超过 4 MiB；完整请求及流式下载受 `connect_timeout_ms` 超时限制，最多跟随 5 次重定向。每个 HTTP provider 会将响应原文原子写入缓存：可用 `path` 指定位置（相对配置文件目录或绝对路径），省略时写入配置目录下 `.rust-mhm-cache/` 的 provider 专属文件。缓存路径不得直接覆盖配置文件，也不能被多个 provider 共用；由于自定义路径可能写入配置目录以外的位置，只应加载可信配置。启动时先尝试联网；若下载失败，则回退到已存在且通过校验的缓存，没有有效缓存时启动失败。`file` 与 `http` 的 `interval` 均以秒为单位，默认 86400，允许 1 到 31536000 秒；候选内容与整套路由规则都验证通过后，才会原子更新运行中的路由表。读取、下载或校验失败时继续使用旧规则，file provider 的缺失或超限文件也不会清空当前活动规则。缓存写入失败只记录警告，当前进程仍采用通过校验的新规则；若随后离线重启，缓存可能还是上一份快照。可用官方单数 `header` 字段设置一个或多个 HTTP 请求头值；为避免自定义凭据被转发给重定向站点，带自定义头的 provider 不跟随重定向。CLI 使用异步配置加载；库调用方可使用 `Config::load_async`，仅使用 file provider 的场景也可用 `Config::load`。MRS/自定义格式、完整 Mihomo provider 语义和整个配置文件热重载仍未实现。
 
 代理类型目前只支持 `http`（HTTP CONNECT 隧道，不是通用正向 HTTP 转发，也不支持 TLS-to-proxy）和 `socks5`（SOCKS5 TCP CONNECT）。规则的第三列用代理名选择出站，例如 `MATCH,upstream`。省略规则时按本项目约定使用 `MATCH,DIRECT`。
 
@@ -101,4 +102,4 @@ SOCKS5 子集参考 [RFC 1928](https://www.rfc-editor.org/rfc/rfc1928) 和 [RFC 
 
 ## 验证状态
 
-Linux x86_64 上已验证格式检查、workspace 全目标编译、workspace 测试、零警告 Clippy 与 CLI 帮助检查；Rust 1.85.0 下的全套锁定依赖测试也通过。最近一次已完成的 GitHub Actions 跨平台结果对应提交 `37d11d4`，不包含当前未提交改动。网络测试只使用本地假服务，不依赖外网；Android、真实第三方代理、长时负载及 Android VPN 集成尚未验证。
+Linux x86_64 上已验证格式检查、workspace 全目标编译、73 项 workspace 测试、零警告 Clippy、CLI 帮助检查与 Rust 1.85.0 锁定依赖测试。提交 `e7cba48` 的 [GitHub Actions 跨平台 run](https://github.com/koko123as/rust-mhm/actions/runs/44945822264) 中 Linux、Windows、macOS 与 Rust 1.85 所有任务均通过；当前 file-provider 热重载改动尚未推送，因此仍待新 CI 验证。网络测试只使用本地假服务，不依赖外网；Android、真实第三方代理、长时负载及 Android VPN 集成尚未验证。

@@ -181,7 +181,7 @@ async fn refresh_rule_provider_loop(
             if deadlines[index] > now {
                 continue;
             }
-            match config.refresh_http_rule_provider(name).await {
+            match config.refresh_rule_provider(name).await {
                 Ok(()) => match config.routing_rules() {
                     Ok(updated_rules) => {
                         routing.send_replace(Arc::new(updated_rules));
@@ -656,6 +656,72 @@ mod tests {
         refresh_task.abort();
         let _ = refresh_task.await;
         server.await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_provider_refresh_swaps_valid_routes_and_keeps_them_on_bad_files() {
+        let directory = std::env::temp_dir().join(format!(
+            "rust-mhm-file-refresh-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let provider_path = directory.join("provider.rules");
+        std::fs::write(&provider_path, "payload:\n  - DOMAIN-SUFFIX,old.example\n").unwrap();
+        let config_path = directory.join("config.yaml");
+        std::fs::write(
+            &config_path,
+            "rule-providers:\n  local:\n    type: file\n    behavior: classical\n    path: provider.rules\n    interval: 1\nrules:\n  - RULE-SET,local,REJECT\n  - MATCH,DIRECT\n",
+        )
+        .unwrap();
+
+        let config = Config::load_async(&config_path).await.unwrap();
+        let refreshes = config.rule_provider_refreshes();
+        let (sender, mut routing) = watch::channel(Arc::new(config.routing_rules().unwrap()));
+        let refresh_task = tokio::spawn(refresh_rule_provider_loop(config, refreshes, sender));
+        let old_target = RequestTarget {
+            host: TargetHost::Domain("cdn.old.example".into()),
+            port: 443,
+        };
+        let new_target = RequestTarget {
+            host: TargetHost::Domain("cdn.new.example".into()),
+            port: 443,
+        };
+        assert_eq!(routing.borrow().route(&old_target), RouteAction::Reject);
+
+        std::fs::write(&provider_path, "payload:\n  - DOMAIN-SUFFIX,new.example\n").unwrap();
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                routing.changed().await.unwrap();
+                if routing.borrow().route(&new_target) == RouteAction::Reject {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("a valid file replacement should publish new routes");
+        assert_eq!(routing.borrow().route(&old_target), RouteAction::Direct);
+
+        std::fs::write(&provider_path, "payload:\n  - GEOIP,CN\n").unwrap();
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert!(!routing.has_changed().unwrap());
+        assert_eq!(routing.borrow().route(&new_target), RouteAction::Reject);
+
+        std::fs::write(&provider_path, vec![b'x'; 4 * 1024 * 1024 + 1]).unwrap();
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert!(!routing.has_changed().unwrap());
+        assert_eq!(routing.borrow().route(&new_target), RouteAction::Reject);
+
+        std::fs::remove_file(&provider_path).unwrap();
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert!(!routing.has_changed().unwrap());
+        assert_eq!(routing.borrow().route(&new_target), RouteAction::Reject);
+
+        refresh_task.abort();
+        let _ = refresh_task.await;
         std::fs::remove_dir_all(directory).unwrap();
     }
 

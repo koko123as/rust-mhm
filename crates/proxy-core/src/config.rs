@@ -230,7 +230,7 @@ impl Config {
     pub(crate) fn rule_provider_refreshes(&self) -> Vec<(String, Duration)> {
         self.rule_providers
             .iter()
-            .filter(|(_, provider)| provider.provider_type == "http")
+            .filter(|(_, provider)| matches!(provider.provider_type.as_str(), "http" | "file"))
             .map(|(name, provider)| {
                 (
                     name.clone(),
@@ -244,40 +244,64 @@ impl Config {
             .collect()
     }
 
-    pub(crate) async fn refresh_http_rule_provider(
-        &mut self,
-        name: &str,
-    ) -> Result<(), ConfigError> {
+    pub(crate) async fn refresh_rule_provider(&mut self, name: &str) -> Result<(), ConfigError> {
         let provider = self
             .rule_providers
             .get(name)
-            .filter(|provider| provider.provider_type == "http")
+            .filter(|provider| matches!(provider.provider_type.as_str(), "http" | "file"))
             .cloned()
             .ok_or_else(|| ConfigError::InvalidRuleProvider {
                 name: name.to_owned(),
-                reason: "provider is not an HTTP provider".to_owned(),
+                reason: "provider is not an HTTP or file provider".to_owned(),
             })?;
-        let client = build_rule_provider_client(provider.headers.is_empty())?;
-        let timeout = Duration::from_millis(self.connect_timeout_ms);
-        let bytes = download_rule_provider(&client, name, &provider, timeout)
-            .await
-            .map_err(|reason| ConfigError::RuleProviderHttp {
-                name: name.to_owned(),
-                reason,
+        let is_http = provider.provider_type == "http";
+        let (payload, refreshed_bytes) = if is_http {
+            let client = build_rule_provider_client(provider.headers.is_empty())?;
+            let timeout = Duration::from_millis(self.connect_timeout_ms);
+            let bytes = download_rule_provider(&client, name, &provider, timeout)
+                .await
+                .map_err(|reason| ConfigError::RuleProviderHttp {
+                    name: name.to_owned(),
+                    reason,
+                })?;
+            let payload = parse_rule_provider_bytes(&bytes).map_err(|reason| {
+                ConfigError::RuleProviderHttp {
+                    name: name.to_owned(),
+                    reason: format!("could not parse response: {reason}"),
+                }
             })?;
-        let payload =
-            parse_rule_provider_bytes(&bytes).map_err(|reason| ConfigError::RuleProviderHttp {
-                name: name.to_owned(),
-                reason: format!("could not parse response: {reason}"),
-            })?;
+            (payload, Some(bytes))
+        } else {
+            let path = provider
+                .path
+                .as_deref()
+                .expect("file provider path is validated");
+            let config_dir = self
+                .config_dir
+                .as_deref()
+                .expect("file providers are loaded only from a config file");
+            let resolved_path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                config_dir.join(path)
+            };
+            (load_file_rule_provider_payload(&resolved_path, name)?, None)
+        };
         let mut updated = provider;
         updated.payload = payload;
-        updated
-            .validate_payload()
-            .map_err(|reason| ConfigError::RuleProviderHttp {
-                name: name.to_owned(),
-                reason: format!("response contains invalid rules: {reason}"),
-            })?;
+        updated.validate_payload().map_err(|reason| {
+            if is_http {
+                ConfigError::RuleProviderHttp {
+                    name: name.to_owned(),
+                    reason: format!("response contains invalid rules: {reason}"),
+                }
+            } else {
+                ConfigError::InvalidRuleProvider {
+                    name: name.to_owned(),
+                    reason: format!("file contains invalid rules: {reason}"),
+                }
+            }
+        })?;
         let mut candidate = self.clone();
         candidate
             .rule_providers
@@ -285,9 +309,11 @@ impl Config {
             .expect("provider was found above")
             .payload = updated.payload.clone();
         candidate.routing_rules()?;
-        let cache_path = self.rule_provider_cache_path(name, &updated);
-        if let Err(error) = write_rule_provider_cache(&cache_path, &bytes) {
-            warn!(provider = %name, error = %error, "could not persist refreshed rule-provider cache");
+        if let Some(bytes) = refreshed_bytes {
+            let cache_path = self.rule_provider_cache_path(name, &updated);
+            if let Err(error) = write_rule_provider_cache(&cache_path, &bytes) {
+                warn!(provider = %name, error = %error, "could not persist refreshed rule-provider cache");
+            }
         }
         self.rule_providers
             .get_mut(name)
@@ -332,55 +358,7 @@ impl Config {
             } else {
                 config_dir.join(path)
             };
-            let file =
-                File::open(&resolved_path).map_err(|error| ConfigError::RuleProviderLoad {
-                    name: name.clone(),
-                    path: resolved_path.display().to_string(),
-                    reason: error.to_string(),
-                })?;
-            let size = file
-                .metadata()
-                .map_err(|error| ConfigError::RuleProviderLoad {
-                    name: name.clone(),
-                    path: resolved_path.display().to_string(),
-                    reason: error.to_string(),
-                })?
-                .len();
-            if size > MAX_RULE_PROVIDER_BYTES {
-                return Err(ConfigError::RuleProviderLoad {
-                    name: name.clone(),
-                    path: resolved_path.display().to_string(),
-                    reason: format!("file exceeds {MAX_RULE_PROVIDER_BYTES} bytes"),
-                });
-            }
-            let mut bytes = Vec::with_capacity(size as usize);
-            file.take(MAX_RULE_PROVIDER_BYTES + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|error| ConfigError::RuleProviderLoad {
-                    name: name.clone(),
-                    path: resolved_path.display().to_string(),
-                    reason: error.to_string(),
-                })?;
-            if bytes.len() as u64 > MAX_RULE_PROVIDER_BYTES {
-                return Err(ConfigError::RuleProviderLoad {
-                    name: name.clone(),
-                    path: resolved_path.display().to_string(),
-                    reason: format!("file exceeds {MAX_RULE_PROVIDER_BYTES} bytes"),
-                });
-            }
-            let source =
-                String::from_utf8(bytes).map_err(|error| ConfigError::RuleProviderLoad {
-                    name: name.clone(),
-                    path: resolved_path.display().to_string(),
-                    reason: format!("file is not valid UTF-8: {error}"),
-                })?;
-            provider.payload = parse_rule_provider_file(&source).map_err(|reason| {
-                ConfigError::RuleProviderLoad {
-                    name: name.clone(),
-                    path: resolved_path.display().to_string(),
-                    reason,
-                }
-            })?;
+            provider.payload = load_file_rule_provider_payload(&resolved_path, name)?;
         }
         Ok(())
     }
@@ -592,6 +570,59 @@ fn parse_rule_provider_file(source: &str) -> Result<Vec<String>, String> {
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(str::to_owned)
         .collect())
+}
+
+fn load_file_rule_provider_payload(path: &Path, name: &str) -> Result<Vec<String>, ConfigError> {
+    let metadata = std::fs::metadata(path).map_err(|error| ConfigError::RuleProviderLoad {
+        name: name.to_owned(),
+        path: path.display().to_string(),
+        reason: error.to_string(),
+    })?;
+    if !metadata.is_file() {
+        return Err(ConfigError::RuleProviderLoad {
+            name: name.to_owned(),
+            path: path.display().to_string(),
+            reason: "path is not a regular file".to_owned(),
+        });
+    }
+    let size = metadata.len();
+    if size > MAX_RULE_PROVIDER_BYTES {
+        return Err(ConfigError::RuleProviderLoad {
+            name: name.to_owned(),
+            path: path.display().to_string(),
+            reason: format!("file exceeds {MAX_RULE_PROVIDER_BYTES} bytes"),
+        });
+    }
+    let file = File::open(path).map_err(|error| ConfigError::RuleProviderLoad {
+        name: name.to_owned(),
+        path: path.display().to_string(),
+        reason: error.to_string(),
+    })?;
+    let mut bytes = Vec::with_capacity(size as usize);
+    file.take(MAX_RULE_PROVIDER_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| ConfigError::RuleProviderLoad {
+            name: name.to_owned(),
+            path: path.display().to_string(),
+            reason: error.to_string(),
+        })?;
+    if bytes.len() as u64 > MAX_RULE_PROVIDER_BYTES {
+        return Err(ConfigError::RuleProviderLoad {
+            name: name.to_owned(),
+            path: path.display().to_string(),
+            reason: format!("file exceeds {MAX_RULE_PROVIDER_BYTES} bytes"),
+        });
+    }
+    let source = String::from_utf8(bytes).map_err(|error| ConfigError::RuleProviderLoad {
+        name: name.to_owned(),
+        path: path.display().to_string(),
+        reason: format!("file is not valid UTF-8: {error}"),
+    })?;
+    parse_rule_provider_file(&source).map_err(|reason| ConfigError::RuleProviderLoad {
+        name: name.to_owned(),
+        path: path.display().to_string(),
+        reason,
+    })
 }
 
 fn reqwest_error_reason(error: reqwest::Error) -> String {
@@ -929,8 +960,14 @@ impl RuleProviderConfig {
                     .as_ref()
                     .is_some_and(|path| !path.as_os_str().is_empty())
                     && self.url.is_none()
-                    && self.interval.is_none()
-                    && self.headers.is_empty() => {}
+                    && self.headers.is_empty() =>
+            {
+                if !valid_rule_provider_interval(self.interval) {
+                    return Err(invalid(format!(
+                        "interval must be between 1 and {MAX_RULE_PROVIDER_INTERVAL_SECS} seconds"
+                    )));
+                }
+            }
             "http"
                 if self
                     .path
@@ -953,8 +990,7 @@ impl RuleProviderConfig {
                             .to_owned(),
                     ));
                 }
-                let interval = self.interval.unwrap_or(DEFAULT_RULE_PROVIDER_INTERVAL_SECS);
-                if !(1..=MAX_RULE_PROVIDER_INTERVAL_SECS).contains(&interval) {
+                if !valid_rule_provider_interval(self.interval) {
                     return Err(invalid(format!(
                         "interval must be between 1 and {MAX_RULE_PROVIDER_INTERVAL_SECS} seconds"
                     )));
@@ -1058,6 +1094,10 @@ const fn default_max_connections() -> usize {
 
 fn default_rules() -> Vec<String> {
     vec!["MATCH,DIRECT".to_owned()]
+}
+
+fn valid_rule_provider_interval(interval: Option<u64>) -> bool {
+    interval.is_none_or(|interval| (1..=MAX_RULE_PROVIDER_INTERVAL_SECS).contains(&interval))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1455,6 +1495,53 @@ rules:
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    #[test]
+    fn file_rule_provider_interval_is_optional_bounded_and_scheduled() {
+        let directory = temporary_directory();
+        std::fs::write(directory.join("rules.txt"), "old.example\n").unwrap();
+        for (interval, expected) in [
+            (None, DEFAULT_RULE_PROVIDER_INTERVAL_SECS),
+            (Some(3600), 3600),
+            (
+                Some(MAX_RULE_PROVIDER_INTERVAL_SECS),
+                MAX_RULE_PROVIDER_INTERVAL_SECS,
+            ),
+        ] {
+            let interval_config = interval
+                .map(|seconds| format!("    interval: {seconds}\n"))
+                .unwrap_or_default();
+            let config_path = directory.join("config.yaml");
+            std::fs::write(
+                &config_path,
+                format!(
+                    "rule-providers:\n  local:\n    type: file\n    behavior: domain\n    path: rules.txt\n{interval_config}rules:\n  - RULE-SET,local,REJECT\n"
+                ),
+            )
+            .unwrap();
+            let config = Config::load(&config_path).unwrap();
+            assert_eq!(
+                config.rule_provider_refreshes(),
+                vec![("local".to_owned(), Duration::from_secs(expected))]
+            );
+        }
+
+        for invalid_interval in [0, MAX_RULE_PROVIDER_INTERVAL_SECS + 1] {
+            let config_path = directory.join("invalid-interval.yaml");
+            std::fs::write(
+                &config_path,
+                format!(
+                    "rule-providers:\n  local:\n    type: file\n    behavior: domain\n    path: rules.txt\n    interval: {invalid_interval}\n"
+                ),
+            )
+            .unwrap();
+            assert!(matches!(
+                Config::load(&config_path),
+                Err(ConfigError::InvalidRuleProvider { .. })
+            ));
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[tokio::test]
     async fn http_provider_downloads_and_routes_a_startup_snapshot() {
         let body = b"payload:\n  - .remote.example\n  - '*.static.example'\n".to_vec();
@@ -1819,6 +1906,17 @@ rules:
         assert!(matches!(
             Config::load(directory.join("missing.yaml")),
             Err(ConfigError::RuleProviderLoad { .. })
+        ));
+
+        std::fs::write(
+            directory.join("directory.yaml"),
+            "rule-providers:\n  local:\n    type: file\n    behavior: classical\n    path: .\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            Config::load(directory.join("directory.yaml")),
+            Err(ConfigError::RuleProviderLoad { reason, .. })
+                if reason.contains("not a regular file")
         ));
 
         std::fs::write(

@@ -16,7 +16,7 @@
 | `SRC-PORT` | 有限支持 | 匹配 TCP 客户端 peer 端口，接受单端口或闭区间格式。 |
 | `DST-PORT` | 有限支持 | 匹配一个端口或一个闭区间，例如 `443` 或 `8000-8100`。 |
 | `MATCH` | 支持 | 匹配所有剩余请求；显式出现时必须是唯一且最后一条规则。 |
-| `RULE-SET` | 有限支持 | 支持 `type: inline`/`file`/`http`，`behavior: classical`/`domain`/`ipcidr`；HTTP/HTTPS provider 支持持久原文缓存、离线缓存回退、按秒刷新间隔和自定义请求头。有效刷新会替换运行中的规则表，失败时保留旧表；引用处动作覆盖 provider 内容。classical 内容仅能使用本项目已实现的规则类型。缓存/刷新不是完整 Mihomo 生命周期兼容。 |
+| `RULE-SET` | 有限支持 | 支持 `type: inline`/`file`/`http`，`behavior: classical`/`domain`/`ipcidr`；HTTP/HTTPS provider 支持持久原文缓存、离线缓存回退、按秒刷新间隔和自定义请求头，file provider 可按秒重新读取本地文件。只有新内容与完整路由表都通过校验才切换活动路由；失败时保留旧表。引用处动作覆盖 provider 内容。classical 内容仅能使用本项目已实现的规则类型。缓存/刷新不是完整 Mihomo 生命周期兼容。 |
 
 规则依配置顺序评估，首个匹配决定动作。动作可为 `DIRECT`（TCP 直连）、`REJECT`（拨号前返回 SOCKS5 `REP=0x02`）或已声明的代理名。代理引用必须精确匹配 `proxies[].name`；未配置名称、重复名称和保留名称 `DIRECT`/`REJECT` 均不接受。
 
@@ -45,12 +45,13 @@
 - `DST-PORT` 目前只接受单值或单个 `-` 区间，不承诺上游语法中的所有端口集合/表达式形式。
 - 没有规则时，或列表未写 `MATCH` 时，本项目会追加 `MATCH,DIRECT`。这是本项目的 fallback 约定，不代表完整 Mihomo 的默认值。
 - 顶层只识别 `listen`、`connect_timeout_ms`、`max_connections`、`rules`、`rule-providers`、`proxies`、`authentication`、`skip-auth-prefixes`。`rule-providers` 是受限的 `inline`/`file`/`http` 子集；`mixed-port`、`proxy-groups`、完整 DNS 配置等仍会失败。
-- `RULE-SET` 的 file provider 仅在进程启动时读取相对配置文件或绝对路径；file 与 HTTP 响应均限制为 4 MiB，并支持有限 YAML `payload` 或逐行 UTF-8 文本。HTTP provider 只允许无 URL 凭据的 HTTP/HTTPS URL，要求成功状态，完整下载受 `connect_timeout_ms` 限制；无自定义请求头时最多跟随 5 次重定向，配置官方单数 `header` 时禁用重定向以避免敏感头被转发。`header` 的每个头名可对应单个字符串或字符串列表。HTTP 数据会原子写入显式 `path`（相对配置目录或绝对路径）或默认 `.rust-mhm-cache/` 缓存；缓存不能直接覆盖配置文件，也不能被多个 provider 共用。显式路径可写至配置目录外，因此只应使用可信配置。联网失败时仅回退到经规则校验的已有缓存，否则启动失败。`interval` 是 1–31536000 秒，默认一天；后台刷新成功后切换活动路由，失败保留旧规则。库调用方需使用 `Config::load_async`，CLI 已使用异步加载。MRS/自定义格式、`size-limit`、完整 provider 语义和配置文件热重载未实现；`classical` 中未实现的规则类型会报错。`Config::from_yaml_str` 不接受 file 或 HTTP provider；`Config::load` 不接受 HTTP provider。
+- `RULE-SET` 的 file provider 在启动时读取相对配置文件或绝对路径，并可按 `interval` 周期重新读取；file 与 HTTP 响应均限制为 4 MiB，并支持有限 YAML `payload` 或逐行 UTF-8 文本。HTTP provider 只允许无 URL 凭据的 HTTP/HTTPS URL，要求成功状态，完整下载受 `connect_timeout_ms` 限制；无自定义请求头时最多跟随 5 次重定向，配置官方单数 `header` 时禁用重定向以避免敏感头被转发。`header` 的每个头名可对应单个字符串或字符串列表。HTTP 数据会原子写入显式 `path`（相对配置目录或绝对路径）或默认 `.rust-mhm-cache/` 缓存；缓存不能直接覆盖配置文件，也不能被多个 provider 共用。显式路径可写至配置目录外，因此只应使用可信配置。联网失败时仅回退到经规则校验的已有缓存，否则启动失败。file/HTTP `interval` 均为 1–31536000 秒，默认一天；后台刷新仅在新 payload 和完整路由表均通过校验后切换活动路由，文件缺失、超限、下载失败或内容无效时保留旧规则。库调用方需使用 `Config::load_async`，CLI 已使用异步加载；仅含 file provider 的配置也可使用 `Config::load`。MRS/自定义格式、`size-limit`、完整 provider 语义和整个配置文件热重载未实现；`classical` 中未实现的规则类型会报错。`Config::from_yaml_str` 不接受 file 或 HTTP provider；`Config::load` 不接受 HTTP provider。
 - 代理组（手动选择、故障转移、负载均衡）、DNS 策略、UDP、透明代理与 TUN 均未实现。
 
 ## 官方参考
 
 - [Mihomo 官方 Routing Rules 文档](https://wiki.metacubex.one/en/config/rules/)：规则顺序和规则类型参考；官方将 `DOMAIN-REGEX` 定义为域名正则匹配，并将 `DOMAIN-KEYWORD` 定义为按域名关键词匹配、`SRC-IP-CIDR` 定义为匹配来源地址范围、`SRC-PORT` 定义为匹配来源端口，说明 `DOMAIN-WILDCARD` 只支持 `*` 与 `?`（分别匹配零或多个字符、恰好一个字符）。
+- [Rust regex crate 语法参考](https://docs.rs/regex/latest/regex/#syntax)：本项目 `DOMAIN-REGEX` 表达式编译所使用的语法实现。
 - [Rust regex crate 语法参考](https://docs.rs/regex/latest/regex/#syntax)：本项目 `DOMAIN-REGEX` 表达式编译所使用的语法实现。
 - [Mihomo 官方 Proxy 配置文档](https://wiki.metacubex.one/en/config/proxies/) 与[配置语法手册](https://wiki.metacubex.one/en/handbook/syntax/)：上游出站配置参考；本项目使用不同 YAML 子集，不代表相同语义或完整支持。
 - [Mihomo 官方全局配置](https://wiki.metacubex.one/en/config/general/)：`authentication` 与 `skip-auth-prefixes` 参考；本项目只支持全局认证列表及来源 CIDR 豁免的 SOCKS5 子集。
