@@ -112,4 +112,4 @@ SOCKS5 子集参考 [RFC 1928](https://www.rfc-editor.org/rfc/rfc1928) 和 [RFC 
 
 ## 验证状态
 
-Linux x86_64 上静态 `select` 代理组切片已通过格式、workspace 全目标检查、workspace 测试、零警告 Clippy、CLI 帮助、Rust 1.85 锁定依赖测试和差异检查；其跨平台 CI 在本提交推送后核验。此前 SOCKS5 UDP 出站的 [Linux、Windows、macOS 与 Rust 1.85 CI](https://github.com/koko123as/rust-mhm/actions/runs/44948797643) 已全项通过。网络测试只使用本地假服务，不依赖外网；Android、真实第三方代理、长时负载及 Android VPN 集成尚未验证。
+Linux x86_64 上静态 `select` 代理组切片已通过格式、workspace 全目标检查、81 项 workspace 测试、零警告 Clippy、CLI 帮助、Rust 1.85 锁定依赖测试和差异检查；跨平台检查也已在 [Linux、Windows、macOS 与 Rust 1.85 CI](https://github.com/koko123as/rust-mhm/actions/runs/44949696886) 全项通过。此前 SOCKS5 UDP 出站的 [CI run](https://github.com/koko123as/rust-mhm/actions/runs/44948797643) 亦已通过。网络测试只使用本地假服务，不依赖外网；Android、真实第三方代理、长时负载及 Android VPN 集成尚未验证。
