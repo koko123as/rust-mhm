@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
@@ -8,7 +9,7 @@ use std::{
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UdpSocket},
     sync::{Semaphore, watch},
     task::JoinSet,
     time::{Instant, sleep_until, timeout},
@@ -25,6 +26,7 @@ const METHOD_USERNAME_PASSWORD: u8 = 0x02;
 const METHOD_NO_ACCEPTABLE: u8 = 0xff;
 const AUTH_VERSION: u8 = 0x01;
 const CMD_CONNECT: u8 = 0x01;
+const CMD_UDP_ASSOCIATE: u8 = 0x03;
 const REP_SUCCEEDED: u8 = 0x00;
 const REP_GENERAL_FAILURE: u8 = 0x01;
 const REP_CONNECTION_NOT_ALLOWED: u8 = 0x02;
@@ -34,6 +36,8 @@ const REP_CONNECTION_REFUSED: u8 = 0x05;
 const REP_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 const REP_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_TRACKED_UDP_DESTINATIONS: usize = 1024;
+const MAX_ENCAPSULATED_UDP_PACKET_SIZE: usize = 65_507;
 
 #[derive(Clone, Copy)]
 struct ConnectionTimeouts {
@@ -48,6 +52,17 @@ struct ConnectionContext {
     outbounds: Arc<Vec<ProxyOutbound>>,
     authentication: Arc<Vec<(String, String)>>,
     skip_auth_prefixes: Arc<Vec<AuthSkipPrefix>>,
+}
+
+#[derive(Debug)]
+struct SocksRequest {
+    command: u8,
+    target: RequestTarget,
+}
+
+struct UdpDatagram<'a> {
+    target: RequestTarget,
+    payload: &'a [u8],
 }
 
 #[derive(Debug, Error)]
@@ -232,7 +247,7 @@ async fn handle_connection_with_rules(
         && !skip_auth_prefixes
             .iter()
             .any(|prefix| prefix.contains(peer.ip()));
-    let target = match timeout(
+    let request = match timeout(
         timeouts.handshake,
         negotiate(&mut client, &authentication, require_authentication),
     )
@@ -247,6 +262,18 @@ async fn handle_connection_with_rules(
         }
         Ok(Err(ProtocolError::Io(error))) => return Err(error),
     };
+
+    if request.command == CMD_UDP_ASSOCIATE {
+        return handle_udp_association(
+            client,
+            timeouts,
+            routing,
+            peer,
+            (request.target.port != 0).then_some(request.target.port),
+        )
+        .await;
+    }
+    let target = request.target;
 
     let routing_table = Arc::clone(&routing.borrow());
     let action = routing_table.route_with_source(&target, Some(peer));
@@ -305,7 +332,7 @@ async fn negotiate<S>(
     stream: &mut S,
     authentication: &[(String, String)],
     require_authentication: bool,
-) -> Result<Option<RequestTarget>, ProtocolError>
+) -> Result<Option<SocksRequest>, ProtocolError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -338,7 +365,7 @@ where
         return Ok(None);
     }
 
-    read_connect_request(stream).await.map(Some)
+    read_socks_request(stream).await.map(Some)
 }
 
 async fn authenticate_user<S>(
@@ -374,7 +401,7 @@ where
     Ok(authenticated)
 }
 
-async fn read_connect_request<S>(stream: &mut S) -> Result<RequestTarget, ProtocolError>
+async fn read_socks_request<S>(stream: &mut S) -> Result<SocksRequest, ProtocolError>
 where
     S: AsyncRead + Unpin,
 {
@@ -410,13 +437,264 @@ where
     let mut port_bytes = [0u8; 2];
     stream.read_exact(&mut port_bytes).await?;
     let port = u16::from_be_bytes(port_bytes);
+    // Consume the complete valid request frame before rejecting it. In particular,
+    // this lets Windows deliver the SOCKS error reply before closing the TCP stream.
     if header[0] != SOCKS_VERSION || header[2] != 0 {
         return Err(ProtocolError::Reply(REP_GENERAL_FAILURE));
     }
-    if header[1] != CMD_CONNECT {
+    if !matches!(header[1], CMD_CONNECT | CMD_UDP_ASSOCIATE) {
         return Err(ProtocolError::Reply(REP_COMMAND_NOT_SUPPORTED));
     }
-    Ok(RequestTarget { host, port })
+    Ok(SocksRequest {
+        command: header[1],
+        target: RequestTarget { host, port },
+    })
+}
+
+async fn handle_udp_association(
+    mut client: TcpStream,
+    timeouts: ConnectionTimeouts,
+    routing: watch::Receiver<Arc<RuleSet>>,
+    peer: SocketAddr,
+    expected_client_port: Option<u16>,
+) -> io::Result<()> {
+    let relay_bind = SocketAddr::new(client.local_addr()?.ip(), 0);
+    let relay = match UdpSocket::bind(relay_bind).await {
+        Ok(socket) => socket,
+        Err(error) => {
+            send_reply(&mut client, REP_GENERAL_FAILURE, None).await?;
+            return Err(error);
+        }
+    };
+
+    // These ephemeral sockets provide route-selected source addresses for remote UDP targets.
+    // Only responses from destinations contacted through this association are sent to the client.
+    let egress_v4 = match UdpSocket::bind("0.0.0.0:0").await {
+        Ok(socket) => Some(socket),
+        Err(error) => {
+            debug!(error = %error, "IPv4 UDP egress is unavailable for this association");
+            None
+        }
+    };
+    let egress_v6 = match UdpSocket::bind("[::]:0").await {
+        Ok(socket) => Some(socket),
+        Err(error) => {
+            debug!(error = %error, "IPv6 UDP egress is unavailable for this association");
+            None
+        }
+    };
+    if egress_v4.is_none() && egress_v6.is_none() {
+        send_reply(&mut client, REP_GENERAL_FAILURE, None).await?;
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "no UDP egress socket could be bound",
+        ));
+    }
+
+    send_reply(&mut client, REP_SUCCEEDED, Some(relay.local_addr()?)).await?;
+
+    let mut client_endpoint = None;
+    let mut allowed_destinations = VecDeque::new();
+    let mut relay_buffer = vec![0u8; 65_535];
+    let mut v4_buffer = vec![0u8; 65_535];
+    let mut v6_buffer = vec![0u8; 65_535];
+    let mut control_byte = [0u8; 1];
+
+    loop {
+        tokio::select! {
+            result = client.read(&mut control_byte) => match result {
+                Ok(_) => return Ok(()),
+                Err(error) => return Err(error),
+            },
+            result = relay.recv_from(&mut relay_buffer) => {
+                let (length, source) = result?;
+                if source.ip() != peer.ip()
+                    || expected_client_port.is_some_and(|port| port != source.port())
+                    || client_endpoint.is_some_and(|endpoint| endpoint != source)
+                {
+                    continue;
+                }
+                let Some(datagram) = decode_udp_datagram(&relay_buffer[..length]) else {
+                    continue;
+                };
+                if client_endpoint.is_none() {
+                    client_endpoint = Some(source);
+                }
+
+                let action = routing
+                    .borrow()
+                    .route_with_source(&datagram.target, Some(peer));
+                match action {
+                    RouteAction::Direct => {}
+                    RouteAction::Reject => continue,
+                    RouteAction::Proxy(name) => {
+                        debug!(proxy = %name, "dropping UDP datagram; UDP proxying is not implemented");
+                        continue;
+                    }
+                }
+
+                let destinations = match timeout(
+                    timeouts.connect,
+                    resolve_udp_target(&datagram.target),
+                ).await {
+                    Ok(Ok(destinations)) => destinations,
+                    Ok(Err(error)) => {
+                        debug!(error = %error, "could not resolve UDP destination");
+                        continue;
+                    }
+                    Err(_) => {
+                        debug!("UDP destination lookup timed out");
+                        continue;
+                    }
+                };
+                for destination in destinations {
+                    let egress = match destination.ip() {
+                        IpAddr::V4(_) => egress_v4.as_ref(),
+                        IpAddr::V6(_) => egress_v6.as_ref(),
+                    };
+                    let Some(egress) = egress else {
+                        continue;
+                    };
+                    if matches!(
+                        egress.send_to(datagram.payload, destination).await,
+                        Ok(sent) if sent == datagram.payload.len()
+                    ) {
+                        remember_udp_destination(&mut allowed_destinations, destination);
+                        break;
+                    }
+                }
+            },
+            result = async {
+                match egress_v4.as_ref() {
+                    Some(socket) => socket.recv_from(&mut v4_buffer).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let (length, source) = result?;
+                relay_udp_response(
+                    &relay,
+                    &allowed_destinations,
+                    client_endpoint,
+                    source,
+                    &v4_buffer[..length],
+                ).await?;
+            },
+            result = async {
+                match egress_v6.as_ref() {
+                    Some(socket) => socket.recv_from(&mut v6_buffer).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let (length, source) = result?;
+                relay_udp_response(
+                    &relay,
+                    &allowed_destinations,
+                    client_endpoint,
+                    source,
+                    &v6_buffer[..length],
+                ).await?;
+            },
+        }
+    }
+}
+
+async fn resolve_udp_target(target: &RequestTarget) -> io::Result<Vec<SocketAddr>> {
+    match &target.host {
+        TargetHost::Ip(address) => Ok(vec![SocketAddr::new(*address, target.port)]),
+        TargetHost::Domain(domain) => Ok(tokio::net::lookup_host((domain.as_str(), target.port))
+            .await?
+            .collect()),
+    }
+}
+
+fn decode_udp_datagram(packet: &[u8]) -> Option<UdpDatagram<'_>> {
+    if packet.len() < 4 || packet[0] != 0 || packet[1] != 0 || packet[2] != 0 {
+        return None;
+    }
+    let mut cursor = 4;
+    let host = match packet[3] {
+        0x01 => {
+            let octets: [u8; 4] = packet.get(cursor..cursor + 4)?.try_into().ok()?;
+            cursor += 4;
+            TargetHost::Ip(IpAddr::V4(octets.into()))
+        }
+        0x04 => {
+            let octets: [u8; 16] = packet.get(cursor..cursor + 16)?.try_into().ok()?;
+            cursor += 16;
+            TargetHost::Ip(IpAddr::V6(octets.into()))
+        }
+        0x03 => {
+            let length = usize::from(*packet.get(cursor)?);
+            cursor += 1;
+            if length == 0 {
+                return None;
+            }
+            let domain = String::from_utf8(packet.get(cursor..cursor + length)?.to_vec()).ok()?;
+            cursor += length;
+            TargetHost::Domain(domain)
+        }
+        _ => return None,
+    };
+    let port = u16::from_be_bytes(packet.get(cursor..cursor + 2)?.try_into().ok()?);
+    cursor += 2;
+    Some(UdpDatagram {
+        target: RequestTarget { host, port },
+        payload: &packet[cursor..],
+    })
+}
+
+fn encode_udp_datagram(source: SocketAddr, payload: &[u8]) -> Option<Vec<u8>> {
+    let header_size = match source.ip() {
+        IpAddr::V4(_) => 10,
+        IpAddr::V6(_) => 22,
+    };
+    if header_size + payload.len() > MAX_ENCAPSULATED_UDP_PACKET_SIZE {
+        return None;
+    }
+    let mut packet = Vec::with_capacity(header_size + payload.len());
+    packet.extend_from_slice(&[0, 0, 0]);
+    match source.ip() {
+        IpAddr::V4(address) => {
+            packet.push(0x01);
+            packet.extend_from_slice(&address.octets());
+        }
+        IpAddr::V6(address) => {
+            packet.push(0x04);
+            packet.extend_from_slice(&address.octets());
+        }
+    }
+    packet.extend_from_slice(&source.port().to_be_bytes());
+    packet.extend_from_slice(payload);
+    Some(packet)
+}
+
+fn remember_udp_destination(destinations: &mut VecDeque<SocketAddr>, destination: SocketAddr) {
+    if destinations.contains(&destination) {
+        return;
+    }
+    if destinations.len() == MAX_TRACKED_UDP_DESTINATIONS {
+        destinations.pop_front();
+    }
+    destinations.push_back(destination);
+}
+
+async fn relay_udp_response(
+    relay: &UdpSocket,
+    allowed_destinations: &VecDeque<SocketAddr>,
+    client_endpoint: Option<SocketAddr>,
+    source: SocketAddr,
+    payload: &[u8],
+) -> io::Result<()> {
+    let Some(client_endpoint) = client_endpoint else {
+        return Ok(());
+    };
+    if !allowed_destinations.contains(&source) {
+        return Ok(());
+    }
+    if let Some(packet) = encode_udp_datagram(source, payload) {
+        relay.send_to(&packet, client_endpoint).await?;
+    }
+    Ok(())
 }
 
 async fn connect_target(target: &RequestTarget) -> io::Result<TcpStream> {
@@ -562,11 +840,57 @@ mod tests {
         (header[0], header[1])
     }
 
+    async fn read_reply_with_bound_address(client: &mut TcpStream) -> (u8, u8, SocketAddr) {
+        let mut header = [0u8; 4];
+        client.read_exact(&mut header).await.unwrap();
+        let ip = match header[3] {
+            0x01 => {
+                let mut octets = [0u8; 4];
+                client.read_exact(&mut octets).await.unwrap();
+                IpAddr::V4(octets.into())
+            }
+            0x04 => {
+                let mut octets = [0u8; 16];
+                client.read_exact(&mut octets).await.unwrap();
+                IpAddr::V6(octets.into())
+            }
+            other => panic!("unexpected reply address type: {other}"),
+        };
+        let port = client.read_u16().await.unwrap();
+        (header[0], header[1], SocketAddr::new(ip, port))
+    }
+
     async fn parse_target(request: &[u8]) -> Result<RequestTarget, ProtocolError> {
         let (mut writer, mut reader) = tokio::io::duplex(request.len() + 1);
         writer.write_all(request).await.unwrap();
         drop(writer);
-        read_connect_request(&mut reader).await
+        read_socks_request(&mut reader)
+            .await
+            .map(|request| request.target)
+    }
+
+    async fn parse_request(request: &[u8]) -> Result<SocksRequest, ProtocolError> {
+        let (mut writer, mut reader) = tokio::io::duplex(request.len() + 1);
+        writer.write_all(request).await.unwrap();
+        drop(writer);
+        read_socks_request(&mut reader).await
+    }
+
+    fn udp_request_packet(target: SocketAddr, payload: &[u8]) -> Vec<u8> {
+        let mut packet = vec![0, 0, 0];
+        match target.ip() {
+            IpAddr::V4(address) => {
+                packet.push(0x01);
+                packet.extend_from_slice(&address.octets());
+            }
+            IpAddr::V6(address) => {
+                packet.push(0x04);
+                packet.extend_from_slice(&address.octets());
+            }
+        }
+        packet.extend_from_slice(&target.port().to_be_bytes());
+        packet.extend_from_slice(payload);
+        packet
     }
 
     async fn start_provider_response_sequence(
@@ -807,6 +1131,160 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parses_udp_associate_and_udp_datagram_address_families() {
+        let request = parse_request(&[SOCKS_VERSION, CMD_UDP_ASSOCIATE, 0, 0x01, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        assert_eq!(request.command, CMD_UDP_ASSOCIATE);
+        assert_eq!(request.target.port, 0);
+        assert_eq!(
+            request.target.host,
+            TargetHost::Ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+        );
+
+        let v4 = udp_request_packet("192.0.2.1:5353".parse().unwrap(), b"v4");
+        let decoded = decode_udp_datagram(&v4).unwrap();
+        assert_eq!(
+            decoded.target.host,
+            TargetHost::Ip("192.0.2.1".parse().unwrap())
+        );
+        assert_eq!(decoded.target.port, 5353);
+        assert_eq!(decoded.payload, b"v4");
+
+        let v6 = udp_request_packet("[2001:db8::1]:5353".parse().unwrap(), b"v6");
+        let decoded = decode_udp_datagram(&v6).unwrap();
+        assert_eq!(
+            decoded.target.host,
+            TargetHost::Ip("2001:db8::1".parse().unwrap())
+        );
+        assert_eq!(decoded.target.port, 5353);
+        assert_eq!(decoded.payload, b"v6");
+
+        let mut domain = vec![0, 0, 0, 0x03, 11];
+        domain.extend_from_slice(b"example.com");
+        domain.extend_from_slice(&443u16.to_be_bytes());
+        domain.extend_from_slice(b"domain");
+        let decoded = decode_udp_datagram(&domain).unwrap();
+        assert_eq!(
+            decoded.target.host,
+            TargetHost::Domain("example.com".into())
+        );
+        assert_eq!(decoded.target.port, 443);
+        assert_eq!(decoded.payload, b"domain");
+
+        for malformed in [
+            &[0, 0, 0][..],
+            &[0, 1, 0, 1, 127, 0, 0, 1, 0, 53][..],
+            &[0, 0, 1, 1, 127, 0, 0, 1, 0, 53][..],
+            &[0, 0, 0, 2, 127, 0, 0, 1, 0, 53][..],
+            &[0, 0, 0, 3, 0][..],
+        ] {
+            assert!(decode_udp_datagram(malformed).is_none());
+        }
+
+        let response = encode_udp_datagram("192.0.2.1:5353".parse().unwrap(), b"reply").unwrap();
+        let decoded = decode_udp_datagram(&response).unwrap();
+        assert_eq!(
+            decoded.target.host,
+            TargetHost::Ip("192.0.2.1".parse().unwrap())
+        );
+        assert_eq!(decoded.target.port, 5353);
+        assert_eq!(decoded.payload, b"reply");
+    }
+
+    #[tokio::test]
+    async fn socks5_udp_associate_relays_direct_datagrams_and_pins_client_port() {
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_address = echo.local_addr().unwrap();
+        let mut echo_task = tokio::spawn(async move {
+            let mut buffer = [0u8; 1024];
+            let (length, source) = echo.recv_from(&mut buffer).await.unwrap();
+            echo.send_to(&buffer[..length], source).await.unwrap();
+        });
+        let client_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_udp_address = client_udp.local_addr().unwrap();
+        let attacker_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (mut control, server_task) = start_one_connection().await;
+        negotiate_no_auth(&mut control).await;
+        let mut request = vec![SOCKS_VERSION, CMD_UDP_ASSOCIATE, 0, 0x01, 127, 0, 0, 1];
+        request.extend_from_slice(&client_udp_address.port().to_be_bytes());
+        control.write_all(&request).await.unwrap();
+        let (version, reply, relay_address) = read_reply_with_bound_address(&mut control).await;
+        assert_eq!((version, reply), (SOCKS_VERSION, REP_SUCCEEDED));
+        assert_eq!(relay_address.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_ne!(relay_address.port(), 0);
+
+        let packet = udp_request_packet(echo_address, b"direct-udp");
+        attacker_udp.send_to(&packet, relay_address).await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(100), &mut echo_task)
+                .await
+                .is_err()
+        );
+
+        client_udp.send_to(&packet, relay_address).await.unwrap();
+        timeout(Duration::from_secs(2), &mut echo_task)
+            .await
+            .expect("direct UDP datagram should reach the loopback echo server")
+            .unwrap();
+
+        let mut response = [0u8; 1024];
+        let (response_length, source) =
+            timeout(Duration::from_secs(2), client_udp.recv_from(&mut response))
+                .await
+                .expect("UDP response should return through the SOCKS relay")
+                .unwrap();
+        assert_eq!(source, relay_address);
+        let decoded = decode_udp_datagram(&response[..response_length]).unwrap();
+        assert_eq!(decoded.target.host, TargetHost::Ip(echo_address.ip()));
+        assert_eq!(decoded.target.port, echo_address.port());
+        assert_eq!(decoded.payload, b"direct-udp");
+
+        control.shutdown().await.unwrap();
+        timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("closing the TCP control connection ends the UDP association")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reject_and_proxy_udp_routes_never_fall_back_to_direct() {
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_address = echo.local_addr().unwrap();
+        let proxy_names = vec!["upstream".to_owned()];
+
+        for action in ["REJECT", "upstream"] {
+            let rules = RuleSet::parse_with_proxies(
+                &[format!("DST-PORT,{},{}", echo_address.port(), action)],
+                &proxy_names,
+            )
+            .unwrap();
+            let client_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let client_udp_address = client_udp.local_addr().unwrap();
+            let (mut control, server_task) = start_one_connection_with_rules(rules).await;
+            negotiate_no_auth(&mut control).await;
+            let mut request = vec![SOCKS_VERSION, CMD_UDP_ASSOCIATE, 0, 0x01, 127, 0, 0, 1];
+            request.extend_from_slice(&client_udp_address.port().to_be_bytes());
+            control.write_all(&request).await.unwrap();
+            let (version, reply, relay_address) = read_reply_with_bound_address(&mut control).await;
+            assert_eq!((version, reply), (SOCKS_VERSION, REP_SUCCEEDED));
+
+            let packet = udp_request_packet(echo_address, b"must-not-leak-directly");
+            client_udp.send_to(&packet, relay_address).await.unwrap();
+            let mut buffer = [0u8; 1024];
+            assert!(
+                timeout(Duration::from_millis(100), echo.recv_from(&mut buffer))
+                    .await
+                    .is_err()
+            );
+
+            control.shutdown().await.unwrap();
+            server_task.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn invalid_provider_refresh_keeps_active_routes_and_cached_snapshot() {
         let directory = std::env::temp_dir().join(format!(
             "rust-mhm-invalid-refresh-test-{}",
@@ -1024,9 +1502,9 @@ mod tests {
     async fn unsupported_socks_command_is_rejected() {
         let (mut client, server_task) = start_one_connection().await;
         negotiate_no_auth(&mut client).await;
-        // UDP ASSOCIATE is deliberately outside this TCP-only phase.
+        // BIND remains unsupported.
         client
-            .write_all(&[SOCKS_VERSION, 0x03, 0, 0x01, 127, 0, 0, 1, 0, 53])
+            .write_all(&[SOCKS_VERSION, 0x02, 0, 0x01, 127, 0, 0, 1, 0, 53])
             .await
             .unwrap();
         assert_eq!(
@@ -1112,7 +1590,7 @@ mod tests {
                     Ok(_) => {
                         assert_eq!(method_response, [SOCKS_VERSION, METHOD_NO_AUTH]);
                         client
-                            .write_all(&[SOCKS_VERSION, 0x03, 0, 0x01, 127, 0, 0, 1, 0, 53])
+                            .write_all(&[SOCKS_VERSION, 0x02, 0, 0x01, 127, 0, 0, 1, 0, 53])
                             .await
                             .unwrap();
                         assert_eq!(
@@ -1219,7 +1697,7 @@ mod tests {
         client.read_exact(&mut auth_reply).await.unwrap();
         assert_eq!(auth_reply, [AUTH_VERSION, 0x00]);
         client
-            .write_all(&[SOCKS_VERSION, 0x03, 0, 0x01, 127, 0, 0, 1, 0, 53])
+            .write_all(&[SOCKS_VERSION, 0x02, 0, 0x01, 127, 0, 0, 1, 0, 53])
             .await
             .unwrap();
         assert_eq!(
@@ -1268,7 +1746,7 @@ mod tests {
         .await;
         negotiate_no_auth(&mut client).await;
         client
-            .write_all(&[SOCKS_VERSION, 0x03, 0, 0x01, 127, 0, 0, 1, 0, 53])
+            .write_all(&[SOCKS_VERSION, 0x02, 0, 0x01, 127, 0, 0, 1, 0, 53])
             .await
             .unwrap();
         assert_eq!(

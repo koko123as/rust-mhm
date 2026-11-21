@@ -70,7 +70,9 @@ HTTP 响应必须成功且不超过 4 MiB；完整请求及流式下载受 `conn
 
 代理类型目前只支持 `http`（HTTP CONNECT 隧道，不是通用正向 HTTP 转发，也不支持 TLS-to-proxy）和 `socks5`（SOCKS5 TCP CONNECT）。规则的第三列用代理名选择出站，例如 `MATCH,upstream`。省略规则时按本项目约定使用 `MATCH,DIRECT`。
 
-`skip-auth-prefixes` 命中时将协商无认证方法；该功能应谨慎配置，避免把不可信来源列入豁免范围。SOCKS5 入站认证和 SOCKS5 出站认证按 RFC 1929 传输明文凭据，因此仅应在可信本机网络使用。**仍未实现：** UDP、HTTP 入站、HTTPS/其他代理出站、代理组、Mihomo DNS 策略、TUN、订阅、REST API、UI 与 Android 服务。IP-CIDR 不会为域名目标先行解析。该项目不接受完整 Mihomo YAML；见 [兼容性台账](COMPATIBILITY.md)。
+SOCKS5 入站现支持有限的 RFC 1928 `UDP ASSOCIATE`：为每个已认证的 TCP 控制连接建立 loopback UDP relay，控制连接关闭时结束关联；仅允许来自控制连接客户端 IP 的数据报，并在首个合法数据报后固定客户端 UDP 端点。IPv4、IPv6 和域名目标按每个数据报应用路由规则；只有 `DIRECT` 会转发，`REJECT` 与具名代理动作会丢弃，绝不会回退直连。UDP 分片、SOCKS5/HTTP 代理 UDP 出站、DNS 策略、Mihomo 的 `udp` 配置字段及完整入站语义均未实现。relay 地址仍限制在 loopback；远端 UDP 出站通过临时系统端口发送，只把已联系目标的响应转回客户端。
+
+`skip-auth-prefixes` 命中时将协商无认证方法；该功能应谨慎配置，避免把不可信来源列入豁免范围。SOCKS5 入站认证和 SOCKS5 出站认证按 RFC 1929 传输明文凭据，因此仅应在可信本机网络使用。**仍未实现：** HTTP 入站、HTTPS/其他代理出站、代理组、Mihomo DNS 策略、TUN、订阅、REST API、UI 与 Android 服务。IP-CIDR 不会为域名目标先行解析。该项目不接受完整 Mihomo YAML；见 [兼容性台账](COMPATIBILITY.md)。
 
 ## 快速开始
 
@@ -102,4 +104,4 @@ SOCKS5 子集参考 [RFC 1928](https://www.rfc-editor.org/rfc/rfc1928) 和 [RFC 
 
 ## 验证状态
 
-Linux x86_64 上已验证格式检查、workspace 全目标编译、73 项 workspace 测试、零警告 Clippy、CLI 帮助检查与 Rust 1.85.0 锁定依赖测试。提交 `e7cba48` 的 [GitHub Actions 跨平台 run](https://github.com/koko123as/rust-mhm/actions/runs/44945822264) 与提交 `e7a6184` 的 [file-provider 热重载 run](https://github.com/koko123as/rust-mhm/actions/runs/44946737973) 均已通过 Linux、Windows、macOS 和 Rust 1.85 所有任务。网络测试只使用本地假服务，不依赖外网；Android、真实第三方代理、长时负载及 Android VPN 集成尚未验证.
+Linux x86_64 上此前通过格式检查、workspace 全目标编译、73 项 workspace 测试、零警告 Clippy、CLI 帮助检查与 Rust 1.85.0 锁定依赖测试；当前本地工作区已通过核心 crate 的 76 项测试、全目标检查与零警告 Clippy，新增 UDP 改动尚待完整 workspace 和 CI 验证。提交 `e7cba48` 的 [GitHub Actions 跨平台 run](https://github.com/koko123as/rust-mhm/actions/runs/44945822264) 与提交 `e7a6184` 的 [file-provider 热重载 run](https://github.com/koko123as/rust-mhm/actions/runs/44946737973) 均已通过 Linux、Windows、macOS 和 Rust 1.85 所有任务。网络测试只使用本地假服务，不依赖外网；Android、真实第三方代理、长时负载及 Android VPN 集成尚未验证。

@@ -42,7 +42,9 @@
 ## Phase 4 — DNS、UDP 与控制接口
 
 - [ ] 单独设计 DNS 解析策略、缓存和与 IP 规则的交互边界。
-- [ ] UDP、DNS、连接监控和控制 API 各自拆阶段；未实现前明确显示不支持。
+- [x] SOCKS5 入站 `UDP ASSOCIATE` 的有限切片：控制 TCP 生命周期、loopback relay、IPv4/IPv6/域名目标、逐数据报规则判定与 DIRECT UDP 往返；只接收控制 peer 的来源 IP，固定客户端 UDP 端点；非 DIRECT、畸形与分片数据报均丢弃。
+- [ ] SOCKS5/HTTP 代理 UDP 出站、UDP 分片、完整 Mihomo UDP 入站配置及与 DNS 策略的交互。
+- [ ] DNS、连接监控和控制 API 各自拆阶段；未实现前明确显示不支持。
 
 ## Phase 5 — 平台数据面与产品集成
 
