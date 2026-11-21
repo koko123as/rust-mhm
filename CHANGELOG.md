@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- 新增严格配置的有限 `type: load-balance` 组：只接受缺省策略或 `strategy: round-robin`，并拒绝未实现策略及 `url`/`interval` 健康检查字段。
+- 每次路由决策只轮换并解析一个有序成员；TCP 本次连接失败不重试其他成员，UDP 按每个数据报重新路由。round-robin 游标为进程内状态，provider 刷新只在组类型和有序成员保持不变时继承。
+- load-balance 不作为控制 API 手动选择组，也不写入 `proxy-group-state-file`；一致性哈希、粘性会话、主动健康检查和完整 Mihomo 自动策略仍未实现。
+- 增加配置拒绝、并发精确轮换、克隆共享/独立隔离、provider 刷新继承与重置、控制 API 隔离，以及 TCP 不重试和 UDP `REJECT` 不泄漏直连的测试。
 - 新增严格配置的有限 `type: fallback` 组：TCP CONNECT 建连失败后按配置顺序尝试下一个候选，成功即停止，`REJECT` 会终止尝试，嵌套 fallback 展平。
 - 所有候选共享单个 `connect_timeout_ms` 连接总时限；fallback 遇到 UDP 数据报时明确丢弃，不回退直连。控制 API 与持久化状态仍只处理手动 `select` 组。
 - 新增本地假代理端到端测试，覆盖首候选失败后成功、首候选成功不尝试后续、全部失败、REJECT 终止、嵌套 select 改变后续请求候选及候选共享总时限。

@@ -67,6 +67,8 @@ struct ProxyGroupConfig {
     proxies: Vec<String>,
     #[serde(default, rename = "default-selected")]
     default_selected: Option<String>,
+    #[serde(default)]
+    strategy: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -702,18 +704,33 @@ impl Config {
             let kind = match group.group_type.as_str() {
                 "select" => ProxyGroupKind::Select,
                 "fallback" => ProxyGroupKind::Fallback,
+                "load-balance" => ProxyGroupKind::LoadBalance,
                 _ => {
                     return Err(ConfigError::InvalidProxyGroup(format!(
-                        "unsupported group type '{}' for {} (only select and fallback are supported)",
+                        "unsupported group type '{}' for {} (only select, fallback, and load-balance are supported)",
                         group.group_type, group.name
                     )));
                 }
             };
-            if kind == ProxyGroupKind::Fallback && group.default_selected.is_some() {
+            if kind != ProxyGroupKind::Select && group.default_selected.is_some() {
                 return Err(ConfigError::InvalidProxyGroup(format!(
                     "default-selected is only supported for select group {}",
                     group.name
                 )));
+            }
+            if let Some(strategy) = &group.strategy {
+                if kind != ProxyGroupKind::LoadBalance {
+                    return Err(ConfigError::InvalidProxyGroup(format!(
+                        "strategy is only supported for load-balance group {}",
+                        group.name
+                    )));
+                }
+                if strategy != "round-robin" {
+                    return Err(ConfigError::InvalidProxyGroup(format!(
+                        "unsupported load-balance strategy '{}' for {} (only round-robin is supported)",
+                        strategy, group.name
+                    )));
+                }
             }
             if group.proxies.is_empty() {
                 return Err(ConfigError::InvalidProxyGroup(format!(
@@ -758,6 +775,7 @@ impl Config {
                 let kind = match group.group_type.as_str() {
                     "select" => ProxyGroupKind::Select,
                     "fallback" => ProxyGroupKind::Fallback,
+                    "load-balance" => ProxyGroupKind::LoadBalance,
                     _ => unreachable!("group types are validated before construction"),
                 };
                 let default_selected = if kind == ProxyGroupKind::Select {
@@ -2636,8 +2654,186 @@ rules:
         rules.select_proxy_group_member("outer", "first").unwrap();
         assert_eq!(
             rules.route(&target("other.example")),
-            RouteAction::Proxy("first".to_owned())
+            RouteAction::Proxy("first".into())
         );
+    }
+
+    #[test]
+    fn load_balance_round_robins_per_route_and_is_not_manually_selectable() {
+        let config = Config::from_yaml_str(
+            r#"
+proxies:
+  - { name: first, type: http, server: 127.0.0.1, port: 8080 }
+  - { name: second, type: socks5, server: 127.0.0.1, port: 1080 }
+proxy-groups:
+  - name: balanced
+    type: load-balance
+    proxies: [first, second]
+  - name: outer
+    type: load-balance
+    strategy: round-robin
+    proxies: [first, nested]
+  - name: nested
+    type: select
+    proxies: [first, second]
+    default-selected: second
+rules:
+  - DOMAIN,balanced.example,balanced
+  - DOMAIN,outer.example,outer
+  - MATCH,DIRECT
+"#,
+        )
+        .unwrap();
+        let rules = config.routing_rules().unwrap();
+        let balanced_target = RequestTarget {
+            host: TargetHost::Domain("balanced.example".into()),
+            port: 443,
+        };
+        let outer_target = RequestTarget {
+            host: TargetHost::Domain("outer.example".into()),
+            port: 443,
+        };
+
+        assert_eq!(
+            rules.route(&balanced_target),
+            RouteAction::Proxy("first".into())
+        );
+        assert_eq!(
+            rules.route(&balanced_target),
+            RouteAction::Proxy("second".into())
+        );
+        assert_eq!(
+            rules.route(&balanced_target),
+            RouteAction::Proxy("first".into())
+        );
+        let clone = rules.clone();
+        assert_eq!(
+            clone.route(&balanced_target),
+            RouteAction::Proxy("second".into())
+        );
+        let independent = config.routing_rules().unwrap();
+        assert_eq!(
+            independent.route(&balanced_target),
+            RouteAction::Proxy("first".into())
+        );
+        let concurrent_rules = config.routing_rules().unwrap();
+        let concurrent_counts = std::sync::Arc::new([
+            std::sync::atomic::AtomicUsize::new(0),
+            std::sync::atomic::AtomicUsize::new(0),
+        ]);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let rules = concurrent_rules.clone();
+                let target = balanced_target.clone();
+                let counts = std::sync::Arc::clone(&concurrent_counts);
+                scope.spawn(move || {
+                    for _ in 0..1_000 {
+                        match rules.route(&target) {
+                            RouteAction::Proxy(name) if name == "first" => {
+                                counts[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            RouteAction::Proxy(name) if name == "second" => {
+                                counts[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            action => panic!("unexpected load-balance action: {action:?}"),
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            concurrent_counts[0].load(std::sync::atomic::Ordering::Relaxed),
+            4_000
+        );
+        assert_eq!(
+            concurrent_counts[1].load(std::sync::atomic::Ordering::Relaxed),
+            4_000
+        );
+
+        assert_eq!(
+            rules.route(&outer_target),
+            RouteAction::Proxy("first".into())
+        );
+        assert_eq!(
+            rules.route(&outer_target),
+            RouteAction::Proxy("second".into())
+        );
+        rules.select_proxy_group_member("nested", "first").unwrap();
+        assert_eq!(
+            rules.route(&outer_target),
+            RouteAction::Proxy("first".into())
+        );
+        assert_eq!(
+            rules.route(&outer_target),
+            RouteAction::Proxy("first".into())
+        );
+        assert!(rules.proxy_group_snapshot("balanced").is_none());
+        assert!(matches!(
+            rules.select_proxy_group_member("balanced", "first"),
+            Err(RuleError::ProxyGroupNotSelectable { .. })
+        ));
+        assert_eq!(
+            rules
+                .proxy_group_snapshots()
+                .into_iter()
+                .map(|group| group.name)
+                .collect::<Vec<_>>(),
+            ["nested"]
+        );
+
+        assert_eq!(
+            rules.route(&balanced_target),
+            RouteAction::Proxy("first".into())
+        );
+        let mut refreshed = config.routing_rules().unwrap();
+        refreshed.inherit_proxy_group_selections_from(&rules);
+        assert_eq!(
+            refreshed.route(&balanced_target),
+            RouteAction::Proxy("second".into())
+        );
+        assert_eq!(
+            refreshed.route(&balanced_target),
+            RouteAction::Proxy("first".into())
+        );
+        assert_eq!(
+            refreshed.selected_proxy_group_member("nested").as_deref(),
+            Some("first")
+        );
+        let reordered_config = Config::from_yaml_str(
+            r#"
+proxies:
+  - { name: first, type: http, server: 127.0.0.1, port: 8080 }
+  - { name: second, type: socks5, server: 127.0.0.1, port: 1080 }
+proxy-groups:
+  - name: balanced
+    type: load-balance
+    proxies: [second, first]
+rules:
+  - MATCH,balanced
+"#,
+        )
+        .unwrap();
+        let mut reordered = reordered_config.routing_rules().unwrap();
+        reordered.inherit_proxy_group_selections_from(&refreshed);
+        assert_eq!(
+            reordered.route(&balanced_target),
+            RouteAction::Proxy("second".into())
+        );
+    }
+
+    #[test]
+    fn load_balance_rejects_unimplemented_strategies_and_health_fields() {
+        let invalid_configurations = [
+            "proxy-groups:\n  - name: balanced\n    type: load-balance\n    proxies: [DIRECT]\n    strategy: consistent-hashing\n",
+            "proxy-groups:\n  - name: balanced\n    type: load-balance\n    proxies: [DIRECT]\n    strategy: sticky-sessions\n",
+            "proxy-groups:\n  - name: balanced\n    type: load-balance\n    proxies: [DIRECT]\n    url: https://example.org/\n",
+            "proxy-groups:\n  - name: balanced\n    type: load-balance\n    proxies: [DIRECT]\n    interval: 300\n",
+            "proxy-groups:\n  - name: balanced\n    type: load-balance\n    proxies: [DIRECT]\n    default-selected: DIRECT\n",
+            "proxy-groups:\n  - name: selected\n    type: select\n    proxies: [DIRECT]\n    strategy: round-robin\n",
+        ];
+        for source in invalid_configurations {
+            assert!(Config::from_yaml_str(source).is_err(), "accepted: {source}");
+        }
     }
 
     #[test]

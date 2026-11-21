@@ -2085,6 +2085,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_balance_udp_selects_per_datagram_and_reject_never_leaks_direct() {
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_address = echo.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            let mut buffer = [0u8; 1024];
+            for expected in [b"lb-direct-one".as_slice(), b"lb-direct-three".as_slice()] {
+                let (length, source) = echo.recv_from(&mut buffer).await.unwrap();
+                assert_eq!(&buffer[..length], expected);
+                echo.send_to(&buffer[..length], source).await.unwrap();
+            }
+        });
+        let config = Config::from_yaml_str(
+            "proxy-groups:\n  - { name: balanced, type: load-balance, strategy: round-robin, proxies: [DIRECT, REJECT] }\nrules:\n  - MATCH,balanced\n",
+        )
+        .unwrap();
+        let client_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_udp_address = client_udp.local_addr().unwrap();
+        let (mut control, server_task) =
+            start_one_connection_with_rules(config.routing_rules().unwrap()).await;
+        negotiate_no_auth(&mut control).await;
+        let mut request = vec![SOCKS_VERSION, CMD_UDP_ASSOCIATE, 0, 0x01, 127, 0, 0, 1];
+        request.extend_from_slice(&client_udp_address.port().to_be_bytes());
+        control.write_all(&request).await.unwrap();
+        let (version, reply, relay_address) = read_reply_with_bound_address(&mut control).await;
+        assert_eq!((version, reply), (SOCKS_VERSION, REP_SUCCEEDED));
+
+        let cases: [(&[u8], bool); 3] = [
+            (b"lb-direct-one", true),
+            (b"lb-reject", false),
+            (b"lb-direct-three", true),
+        ];
+        for (payload, expect_response) in cases {
+            let packet = udp_request_packet(echo_address, payload);
+            client_udp.send_to(&packet, relay_address).await.unwrap();
+            let mut response = [0u8; 1024];
+            if expect_response {
+                let (length, source) =
+                    timeout(Duration::from_secs(2), client_udp.recv_from(&mut response))
+                        .await
+                        .expect("DIRECT load-balance slots should return UDP responses")
+                        .unwrap();
+                assert_eq!(source, relay_address);
+                assert_eq!(
+                    decode_udp_datagram(&response[..length]).unwrap().payload,
+                    payload
+                );
+            } else {
+                assert!(
+                    timeout(
+                        Duration::from_millis(100),
+                        client_udp.recv_from(&mut response)
+                    )
+                    .await
+                    .is_err()
+                );
+            }
+        }
+
+        control.shutdown().await.unwrap();
+        server_task.await.unwrap().unwrap();
+        echo_task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn socks5_proxy_udp_route_preserves_domain_and_relays_response() {
         let proxy_relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let proxy_relay_address = proxy_relay.local_addr().unwrap();
@@ -2984,6 +3048,62 @@ mod tests {
         assert!(server_task.await.unwrap().is_err());
         first_task.await.unwrap();
         second_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn load_balance_does_not_retry_a_rejected_member_and_rotates_next_connect() {
+        let first_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_address = first_listener.local_addr().unwrap();
+        let first_task = start_http_reject_proxy(first_listener).await;
+        let second_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_address = second_listener.local_addr().unwrap();
+        let config_source = format!(
+            "connect_timeout_ms: 2000\nproxies:\n  - {{ name: first, type: http, server: {}, port: {} }}\n  - {{ name: second, type: http, server: {}, port: {} }}\nproxy-groups:\n  - {{ name: balanced, type: load-balance, strategy: round-robin, proxies: [first, second] }}\nrules:\n  - MATCH,balanced\n",
+            first_address.ip(),
+            first_address.port(),
+            second_address.ip(),
+            second_address.port(),
+        );
+        let config = Config::from_yaml_str(&config_source).unwrap();
+        let rules = config.routing_rules().unwrap();
+        let outbounds = config.proxy_outbounds().to_vec();
+
+        let (mut first_client, first_server) =
+            start_one_connection_with_rules_and_outbounds(rules.clone(), outbounds.clone()).await;
+        negotiate_no_auth(&mut first_client).await;
+        send_domain_connect(&mut first_client, "example.com", 443).await;
+        assert_eq!(
+            read_reply(&mut first_client).await,
+            (SOCKS_VERSION, REP_GENERAL_FAILURE)
+        );
+        assert!(first_server.await.unwrap().is_err());
+        first_task.await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(50), second_listener.accept())
+                .await
+                .is_err()
+        );
+
+        let second_task = start_http_echo_proxy(second_listener).await;
+        let (mut second_client, second_server) =
+            start_one_connection_with_rules_and_outbounds(rules, outbounds).await;
+        negotiate_no_auth(&mut second_client).await;
+        send_domain_connect(&mut second_client, "example.com", 443).await;
+        assert_eq!(
+            read_reply(&mut second_client).await,
+            (SOCKS_VERSION, REP_SUCCEEDED)
+        );
+        let payload = b"load-balance-ok";
+        second_client.write_all(payload).await.unwrap();
+        let mut echoed = [0u8; 15];
+        second_client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, payload);
+        second_client.shutdown().await.unwrap();
+        second_server.await.unwrap().unwrap();
+        timeout(Duration::from_secs(1), second_task)
+            .await
+            .expect("the next round-robin member should accept the second CONNECT")
+            .unwrap();
     }
 
     #[tokio::test]

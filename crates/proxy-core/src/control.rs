@@ -269,7 +269,7 @@ mod tests {
     #[tokio::test]
     async fn fallback_groups_are_not_exposed_as_manually_selectable() {
         let config = Config::from_yaml_str(
-            "proxy-groups:\n  - { name: selected, type: select, proxies: [DIRECT, REJECT] }\n  - { name: automatic, type: fallback, proxies: [selected, DIRECT] }\nrules:\n  - MATCH,automatic\n",
+            "proxy-groups:\n  - { name: selected, type: select, proxies: [DIRECT, REJECT] }\n  - { name: automatic, type: fallback, proxies: [selected, DIRECT] }\n  - { name: balanced, type: load-balance, proxies: [DIRECT, REJECT] }\nrules:\n  - MATCH,automatic\n",
         )
         .unwrap();
         let (base_url, server, _) = start_controller(config.routing_rules().unwrap()).await;
@@ -286,9 +286,22 @@ mod tests {
         let listing: Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
         assert!(listing["proxies"]["selected"].is_object());
         assert!(listing["proxies"]["automatic"].is_null());
+        assert!(listing["proxies"]["balanced"].is_null());
 
         let response = client
             .put(format!("{base_url}/proxies/automatic"))
+            .bearer_auth(TEST_SECRET)
+            .header("content-type", "application/json")
+            .body(r#"{"name":"DIRECT"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+        assert_eq!(body["message"], "proxy group is not manually selectable");
+
+        let response = client
+            .put(format!("{base_url}/proxies/balanced"))
             .bearer_auth(TEST_SECRET)
             .header("content-type", "application/json")
             .body(r#"{"name":"DIRECT"}"#)

@@ -4,7 +4,10 @@ use std::{
     io::{Read, Write},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use regex::Regex;
@@ -53,6 +56,7 @@ pub(crate) struct ProxyGroupDefinition {
 pub(crate) enum ProxyGroupKind {
     Select,
     Fallback,
+    LoadBalance,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +89,7 @@ struct ProxyGroupSelections {
     definitions: HashMap<String, ProxyGroupDefinition>,
     selected: BTreeMap<String, String>,
     persistence_path: Option<PathBuf>,
+    round_robin_next: HashMap<String, Arc<AtomicUsize>>,
 }
 
 impl ProxyGroupSelections {
@@ -94,10 +99,16 @@ impl ProxyGroupSelections {
             .filter(|(_, definition)| definition.kind == ProxyGroupKind::Select)
             .map(|(name, definition)| (name.clone(), definition.default_selected.clone()))
             .collect();
+        let round_robin_next = definitions
+            .iter()
+            .filter(|(_, definition)| definition.kind == ProxyGroupKind::LoadBalance)
+            .map(|(name, _)| (name.clone(), Arc::new(AtomicUsize::new(0))))
+            .collect();
         Self {
             definitions: definitions.clone(),
             selected,
             persistence_path: None,
+            round_robin_next,
         }
     }
 
@@ -130,6 +141,20 @@ impl ProxyGroupSelections {
                     }
                 }
                 Some(RouteAction::Fallback(candidates))
+            }
+            ProxyGroupKind::LoadBalance => {
+                let next = self.round_robin_next.get(name)?;
+                let member_count = definition.members.len();
+                let index = next
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                        Some(if current + 1 == member_count {
+                            0
+                        } else {
+                            current + 1
+                        })
+                    })
+                    .unwrap_or_else(|current| current % member_count);
+                self.resolve_member(&definition.members[index], visiting)
             }
         }
     }
@@ -614,16 +639,36 @@ impl RuleSet {
 
     /// Preserve valid selections and share their lock when replacing rules after refresh.
     pub(crate) fn inherit_proxy_group_selections_from(&mut self, previous: &Self) {
-        let new_definitions = self
-            .proxy_groups
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .definitions
-            .clone();
+        let (new_definitions, mut round_robin_next) = {
+            let new_state = self
+                .proxy_groups
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                new_state.definitions.clone(),
+                new_state.round_robin_next.clone(),
+            )
+        };
         let mut previous_state = previous
             .proxy_groups
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (group, next) in &mut round_robin_next {
+            let membership_unchanged = previous_state
+                .definitions
+                .get(group)
+                .zip(new_definitions.get(group))
+                .is_some_and(|(old, new)| {
+                    old.kind == ProxyGroupKind::LoadBalance
+                        && new.kind == ProxyGroupKind::LoadBalance
+                        && old.members == new.members
+                });
+            if membership_unchanged {
+                if let Some(previous_next) = previous_state.round_robin_next.get(group) {
+                    *next = Arc::clone(previous_next);
+                }
+            }
+        }
         let selected = new_definitions
             .iter()
             .filter(|(_, definition)| definition.kind == ProxyGroupKind::Select)
@@ -638,6 +683,7 @@ impl RuleSet {
             .collect();
         previous_state.definitions = new_definitions;
         previous_state.selected = selected;
+        previous_state.round_robin_next = round_robin_next;
         drop(previous_state);
         self.proxy_groups = previous.proxy_groups.clone();
     }
