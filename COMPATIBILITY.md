@@ -73,6 +73,7 @@
 - [Mihomo 官方 Proxy Groups 通用字段文档](https://wiki.metacubex.one/en/config/proxy-groups/)：组可引用代理或其他组；`default-selected` 缺省或找不到组内节点时使用首成员。本项目只采纳该默认成员规则的静态子集。
 - [Mihomo 官方 Select 组文档](https://wiki.metacubex.one/en/config/proxy-groups/select/)：`select` 组语法参考；本项目只接受严格字段子集，不包含其余上游配置项。
 - [Mihomo 官方 Fallback 组文档](https://wiki.metacubex.one/en/config/proxy-groups/fallback/) 与[代理组通用字段文档](https://wiki.metacubex.one/en/config/proxy-groups/)：官方描述当前节点超时后按顺序选择首个可用节点，并列出 `url` / `interval` 等健康检查字段。本项目只在单次 TCP CONNECT 期间按序尝试连接，不做主动探测或周期健康检查，UDP fallback 明确丢弃。
+- [Mihomo 官方 Url-Test 组文档](https://wiki.metacubex.one/en/config/proxy-groups/url-test/)：列出 `url`、`interval` 与 `tolerance` 等字段；本项目当前不接受 `type: url-test`，此链接作为后续阶段语义参考。
 - [Mihomo 官方 API 文档](https://wiki.metacubex.one/en/api/)：运行时可通过 `/proxies/{proxies_name}` 的 `PUT` 选择节点；本项目实现了同形的有限 `GET`/`PUT` 组路由，但仅支持 loopback、Bearer 密钥和 `select` 组，不声称完整 API 兼容。
 - [Mihomo 官方全局配置](https://wiki.metacubex.one/en/config/general/)：`authentication` 与 `skip-auth-prefixes` 参考；本项目只支持全局认证列表及来源 CIDR 豁免的 SOCKS5 子集。
 - [Mihomo 官方 SOCKS 入站文档](https://wiki.metacubex.one/en/config/inbound/listeners/socks/)：监听器级 `users` 覆盖语义参考，当前未实现。

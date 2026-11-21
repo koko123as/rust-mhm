@@ -127,3 +127,5 @@ SOCKS5 子集参考 [RFC 1928](https://www.rfc-editor.org/rfc/rfc1928) 和 [RFC 
 ## 验证状态
 
 Linux x86_64 上上一阶段的静态 `select` 组切片通过了 81 项 workspace 测试及其余本地门禁，且 [Linux、Windows、macOS 与 Rust 1.85 CI](https://github.com/koko123as/rust-mhm/actions/runs/44949696886) 全项通过。本阶段进程内手动选择切片通过了本地完整门禁（85 项 workspace 测试、格式、全目标检查、零警告 Clippy、CLI 帮助和 Rust 1.85 锁定依赖测试），并在[本阶段 CI](https://github.com/koko123as/rust-mhm/actions/runs/44950947867) 的 Ubuntu、Windows、macOS、Rust 1.85 四项任务中全部通过。此前 SOCKS5 UDP 出站的 [CI run](https://github.com/koko123as/rust-mhm/actions/runs/44948797643) 亦已通过。网络测试只使用本地假服务，不依赖外网；Android、真实第三方代理、长时负载及 Android VPN 集成尚未验证。
+
+有限 TCP `fallback` 切片通过本地完整门禁（118 项测试、格式、全目标检查、零警告 Clippy、CLI 帮助与 Rust 1.85 锁定测试）；修复 Windows 临时端口竞态后的 [Linux、Windows、macOS 与 Rust 1.85 CI](https://github.com/koko123as/rust-mhm/actions/runs/44958214245) 全项通过。
