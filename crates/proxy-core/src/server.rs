@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
     io,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
     time::Duration,
 };
@@ -13,11 +13,11 @@ use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
     sync::{Semaphore, mpsc, watch},
     task::JoinSet,
-    time::{Instant, sleep_until, timeout},
+    time::{Instant, sleep, sleep_until, timeout},
 };
 use tracing::{debug, info, warn};
 
-use crate::config::{AuthSkipPrefix, Config, ConfigError};
+use crate::config::{AuthSkipPrefix, Config, ConfigError, UrlTestGroup};
 use crate::control;
 use crate::outbound::ProxyOutbound;
 use crate::routing::{RequestTarget, RouteAction, RuleSet, TargetHost};
@@ -93,6 +93,7 @@ async fn run_until(
     shutdown_signal: impl Future<Output = io::Result<()>>,
 ) -> Result<(), ServerError> {
     let listen_addr = config.listen_addr()?;
+    let url_test_groups = config.url_test_groups();
     let (routing_sender, routing) = watch::channel(Arc::new(config.routing_rules()?));
     let outbounds = Arc::new(config.proxy_outbounds().to_vec());
     let authentication = Arc::new(config.authentication_credentials());
@@ -106,11 +107,20 @@ async fn run_until(
     let connection_context = ConnectionContext {
         timeouts,
         routing,
-        outbounds,
+        outbounds: Arc::clone(&outbounds),
         authentication,
         skip_auth_prefixes,
     };
     let mut tasks: JoinSet<io::Result<()>> = JoinSet::new();
+    for group in url_test_groups {
+        let rules = Arc::clone(&routing_sender.borrow());
+        let group_outbounds = Arc::clone(&outbounds);
+        let request_timeout = timeouts.connect;
+        tasks.spawn(async move {
+            url_test_group_loop(group, rules, group_outbounds, request_timeout).await;
+            Ok(())
+        });
+    }
     let mut controller_task = if let Some(controller_addr) = config.external_controller_addr()? {
         let controller_listener = TcpListener::bind(controller_addr).await?;
         let bound_address = controller_listener.local_addr()?;
@@ -201,6 +211,110 @@ fn controller_exit_error(result: Result<io::Result<()>, tokio::task::JoinError>)
         Ok(Ok(())) => io::Error::other("control API stopped unexpectedly"),
         Ok(Err(error)) => error,
         Err(error) => io::Error::other(error),
+    }
+}
+
+fn build_url_test_client(
+    proxy: Option<&ProxyOutbound>,
+    request_timeout: Duration,
+) -> Result<reqwest::Client, reqwest::Error> {
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(request_timeout)
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(proxy) = proxy {
+        let host = if proxy.server.parse::<Ipv6Addr>().is_ok() {
+            format!("[{}]", proxy.server)
+        } else {
+            proxy.server.clone()
+        };
+        let scheme = match proxy.kind.as_str() {
+            "http" => "http",
+            "socks5" => "socks5h",
+            _ => unreachable!("outbound type is validated before URL-Test starts"),
+        };
+        let proxy_url = format!("{scheme}://{host}:{}", proxy.port);
+        let mut configured_proxy = reqwest::Proxy::all(proxy_url.as_str())?;
+        if let (Some(username), Some(password)) = (&proxy.username, &proxy.password) {
+            configured_proxy = configured_proxy.basic_auth(username, password);
+        }
+        builder = builder.proxy(configured_proxy);
+    }
+    builder.build()
+}
+
+fn build_url_test_clients(
+    group: &UrlTestGroup,
+    outbounds: &[ProxyOutbound],
+    request_timeout: Duration,
+) -> Vec<(String, reqwest::Client)> {
+    let mut clients = Vec::with_capacity(group.members.len());
+    for member in &group.members {
+        let proxy = if member == "DIRECT" {
+            None
+        } else if let Some(proxy) = outbounds.iter().find(|proxy| proxy.name == *member) {
+            Some(proxy)
+        } else {
+            warn!(group = %group.name, member = %member, "URL-Test member has no configured outbound");
+            continue;
+        };
+        match build_url_test_client(proxy, request_timeout) {
+            Ok(client) => clients.push((member.clone(), client)),
+            Err(_) => {
+                warn!(group = %group.name, member = %member, "could not initialize URL-Test client")
+            }
+        }
+    }
+    clients
+}
+
+async fn probe_url_test_group_once(
+    group: &UrlTestGroup,
+    clients: &[(String, reqwest::Client)],
+    request_timeout: Duration,
+) -> Option<(String, Duration)> {
+    let mut fastest: Option<(String, Duration)> = None;
+    for (member, client) in clients {
+        let started = Instant::now();
+        let response = match timeout(request_timeout, client.get(&group.url).send()).await {
+            Ok(Ok(response)) if response.status().is_success() => response,
+            _ => continue,
+        };
+        drop(response);
+        let elapsed = started.elapsed();
+        if fastest
+            .as_ref()
+            .is_none_or(|(_, fastest_elapsed)| elapsed < *fastest_elapsed)
+        {
+            fastest = Some((member.clone(), elapsed));
+        }
+    }
+    fastest
+}
+
+async fn url_test_group_loop(
+    group: UrlTestGroup,
+    rules: Arc<RuleSet>,
+    outbounds: Arc<Vec<ProxyOutbound>>,
+    request_timeout: Duration,
+) {
+    let clients = build_url_test_clients(&group, &outbounds, request_timeout);
+    if clients.is_empty() {
+        warn!(group = %group.name, "URL-Test group has no usable probe clients");
+        return;
+    }
+    loop {
+        match probe_url_test_group_once(&group, &clients, request_timeout).await {
+            Some((member, elapsed)) => {
+                if rules.update_url_test_group_member(&group.name, &member) {
+                    debug!(group = %group.name, member = %member, latency_ms = elapsed.as_millis(), "URL-Test selected the fastest healthy member");
+                }
+            }
+            None => {
+                warn!(group = %group.name, "URL-Test found no healthy members; keeping the previous selection")
+            }
+        }
+        sleep(group.interval).await;
     }
 }
 
@@ -1337,6 +1451,74 @@ mod tests {
         })
     }
 
+    async fn start_http_probe_proxy(
+        listener: TcpListener,
+        delay: Duration,
+        status: u16,
+    ) -> tokio::task::JoinHandle<String> {
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+            }
+            sleep(delay).await;
+            let response =
+                format!("HTTP/1.1 {status} test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            stream.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8(request).unwrap()
+        })
+    }
+
+    async fn start_socks5_probe_proxy(listener: TcpListener) -> tokio::task::JoinHandle<String> {
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut greeting = [0; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [0x05, 0x01, 0x02]);
+            stream.write_all(&[0x05, 0x02]).await.unwrap();
+
+            let mut auth = [0; 2];
+            stream.read_exact(&mut auth).await.unwrap();
+            assert_eq!(auth[0], 0x01);
+            let mut username = vec![0; auth[1] as usize];
+            stream.read_exact(&mut username).await.unwrap();
+            let password_length = stream.read_u8().await.unwrap() as usize;
+            let mut password = vec![0; password_length];
+            stream.read_exact(&mut password).await.unwrap();
+            assert_eq!(username, b"probe-user");
+            assert_eq!(password, b"probe-pass");
+            stream.write_all(&[0x01, 0x00]).await.unwrap();
+
+            let mut request = [0; 4];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(request, [0x05, 0x01, 0x00, 0x03]);
+            let domain_length = stream.read_u8().await.unwrap() as usize;
+            let mut domain = vec![0; domain_length];
+            stream.read_exact(&mut domain).await.unwrap();
+            assert_eq!(domain, b"probe.example");
+            let mut port = [0; 2];
+            stream.read_exact(&mut port).await.unwrap();
+            assert_eq!(u16::from_be_bytes(port), 80);
+            stream
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 80])
+                .await
+                .unwrap();
+
+            let mut http_request = Vec::new();
+            while !http_request.ends_with(b"\r\n\r\n") {
+                http_request.push(stream.read_u8().await.unwrap());
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            String::from_utf8(http_request).unwrap()
+        })
+    }
+
     async fn negotiate_no_auth(client: &mut TcpStream) {
         client
             .write_all(&[SOCKS_VERSION, 1, METHOD_NO_AUTH])
@@ -1466,6 +1648,171 @@ mod tests {
             .unwrap()
             .local_addr()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn url_test_chooses_fastest_successful_http_proxy_for_routing() {
+        let slow_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let slow_address = slow_listener.local_addr().unwrap();
+        let fast_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fast_address = fast_listener.local_addr().unwrap();
+        let bad_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bad_address = bad_listener.local_addr().unwrap();
+        let slow_proxy =
+            start_http_probe_proxy(slow_listener, Duration::from_millis(120), 204).await;
+        let fast_proxy = start_http_probe_proxy(fast_listener, Duration::ZERO, 200).await;
+        let bad_proxy = start_http_probe_proxy(bad_listener, Duration::ZERO, 503).await;
+        let config = Config::from_yaml_str(&format!(
+            "connect_timeout_ms: 1000\nproxies:\n  - {{ name: slow, type: http, server: 127.0.0.1, port: {} }}\n  - {{ name: fast, type: http, server: 127.0.0.1, port: {} }}\n  - {{ name: bad, type: http, server: 127.0.0.1, port: {} }}\nproxy-groups:\n  - name: automatic\n    type: url-test\n    proxies: [slow, fast, bad]\n    url: 'http://probe.example/ping'\n    interval: 3600\nrules:\n  - MATCH,automatic\n",
+            slow_address.port(),
+            fast_address.port(),
+            bad_address.port(),
+        ))
+        .unwrap();
+        let rules = Arc::new(config.routing_rules().unwrap());
+        let group = config.url_test_groups().pop().unwrap();
+        let outbounds = Arc::new(config.proxy_outbounds().to_vec());
+        let target = RequestTarget {
+            host: TargetHost::Domain("example.org".into()),
+            port: 443,
+        };
+        assert_eq!(rules.route(&target), RouteAction::Proxy("slow".into()));
+
+        let worker_rules = Arc::clone(&rules);
+        let worker = tokio::spawn(url_test_group_loop(
+            group,
+            worker_rules,
+            outbounds,
+            Duration::from_secs(1),
+        ));
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                if rules.route(&target) == RouteAction::Proxy("fast".into()) {
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the fastest healthy proxy should be selected");
+
+        worker.abort();
+        let _ = worker.await;
+        for proxy in [slow_proxy, fast_proxy, bad_proxy] {
+            let request = proxy.await.unwrap();
+            assert!(
+                request.starts_with("GET http://probe.example/ping HTTP/1.1\r\n"),
+                "unexpected URL-Test request: {request}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn url_test_probes_through_authenticated_socks5_outbound() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let proxy = start_socks5_probe_proxy(listener).await;
+        let config = Config::from_yaml_str(&format!(
+            "connect_timeout_ms: 1000\nproxies:\n  - {{ name: socks, type: socks5, server: 127.0.0.1, port: {}, username: probe-user, password: probe-pass }}\nproxy-groups:\n  - name: automatic\n    type: url-test\n    proxies: [socks]\n    url: 'http://probe.example/check'\n    interval: 3600\nrules:\n  - MATCH,automatic\n",
+            address.port(),
+        ))
+        .unwrap();
+        let rules = config.routing_rules().unwrap();
+        let group = config.url_test_groups().pop().unwrap();
+        let clients =
+            build_url_test_clients(&group, config.proxy_outbounds(), Duration::from_secs(1));
+        let Some((member, _)) =
+            probe_url_test_group_once(&group, &clients, Duration::from_secs(1)).await
+        else {
+            panic!("authenticated SOCKS5 proxy should pass its URL-Test probe");
+        };
+        assert_eq!(member, "socks");
+        assert!(rules.update_url_test_group_member("automatic", &member));
+        assert_eq!(
+            rules.route(&RequestTarget {
+                host: TargetHost::Domain("example.org".into()),
+                port: 443,
+            }),
+            RouteAction::Proxy("socks".into())
+        );
+        let request = proxy.await.unwrap();
+        assert!(request.starts_with("GET /check HTTP/1.1\r\n"));
+    }
+
+    #[tokio::test]
+    async fn url_test_keeps_its_last_member_when_all_probes_fail() {
+        let first_address = closed_local_address();
+        let second_address = closed_local_address();
+        let config = Config::from_yaml_str(&format!(
+            "proxies:\n  - {{ name: first, type: http, server: {}, port: {} }}\n  - {{ name: second, type: http, server: {}, port: {} }}\nproxy-groups:\n  - name: automatic\n    type: url-test\n    proxies: [first, second]\n    url: 'http://probe.example/check'\n    interval: 3600\nrules:\n  - MATCH,automatic\n",
+            first_address.ip(),
+            first_address.port(),
+            second_address.ip(),
+            second_address.port(),
+        ))
+        .unwrap();
+        let rules = config.routing_rules().unwrap();
+        assert!(rules.update_url_test_group_member("automatic", "second"));
+        let group = config.url_test_groups().pop().unwrap();
+        let clients =
+            build_url_test_clients(&group, config.proxy_outbounds(), Duration::from_millis(500));
+        assert!(
+            probe_url_test_group_once(&group, &clients, Duration::from_millis(500))
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            rules.route(&RequestTarget {
+                host: TargetHost::Domain("example.org".into()),
+                port: 443,
+            }),
+            RouteAction::Proxy("second".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn url_test_probe_is_cancelled_when_the_server_shuts_down() {
+        let listen_address = unused_loopback_address().await;
+        let probe_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let probe_address = probe_listener.local_addr().unwrap();
+        let config = Config::from_yaml_str(&format!(
+            "listen: '{listen_address}'\nconnect_timeout_ms: 60000\nproxy-groups:\n  - name: automatic\n    type: url-test\n    proxies: [DIRECT]\n    url: 'http://{probe_address}/check'\n    interval: 3600\nrules:\n  - MATCH,automatic\n"
+        ))
+        .unwrap();
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        let shutdown_signal = async move {
+            shutdown_receiver.await.map_err(io::Error::other)?;
+            Ok(())
+        };
+        let server = tokio::spawn(run_until(config, shutdown_signal));
+        let (mut probe_stream, _) =
+            tokio::time::timeout(Duration::from_secs(3), probe_listener.accept())
+                .await
+                .expect("URL-Test should start its initial probe")
+                .unwrap();
+        let mut request = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(probe_stream.read_u8().await.unwrap());
+            }
+        })
+        .await
+        .expect("the direct health request should arrive");
+
+        shutdown_sender.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("server shutdown should cancel the in-flight probe")
+            .unwrap()
+            .unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), probe_stream.read(&mut byte))
+                .await
+                .expect("probe connection should close promptly")
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

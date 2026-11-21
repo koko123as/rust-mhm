@@ -10,7 +10,8 @@
 - TCP 域名请求只有在有序规则运行到普通 `IP-CIDR`/`IP-CIDR6` 时才查询一次系统解析器，最多接受 16 个去重答案；`no-resolve` 跳过 CIDR 路由查询（但 DIRECT 建立连接仍需解析域名），DIRECT 复用已执行的解析结果，代理动作保留原始域名交给上游。解析失败、无答案或答案超限均失败关闭。此能力不是通用 DNS 子系统，UDP 路径不改变。
 - `REJECT` 在拨号前返回 SOCKS5 connection-not-allowed；代理握手与连接共用配置的出站超时。
 - 默认监听 `127.0.0.1:1080`，拒绝非 loopback 监听；连接并发有界。
-- 严格配置支持有限 `select`、`fallback` 与 `load-balance` 代理组：`select` 可嵌套引用代理组，`default-selected` 未填写或不是成员时取首成员；`fallback` 只在 TCP CONNECT 建立失败时按配置顺序尝试下一个候选，成功即停止，`REJECT` 候选会终止尝试，嵌套 fallback 会展平；有限 `load-balance` 只实现 round-robin，每次路由决策（包括每个 UDP 数据报）轮换一个成员，失败不会在该次请求内重试。组策略不做主动健康探测，不实现一致性哈希或粘性会话；UDP fallback 数据报明确丢弃。核心库和可选 loopback 控制 API 只允许手动选择 `select` 组；API 需 Bearer 密钥。可选 `proxy-group-state-file` 只持久化 `select` 选择；启动只恢复仍有效的成员，损坏或过期条目回退默认。
+- 严格配置支持有限 `select`、`fallback` 与 `load-balance` 代理组：`select` 可嵌套引用代理组，`default-selected` 未填写或不是成员时取首成员；`fallback` 只在 TCP CONNECT 建立失败时按配置顺序尝试下一个候选，成功即停止，`REJECT` 候选会终止尝试，嵌套 fallback 会展平；有限 `load-balance` 只实现 round-robin，每次路由决策（包括每个 UDP 数据报）轮换一个成员，失败不会在该次请求内重试。fallback 与 load-balance 没有主动健康探测或完整 Mihomo 自动策略语义；UDP fallback 数据报明确丢弃。核心库和可选 loopback 控制 API 只允许手动选择 `select` 组；API 需 Bearer 密钥。可选 `proxy-group-state-file` 只持久化 `select` 选择；启动只恢复仍有效的成员，损坏或过期条目回退默认。
+- 有限 `url-test` 组只接受已配置出站或 `DIRECT` 成员、HTTP(S) `url` 和必填 `interval`（秒）；启动后按成员顺序串行探测，并在每轮完成后等待配置间隔，每个请求受项目连接超时限制。选择返回 2xx 的最低响应头延迟成员；全员失败保留上次选择，首轮成功前使用首成员。探测运行态不进入 `select` 控制 API 或状态文件；`tolerance`、`timeout`、`lazy`、`max-failed-times` 等上游字段及其他完整 Mihomo 组语义仍未实现。
 - 未知 YAML 字段、代理类型、规则类型、动作、重复代理/组名和未配置的成员引用均显式报错。
 
 配置示例（账号字段是明文配置；实际使用时应限制配置文件权限，不要提交真实凭据）：
@@ -54,7 +55,7 @@ rules.select_proxy_group_member("preferred", "backup")?;
 let selected = rules.selected_proxy_group_member("preferred");
 ```
 
-默认情况下，手动 `select` 切换只保存在进程内，重启后按配置默认值初始化。只有配置本项目的 `proxy-group-state-file` 才会持久化；API 先原子写入状态文件，写入失败会返回错误且保持当前选择不变。可选控制 API 提供 `GET /proxies`、`GET /proxies/{组名}` 与 `PUT /proxies/{组名}`（JSON `{"name":"成员名"}`），所有请求都必须带 `Authorization: Bearer <secret>`。API 仅绑定 loopback，配置时必须同时提供 `external-controller` 与 `secret`；请求体上限 4 KiB、最多 32 个并发请求、处理时限 10 秒。provider 刷新会保留仍然存在的 `select` 选择；组或成员已被移除时改用新配置默认值。fallback 与 load-balance 均不属于可手动选择或持久化的组。此 API 不提供 WebSocket、TLS、完整 Mihomo API 或通用代理列表。当前 load-balance 只有有限 round-robin；`url-test`、主动健康检查、哈希/粘性策略与组过滤器仍未实现。本项目 fallback 仅为有限 TCP 连接失败顺序切换，不能视为完整 Mihomo fallback 语义。
+默认情况下，手动 `select` 切换只保存在进程内，重启后按配置默认值初始化。只有配置本项目的 `proxy-group-state-file` 才会持久化；API 先原子写入状态文件，写入失败会返回错误且保持当前选择不变。可选控制 API 提供 `GET /proxies`、`GET /proxies/{组名}` 与 `PUT /proxies/{组名}`（JSON `{"name":"成员名"}`），所有请求都必须带 `Authorization: Bearer <secret>`。API 仅绑定 loopback，配置时必须同时提供 `external-controller` 与 `secret`；请求体上限 4 KiB、最多 32 个并发请求、处理时限 10 秒。provider 刷新会保留仍然存在的 `select` 选择；组或成员已被移除时改用新配置默认值。fallback、load-balance 与 url-test 均不属于可手动选择或持久化的组。此 API 不提供 WebSocket、TLS、完整 Mihomo API 或通用代理列表。当前 load-balance 只有有限 round-robin；URL-Test 只实现上述探测子集，不代表完整自动策略兼容。本项目 fallback 仅为有限 TCP 连接失败顺序切换，不能视为完整 Mihomo fallback 语义。
 
 规则 provider 支持 `inline`、本地 `file` 和 HTTP/HTTPS，当前行为限定为 `classical`、`domain`、`ipcidr`；本地文件路径相对配置文件所在目录。file provider 支持通过 `interval` 定时重新读取，示例：
 
@@ -94,7 +95,7 @@ HTTP 响应必须成功且不超过 4 MiB；完整请求及流式下载受 `conn
 
 SOCKS5 入站现支持有限的 RFC 1928 `UDP ASSOCIATE`：为每个已认证的 TCP 控制连接建立 loopback UDP relay，控制连接关闭时结束关联；仅允许来自控制连接客户端 IP 的数据报，并在首个合法数据报后固定客户端 UDP 端点。IPv4、IPv6 和域名目标按每个数据报应用路由规则：`DIRECT` 通过临时系统 UDP socket 发送，具名 SOCKS5 代理使用上游 `UDP ASSOCIATE`（域名交给代理端解析）；`REJECT` 与 HTTP 代理 UDP 动作会丢弃，绝不回退直连。上游 SOCKS5 控制连接随入站关联保持，队列有界。UDP 分片、HTTP 代理 UDP 出站、DNS 策略、Mihomo 的 `udp` 配置字段及完整入站语义均未实现；畸形和分片帧也会丢弃。relay 地址仍限制在 loopback。
 
-`skip-auth-prefixes` 命中时将协商无认证方法；该功能应谨慎配置，避免把不可信来源列入豁免范围。SOCKS5 入站认证和 SOCKS5 出站认证按 RFC 1929 传输明文凭据，因此仅应在可信本机网络使用。**仍未实现：** HTTP 入站、HTTPS/其他代理出站、URL-test、主动健康检查、load-balance 的一致性哈希/粘性会话、完整 Mihomo DNS 策略、TUN、订阅、完整 REST/WebSocket API、UI 与 Android 服务。fallback 只有上述有限 TCP 顺序切换；UDP 数据报会丢弃，不含 `url`/`interval` 探测与周期健康状态。load-balance 只提供每次路由决策一次轮换成员的 round-robin，不会在失败后于同一请求重试。当前只有受密钥保护的 loopback `select` 组状态/切换 API；可选的本地组状态文件是本项目扩展，不是完整 Mihomo 控制面或持久化兼容。域名 CIDR 规则仅有上述 TCP 有界系统解析切片，不提供 DNS 策略、缓存或 hosts/fake-IP。该项目不接受完整 Mihomo YAML；见 [兼容性台账](COMPATIBILITY.md)。
+`skip-auth-prefixes` 命中时将协商无认证方法；该功能应谨慎配置，避免把不可信来源列入豁免范围。SOCKS5 入站认证和 SOCKS5 出站认证按 RFC 1929 传输明文凭据，因此仅应在可信本机网络使用。**仍未实现：** HTTP 入站、HTTPS/其他代理出站、完整 Mihomo URL-Test 字段与行为、fallback/load-balance 主动健康检查、一致性哈希/粘性会话、完整 Mihomo DNS 策略、TUN、订阅、完整 REST/WebSocket API、UI 与 Android 服务。fallback 只有上述有限 TCP 顺序切换；UDP 数据报会丢弃，不含 `url`/`interval` 探测与周期健康状态。load-balance 只提供每次路由决策一次轮换成员的 round-robin，不会在失败后于同一请求重试。当前只有受密钥保护的 loopback `select` 组状态/切换 API；可选的本地组状态文件是本项目扩展，不是完整 Mihomo 控制面或持久化兼容。域名 CIDR 规则仅有上述 TCP 有界系统解析切片，不提供 DNS 策略、缓存或 hosts/fake-IP。该项目不接受完整 Mihomo YAML；见 [兼容性台账](COMPATIBILITY.md)。
 
 ## 快速开始
 
@@ -131,3 +132,5 @@ Linux x86_64 上上一阶段的静态 `select` 组切片通过了 81 项 workspa
 有限 TCP `fallback` 切片通过本地完整门禁（118 项测试、格式、全目标检查、零警告 Clippy、CLI 帮助与 Rust 1.85 锁定测试）；修复 Windows 临时端口竞态后的 [Linux、Windows、macOS 与 Rust 1.85 CI](https://github.com/koko123as/rust-mhm/actions/runs/44958214245) 全项通过。
 
 有限 `load-balance` round-robin 切片通过本地完整门禁（122 项 workspace 测试、格式、全目标检查、零警告 Clippy、CLI 帮助与 Rust 1.85 锁定测试）；修复最新 Rust 弃用警告后的提交 `628ece3` 在 [Linux、Windows、macOS 与 Rust 1.85 CI](https://github.com/koko123as/rust-mhm/actions/runs/44959469886) 全项通过。
+
+有限 `url-test` 垂直切片已通过本地完整门禁（129 项 workspace 测试、格式、全目标检查、零警告 Clippy、CLI 帮助与 Rust 1.85 锁定测试）；本次跨平台 CI 尚待推送后验证。

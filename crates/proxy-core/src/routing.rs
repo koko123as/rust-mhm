@@ -57,6 +57,7 @@ pub(crate) enum ProxyGroupKind {
     Select,
     Fallback,
     LoadBalance,
+    UrlTest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +89,7 @@ struct RoutingRule {
 struct ProxyGroupSelections {
     definitions: HashMap<String, ProxyGroupDefinition>,
     selected: BTreeMap<String, String>,
+    url_test_selected: BTreeMap<String, String>,
     persistence_path: Option<PathBuf>,
     round_robin_next: HashMap<String, Arc<AtomicUsize>>,
 }
@@ -99,6 +101,11 @@ impl ProxyGroupSelections {
             .filter(|(_, definition)| definition.kind == ProxyGroupKind::Select)
             .map(|(name, definition)| (name.clone(), definition.default_selected.clone()))
             .collect();
+        let url_test_selected = definitions
+            .iter()
+            .filter(|(_, definition)| definition.kind == ProxyGroupKind::UrlTest)
+            .map(|(name, definition)| (name.clone(), definition.default_selected.clone()))
+            .collect();
         let round_robin_next = definitions
             .iter()
             .filter(|(_, definition)| definition.kind == ProxyGroupKind::LoadBalance)
@@ -107,6 +114,7 @@ impl ProxyGroupSelections {
         Self {
             definitions: definitions.clone(),
             selected,
+            url_test_selected,
             persistence_path: None,
             round_robin_next,
         }
@@ -130,6 +138,10 @@ impl ProxyGroupSelections {
         match definition.kind {
             ProxyGroupKind::Select => {
                 let selected = self.selected.get(name)?;
+                self.resolve_member(selected, visiting)
+            }
+            ProxyGroupKind::UrlTest => {
+                let selected = self.url_test_selected.get(name)?;
                 self.resolve_member(selected, visiting)
             }
             ProxyGroupKind::Fallback => {
@@ -603,6 +615,38 @@ impl RuleSet {
             .cloned()
     }
 
+    pub(crate) fn update_url_test_group_member(&self, group: &str, member: &str) -> bool {
+        let mut selections = self
+            .proxy_groups
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(definition) = selections.definitions.get(group) else {
+            return false;
+        };
+        if definition.kind != ProxyGroupKind::UrlTest
+            || !definition
+                .members
+                .iter()
+                .any(|candidate| candidate == member)
+        {
+            return false;
+        }
+        selections
+            .url_test_selected
+            .insert(group.to_owned(), member.to_owned());
+        true
+    }
+
+    #[cfg(test)]
+    fn selected_url_test_group_member(&self, group: &str) -> Option<String> {
+        self.proxy_groups
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .url_test_selected
+            .get(group)
+            .cloned()
+    }
+
     /// Return an owned snapshot of the configured selection groups.
     pub fn proxy_group_snapshots(&self) -> Vec<ProxyGroupSnapshot> {
         let selections = self
@@ -692,8 +736,25 @@ impl RuleSet {
                 (group.clone(), member.clone())
             })
             .collect();
+        let url_test_selected = new_definitions
+            .iter()
+            .filter(|(_, definition)| definition.kind == ProxyGroupKind::UrlTest)
+            .map(|(group, definition)| {
+                let membership_unchanged =
+                    previous_state.definitions.get(group).is_some_and(|old| {
+                        old.kind == ProxyGroupKind::UrlTest && old.members == definition.members
+                    });
+                let member = membership_unchanged
+                    .then(|| previous_state.url_test_selected.get(group))
+                    .flatten()
+                    .filter(|member| definition.members.contains(member))
+                    .unwrap_or(&definition.default_selected);
+                (group.clone(), member.clone())
+            })
+            .collect();
         previous_state.definitions = new_definitions;
         previous_state.selected = selected;
+        previous_state.url_test_selected = url_test_selected;
         previous_state.round_robin_next = round_robin_next;
         drop(previous_state);
         self.proxy_groups = previous.proxy_groups.clone();
@@ -1045,6 +1106,95 @@ mod tests {
             changed.route(&domain_target("example.org", 443)),
             RouteAction::Direct
         );
+    }
+
+    #[test]
+    fn url_test_selection_is_ephemeral_non_manual_and_inherited_only_for_same_members() {
+        let lines = vec!["MATCH,automatic".to_owned()];
+        let definitions = HashMap::from([(
+            "automatic".to_owned(),
+            ProxyGroupDefinition {
+                kind: ProxyGroupKind::UrlTest,
+                members: vec!["first".to_owned(), "second".to_owned()],
+                default_selected: "first".to_owned(),
+            },
+        )]);
+        let previous = RuleSet::parse_with_rule_providers_and_groups(
+            &lines,
+            &["first".to_owned(), "second".to_owned()],
+            &definitions,
+            &HashMap::new(),
+        )
+        .unwrap();
+        let clone = previous.clone();
+        let target = domain_target("example.org", 443);
+        assert_eq!(
+            previous.route(&target),
+            RouteAction::Proxy("first".to_owned())
+        );
+        assert_eq!(previous.selected_proxy_group_member("automatic"), None);
+        assert!(previous.proxy_group_snapshot("automatic").is_none());
+        assert!(matches!(
+            previous.select_proxy_group_member("automatic", "second"),
+            Err(RuleError::ProxyGroupNotSelectable { .. })
+        ));
+        assert!(!previous.update_url_test_group_member("automatic", "missing"));
+        assert!(previous.update_url_test_group_member("automatic", "second"));
+        assert_eq!(
+            clone.route(&target),
+            RouteAction::Proxy("second".to_owned())
+        );
+        assert_eq!(
+            clone.selected_url_test_group_member("automatic").as_deref(),
+            Some("second")
+        );
+
+        let mut refreshed = RuleSet::parse_with_rule_providers_and_groups(
+            &lines,
+            &["first".to_owned(), "second".to_owned()],
+            &definitions,
+            &HashMap::new(),
+        )
+        .unwrap();
+        refreshed.inherit_proxy_group_selections_from(&previous);
+        assert_eq!(
+            refreshed.route(&target),
+            RouteAction::Proxy("second".to_owned())
+        );
+
+        let changed_definitions = HashMap::from([(
+            "automatic".to_owned(),
+            ProxyGroupDefinition {
+                kind: ProxyGroupKind::UrlTest,
+                members: vec!["first".to_owned()],
+                default_selected: "first".to_owned(),
+            },
+        )]);
+        let mut changed = RuleSet::parse_with_rule_providers_and_groups(
+            &lines,
+            &["first".to_owned()],
+            &changed_definitions,
+            &HashMap::new(),
+        )
+        .unwrap();
+        changed.inherit_proxy_group_selections_from(&previous);
+        assert_eq!(
+            changed.route(&target),
+            RouteAction::Proxy("first".to_owned())
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("groups.json");
+        let persistent_rules = RuleSet::parse_with_rule_providers_and_groups(
+            &lines,
+            &["first".to_owned(), "second".to_owned()],
+            &definitions,
+            &HashMap::new(),
+        )
+        .unwrap();
+        persistent_rules.load_persistent_proxy_group_selections(state_path.clone());
+        assert!(persistent_rules.update_url_test_group_member("automatic", "second"));
+        assert!(!state_path.exists());
     }
 
     fn domain_target(domain: &str, port: u16) -> RequestTarget {

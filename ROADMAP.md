@@ -41,7 +41,8 @@
 - [x] 可选 `proxy-group-state-file` 本地状态文件：启动只恢复当前配置中仍存在的组及成员，缺失/损坏/过期状态安全回退；API 切换先原子写盘再更新运行状态，写入失败明确报错。
 - [x] 有限 `fallback` 组：TCP CONNECT 建立失败后按序尝试候选、成功即停止、`REJECT` 终止、嵌套 fallback 展平；候选共享一个 `connect_timeout_ms` 总时限；UDP 数据报明确丢弃。端到端覆盖首候选失败/成功、候选全失败、REJECT、嵌套 select 状态变化与总时限。
 - [x] 有限 `load-balance` round-robin：只接受缺省策略或 `strategy: round-robin`，每次路由决策轮换一个有序成员；线程安全游标在组类型及有序成员不变时跨 provider 刷新保留。TCP 当前请求失败不重试其他成员，UDP 每个数据报单独路由；控制 API 不把它当作可手动选择组。
-- [ ] 主动健康探测及周期状态切换、`url-test`、一致性哈希/粘性 load-balance 策略、失败后重试与组过滤器；当前 fallback 只检查单次 TCP CONNECT 建连结果，不是完整 Mihomo 语义。控制 API 仍仅为有限手动 `select` 子集，不代表完整 Mihomo API。
+- [x] 有限 `url-test`：仅支持 `url`、`interval` 和具名出站/`DIRECT` 成员；探测 HTTP(S) 目标并选择 2xx 响应中延迟最低者，全失败保留上次选择，状态只在内存中。配置边界、HTTP/SOCKS5 本地假代理与关闭取消测试通过；未实现的上游字段仍严格拒绝。
+- [ ] 完整 URL-Test 语义（含 `tolerance`、`timeout`、`lazy`、`max-failed-times` 与健康状态 API）、fallback/load-balance 主动健康切换、一致性哈希/粘性策略、失败后重试与组过滤器；当前 fallback 只检查单次 TCP CONNECT 建连结果，不是完整 Mihomo 语义。控制 API 仍仅为有限手动 `select` 子集，不代表完整 Mihomo API。
 - [ ] 扩展真实 Mihomo 代理类型及协议互操作测试；当前代理 schema 是严格子集。
 - [ ] 重试与多级代理尚未实现。
 

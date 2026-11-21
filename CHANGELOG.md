@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- 新增严格配置的有限 `type: url-test` 组：仅接受 HTTP(S) `url`、必填秒级 `interval` 与具名出站/`DIRECT` 成员，拒绝凭据、片段、未知字段及未实现的上游选项。
+- 服务启动后立即串行探测候选，接受 2xx 响应并选择响应头延迟最低者；每轮结束后等待 interval。全员失败保留上次选择，首次探测完成前使用首成员。
+- URL-Test 自动选择状态与手动 `select` 状态分离；仅在组类型及有序成员不变时跨 provider 刷新继承，不进入控制 API 或 `proxy-group-state-file`。服务关闭会取消探测任务。
+- 新增 HTTP、HTTP 代理与带认证 SOCKS5 代理探测、最低延迟选择、全失败保留、状态隔离/刷新继承、配置拒绝及取消关闭测试；文档明确本切片不是完整 Mihomo 健康检查兼容。
 - 新增严格配置的有限 `type: load-balance` 组：只接受缺省策略或 `strategy: round-robin`，并拒绝未实现策略及 `url`/`interval` 健康检查字段。
 - 每次路由决策只轮换并解析一个有序成员；TCP 本次连接失败不重试其他成员，UDP 按每个数据报重新路由。round-robin 游标为进程内状态，provider 刷新只在组类型和有序成员保持不变时继承。
 - load-balance 不作为控制 API 手动选择组，也不写入 `proxy-group-state-file`；一致性哈希、粘性会话、主动健康检查和完整 Mihomo 自动策略仍未实现。
@@ -24,7 +28,7 @@
 - 控制 API 请求体限制为 4 KiB、并发请求限制为 32、处理时限为 10 秒；配置要求 `external-controller` 与 `secret` 同时设置，且仅允许 loopback IP socket。
 - provider 刷新在新组仍含当前已选成员时继承进程内选择；组或成员被移除时采用新配置默认成员。
 - 新增控制 API 认证、非法/超大请求、服务启动/关闭与真实 SOCKS 路由联动测试，以及手动选择跨 provider 刷新的端到端测试。
-- 更早阶段尚未实现 `url-test`、`fallback`、`load-balance`、健康检查与过滤器；本轮已新增前述有限 TCP fallback 切片，完整健康探测/自动策略仍待后续实现。
+- 早期阶段曾未实现 `url-test`、`fallback`、`load-balance`、健康检查与过滤器；后续分别加入有限 URL-Test、TCP fallback 与 round-robin 垂直切片，完整健康探测/自动策略仍未实现。
 - 增加受限 SOCKS5 UDP 代理出站：按数据报路由到具名 SOCKS5 上游，保留目标域名供代理解析，并维持上游 TCP 控制连接直至入站关联结束；HTTP 代理 UDP 与分片仍不支持，也不回退直连。
 - 增加 SOCKS5 UDP ASSOCIATE 认证与上游 relay 协商测试，以及经本地假 SOCKS5 UDP relay 的域名请求/响应端到端测试。
 - 增加受限 SOCKS5 UDP ASSOCIATE 入站：关联随 TCP 控制连接结束，支持 loopback relay、客户端端点固定、IPv4/IPv6/域名目标和逐数据报规则判断；可选择 DIRECT 或具名 SOCKS5 UDP 出站，REJECT/HTTP 代理/畸形/分片数据报丢弃且不回退直连。

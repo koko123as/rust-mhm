@@ -24,6 +24,7 @@ const MAX_CONNECT_TIMEOUT_MS: u64 = 120_000;
 const MAX_RULE_PROVIDER_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_RULE_PROVIDER_INTERVAL_SECS: u64 = 24 * 60 * 60;
 const MAX_RULE_PROVIDER_INTERVAL_SECS: u64 = 365 * 24 * 60 * 60;
+const MAX_URL_TEST_INTERVAL_SECS: u64 = 365 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -69,6 +70,18 @@ struct ProxyGroupConfig {
     default_selected: Option<String>,
     #[serde(default)]
     strategy: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    interval: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct UrlTestGroup {
+    pub(crate) name: String,
+    pub(crate) members: Vec<String>,
+    pub(crate) url: String,
+    pub(crate) interval: Duration,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -291,6 +304,23 @@ impl Config {
                             .unwrap_or(DEFAULT_RULE_PROVIDER_INTERVAL_SECS),
                     ),
                 )
+            })
+            .collect()
+    }
+
+    pub(crate) fn url_test_groups(&self) -> Vec<UrlTestGroup> {
+        self.proxy_groups
+            .iter()
+            .filter(|group| group.group_type == "url-test")
+            .map(|group| UrlTestGroup {
+                name: group.name.clone(),
+                members: group.proxies.clone(),
+                url: group.url.clone().expect("validated URL-Test group has url"),
+                interval: Duration::from_secs(
+                    group
+                        .interval
+                        .expect("validated URL-Test group has interval"),
+                ),
             })
             .collect()
     }
@@ -705,9 +735,10 @@ impl Config {
                 "select" => ProxyGroupKind::Select,
                 "fallback" => ProxyGroupKind::Fallback,
                 "load-balance" => ProxyGroupKind::LoadBalance,
+                "url-test" => ProxyGroupKind::UrlTest,
                 _ => {
                     return Err(ConfigError::InvalidProxyGroup(format!(
-                        "unsupported group type '{}' for {} (only select, fallback, and load-balance are supported)",
+                        "unsupported group type '{}' for {} (only select, fallback, load-balance, and url-test are supported)",
                         group.group_type, group.name
                     )));
                 }
@@ -731,6 +762,37 @@ impl Config {
                         strategy, group.name
                     )));
                 }
+            }
+            if kind == ProxyGroupKind::UrlTest {
+                let Some(url) = group.url.as_deref() else {
+                    return Err(ConfigError::InvalidProxyGroup(format!(
+                        "url-test group {} requires url",
+                        group.name
+                    )));
+                };
+                if !valid_url_test_url(url) {
+                    return Err(ConfigError::InvalidProxyGroup(format!(
+                        "url-test group {} requires an HTTP(S) URL without credentials or a fragment",
+                        group.name
+                    )));
+                }
+                let Some(interval) = group.interval else {
+                    return Err(ConfigError::InvalidProxyGroup(format!(
+                        "url-test group {} requires interval in seconds",
+                        group.name
+                    )));
+                };
+                if interval == 0 || interval > MAX_URL_TEST_INTERVAL_SECS {
+                    return Err(ConfigError::InvalidProxyGroup(format!(
+                        "url-test interval for {} must be between 1 and {} seconds",
+                        group.name, MAX_URL_TEST_INTERVAL_SECS
+                    )));
+                }
+            } else if group.url.is_some() || group.interval.is_some() {
+                return Err(ConfigError::InvalidProxyGroup(format!(
+                    "url and interval are only supported for url-test group {}",
+                    group.name
+                )));
             }
             if group.proxies.is_empty() {
                 return Err(ConfigError::InvalidProxyGroup(format!(
@@ -759,6 +821,15 @@ impl Config {
                         group.name
                     )));
                 }
+                if group.group_type == "url-test"
+                    && member != "DIRECT"
+                    && !proxy_names.contains(member)
+                {
+                    return Err(ConfigError::InvalidProxyGroup(format!(
+                        "url-test group {} only supports DIRECT or configured proxy members, not {member}",
+                        group.name
+                    )));
+                }
             }
         }
 
@@ -776,6 +847,7 @@ impl Config {
                     "select" => ProxyGroupKind::Select,
                     "fallback" => ProxyGroupKind::Fallback,
                     "load-balance" => ProxyGroupKind::LoadBalance,
+                    "url-test" => ProxyGroupKind::UrlTest,
                     _ => unreachable!("group types are validated before construction"),
                 };
                 let default_selected = if kind == ProxyGroupKind::Select {
@@ -812,6 +884,22 @@ impl Config {
             }
         })
     }
+}
+
+fn valid_url_test_url(value: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(value) else {
+        return false;
+    };
+    let authority = value
+        .split_once("://")
+        .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or_default())
+        .unwrap_or_default();
+    matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some()
+        && !authority.contains('@')
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none()
 }
 
 fn validate_proxy_group_cycles(
@@ -2659,6 +2747,80 @@ rules:
     }
 
     #[test]
+    fn url_test_groups_accept_a_strict_http_probe_subset() {
+        let config = Config::from_yaml_str(
+            r#"
+proxies:
+  - { name: first, type: http, server: 127.0.0.1, port: 8080 }
+proxy-groups:
+  - name: automatic
+    type: url-test
+    proxies: [first, DIRECT]
+    url: "https://www.gstatic.com/generate_204"
+    interval: 300
+rules:
+  - MATCH,automatic
+"#,
+        )
+        .unwrap();
+        let groups = config.url_test_groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "automatic");
+        assert_eq!(groups[0].members, ["first", "DIRECT"]);
+        assert_eq!(groups[0].url, "https://www.gstatic.com/generate_204");
+        assert_eq!(groups[0].interval, Duration::from_secs(300));
+        let rules = config.routing_rules().unwrap();
+        assert_eq!(
+            rules.route(&RequestTarget {
+                host: TargetHost::Domain("example.org".into()),
+                port: 443,
+            }),
+            RouteAction::Proxy("first".into())
+        );
+    }
+
+    #[test]
+    fn url_test_groups_reject_unsupported_urls_intervals_members_and_fields() {
+        let invalid_groups = [
+            "proxy-groups:\n  - { name: missing-url, type: url-test, proxies: [DIRECT], interval: 300 }\n",
+            "proxy-groups:\n  - { name: missing-interval, type: url-test, proxies: [DIRECT], url: 'http://example.org/check' }\n",
+            "proxy-groups:\n  - { name: zero-interval, type: url-test, proxies: [DIRECT], url: 'http://example.org/check', interval: 0 }\n",
+            "proxy-groups:\n  - { name: long-interval, type: url-test, proxies: [DIRECT], url: 'http://example.org/check', interval: 31536001 }\n",
+            "proxy-groups:\n  - { name: bad-scheme, type: url-test, proxies: [DIRECT], url: 'ftp://example.org/check', interval: 300 }\n",
+            "proxy-groups:\n  - { name: credentials, type: url-test, proxies: [DIRECT], url: 'http://user:secret@example.org/check', interval: 300 }\n",
+            "proxy-groups:\n  - { name: empty-credentials, type: url-test, proxies: [DIRECT], url: 'http://@example.org/check', interval: 300 }\n",
+            "proxy-groups:\n  - { name: fragment, type: url-test, proxies: [DIRECT], url: 'http://example.org/check#fragment', interval: 300 }\n",
+            "proxy-groups:\n  - { name: reject-member, type: url-test, proxies: [REJECT], url: 'http://example.org/check', interval: 300 }\n",
+            "proxy-groups:\n  - { name: default-member, type: url-test, proxies: [DIRECT], url: 'http://example.org/check', interval: 300, default-selected: DIRECT }\n",
+        ];
+        for source in invalid_groups {
+            assert!(Config::from_yaml_str(source).is_err(), "accepted: {source}");
+        }
+
+        for field in [
+            "tolerance: 50",
+            "timeout: 1000",
+            "lazy: false",
+            "expected-status: 204",
+            "max-failed-times: 5",
+        ] {
+            let source = format!(
+                "proxy-groups:\n  - name: strict\n    type: url-test\n    proxies: [DIRECT]\n    url: 'http://example.org/check'\n    interval: 300\n    {field}\n"
+            );
+            assert!(
+                matches!(Config::from_yaml_str(&source), Err(ConfigError::Yaml(_))),
+                "unsupported URL-Test field should be rejected: {field}"
+            );
+        }
+
+        let nested_member = Config::from_yaml_str(
+            "proxy-groups:\n  - { name: nested, type: select, proxies: [DIRECT] }\n  - { name: automatic, type: url-test, proxies: [nested], url: 'http://example.org/check', interval: 300 }\n",
+        )
+        .unwrap_err();
+        assert!(matches!(nested_member, ConfigError::InvalidProxyGroup(_)));
+    }
+
+    #[test]
     fn load_balance_round_robins_per_route_and_is_not_manually_selectable() {
         let config = Config::from_yaml_str(
             r#"
@@ -3032,13 +3194,13 @@ rules:
             Config::from_yaml_str(
                 "proxy-groups:\n  - name: strict\n    type: select\n    proxies: [DIRECT]\n    url: https://example.org/\n"
             ),
-            Err(ConfigError::Yaml(_))
+            Err(ConfigError::InvalidProxyGroup(_))
         ));
         assert!(matches!(
             Config::from_yaml_str(
                 "proxy-groups:\n  - name: strict-fallback\n    type: fallback\n    proxies: [DIRECT]\n    url: https://example.org/\n"
             ),
-            Err(ConfigError::Yaml(_))
+            Err(ConfigError::InvalidProxyGroup(_))
         ));
     }
 
