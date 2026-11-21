@@ -1,4 +1,10 @@
-# This is rust-mhm's limited prototype schema, not a Mihomo config file.
+# This is rust-mhm's limited prototype schema, not a full Mihomo config.
 listen: "127.0.0.1:1080"
 connect_timeout_ms: 10000
 max_connections: 256
+rules:
+  - DOMAIN,ads.example,REJECT
+  - DOMAIN-SUFFIX,example.org,DIRECT
+  - IP-CIDR,192.0.2.0/24,DIRECT,no-resolve
+  - DST-PORT,443,DIRECT
+  - MATCH,DIRECT

@@ -3,6 +3,8 @@ use std::{net::SocketAddr, path::Path};
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::routing::{RuleError, RuleSet};
+
 const DEFAULT_LISTEN: &str = "127.0.0.1:1080";
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_MAX_CONNECTIONS: usize = 256;
@@ -19,6 +21,8 @@ pub struct Config {
     connect_timeout_ms: u64,
     #[serde(default = "default_max_connections")]
     max_connections: usize,
+    #[serde(default = "default_rules")]
+    rules: Vec<String>,
 }
 
 impl Default for Config {
@@ -27,6 +31,7 @@ impl Default for Config {
             listen: default_listen(),
             connect_timeout_ms: default_connect_timeout_ms(),
             max_connections: default_max_connections(),
+            rules: default_rules(),
         }
     }
 }
@@ -59,6 +64,10 @@ impl Config {
         self.max_connections
     }
 
+    pub fn routing_rules(&self) -> Result<RuleSet, ConfigError> {
+        Ok(RuleSet::parse(&self.rules)?)
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         let listen_addr = self.listen_addr()?;
         if !listen_addr.ip().is_loopback() {
@@ -70,6 +79,7 @@ impl Config {
         if !(1..=MAX_CONNECTIONS).contains(&self.max_connections) {
             return Err(ConfigError::InvalidMaxConnections(self.max_connections));
         }
+        RuleSet::parse(&self.rules)?;
         Ok(())
     }
 }
@@ -84,6 +94,10 @@ const fn default_connect_timeout_ms() -> u64 {
 
 const fn default_max_connections() -> usize {
     DEFAULT_MAX_CONNECTIONS
+}
+
+fn default_rules() -> Vec<String> {
+    vec!["MATCH,DIRECT".to_owned()]
 }
 
 #[derive(Debug, Error)]
@@ -102,11 +116,14 @@ pub enum ConfigError {
     InvalidConnectTimeout(u64),
     #[error("max_connections must be between 1 and {MAX_CONNECTIONS}; got {0}")]
     InvalidMaxConnections(usize),
+    #[error(transparent)]
+    Routing(#[from] RuleError),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routing::{RequestTarget, RouteAction, TargetHost};
 
     #[test]
     fn defaults_are_loopback_and_bounded() {
@@ -132,7 +149,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_mihomo_style_fields_instead_of_ignoring_them() {
+    fn rejects_unknown_top_level_fields() {
         let error = Config::from_yaml_str("mixed-port: 7890\n").unwrap_err();
         assert!(matches!(error, ConfigError::Yaml(_)));
     }
@@ -144,5 +161,36 @@ mod tests {
 
         let error = Config::from_yaml_str("connect_timeout_ms: 10\n").unwrap_err();
         assert!(matches!(error, ConfigError::InvalidConnectTimeout(10)));
+    }
+
+    #[test]
+    fn parses_rules_and_uses_match_direct_by_default() {
+        let config = Config::from_yaml_str("rules:\n  - DOMAIN,ad.example,REJECT\n").unwrap();
+        let rules = config.routing_rules().unwrap();
+        let blocked = RequestTarget {
+            host: TargetHost::Domain("ad.example".to_owned()),
+            port: 443,
+        };
+        let other = RequestTarget {
+            host: TargetHost::Domain("other.example".to_owned()),
+            port: 443,
+        };
+        assert_eq!(rules.route(&blocked), RouteAction::Reject);
+        assert_eq!(rules.route(&other), RouteAction::Direct);
+    }
+
+    #[test]
+    fn repository_example_config_parses() {
+        let config = Config::from_yaml_str(include_str!("../../../config.example.yaml")).unwrap();
+        assert_eq!(config.routing_rules().unwrap().rule_count(), 5);
+    }
+
+    #[test]
+    fn invalid_or_unsupported_rules_reject_the_configuration() {
+        let error = Config::from_yaml_str("rules:\n  - RULE-SET,ads,REJECT\n").unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::Routing(RuleError::UnsupportedRuleType { .. })
+        ));
     }
 }

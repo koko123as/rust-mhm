@@ -16,6 +16,7 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::config::{Config, ConfigError};
+use crate::routing::{RequestTarget, RouteAction, RuleSet, TargetHost};
 
 const SOCKS_VERSION: u8 = 0x05;
 const METHOD_NO_AUTH: u8 = 0x00;
@@ -23,6 +24,7 @@ const METHOD_NO_ACCEPTABLE: u8 = 0xff;
 const CMD_CONNECT: u8 = 0x01;
 const REP_SUCCEEDED: u8 = 0x00;
 const REP_GENERAL_FAILURE: u8 = 0x01;
+const REP_CONNECTION_NOT_ALLOWED: u8 = 0x02;
 const REP_NETWORK_UNREACHABLE: u8 = 0x03;
 const REP_HOST_UNREACHABLE: u8 = 0x04;
 const REP_CONNECTION_REFUSED: u8 = 0x05;
@@ -41,6 +43,7 @@ pub enum ServerError {
 /// Bind the configured loopback listener and serve until Ctrl-C.
 pub async fn run(config: Config) -> Result<(), ServerError> {
     let listen_addr = config.listen_addr()?;
+    let routing = Arc::new(config.routing_rules()?);
     let listener = TcpListener::bind(listen_addr).await?;
     let connection_limit = Arc::new(Semaphore::new(config.max_connections()));
     let connect_timeout = Duration::from_millis(config.connect_timeout_ms());
@@ -60,9 +63,10 @@ pub async fn run(config: Config) -> Result<(), ServerError> {
                 let (stream, _peer) = result?;
                 match connection_limit.clone().try_acquire_owned() {
                     Ok(permit) => {
+                        let routing = Arc::clone(&routing);
                         tasks.spawn(async move {
                             let _permit = permit;
-                            handle_connection(stream, connect_timeout).await
+                            handle_connection_with_rules(stream, connect_timeout, routing).await
                         });
                     }
                     Err(_) => {
@@ -91,8 +95,17 @@ pub async fn run(config: Config) -> Result<(), ServerError> {
     Ok(())
 }
 
-/// Handle one SOCKS5 TCP stream. Exposed for local integration tests and embedding.
-pub async fn handle_connection(mut client: TcpStream, connect_timeout: Duration) -> io::Result<()> {
+/// Handle one SOCKS5 TCP stream with the default direct-only routing table.
+/// Exposed for local integration tests and embedding.
+pub async fn handle_connection(client: TcpStream, connect_timeout: Duration) -> io::Result<()> {
+    handle_connection_with_rules(client, connect_timeout, Arc::new(RuleSet::default())).await
+}
+
+async fn handle_connection_with_rules(
+    mut client: TcpStream,
+    connect_timeout: Duration,
+    routing: Arc<RuleSet>,
+) -> io::Result<()> {
     let target = match timeout(HANDSHAKE_TIMEOUT, negotiate(&mut client)).await {
         Err(_) => return Ok(()),
         Ok(Ok(Some(target))) => target,
@@ -103,6 +116,11 @@ pub async fn handle_connection(mut client: TcpStream, connect_timeout: Duration)
         }
         Ok(Err(ProtocolError::Io(error))) => return Err(error),
     };
+
+    if routing.route(&target) == RouteAction::Reject {
+        send_reply(&mut client, REP_CONNECTION_NOT_ALLOWED, None).await?;
+        return Ok(());
+    }
 
     let connect_result = timeout(connect_timeout, connect_target(&target)).await;
     let mut upstream = match connect_result {
@@ -124,12 +142,6 @@ pub async fn handle_connection(mut client: TcpStream, connect_timeout: Duration)
 }
 
 #[derive(Debug)]
-enum Target {
-    Ip(SocketAddr),
-    Domain(String, u16),
-}
-
-#[derive(Debug)]
 enum ProtocolError {
     Io(io::Error),
     Reply(u8),
@@ -141,7 +153,7 @@ impl From<io::Error> for ProtocolError {
     }
 }
 
-async fn negotiate<S>(stream: &mut S) -> Result<Option<Target>, ProtocolError>
+async fn negotiate<S>(stream: &mut S) -> Result<Option<RequestTarget>, ProtocolError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -167,7 +179,7 @@ where
     read_connect_request(stream).await.map(Some)
 }
 
-async fn read_connect_request<S>(stream: &mut S) -> Result<Target, ProtocolError>
+async fn read_connect_request<S>(stream: &mut S) -> Result<RequestTarget, ProtocolError>
 where
     S: AsyncRead + Unpin,
 {
@@ -184,12 +196,12 @@ where
         0x01 => {
             let mut octets = [0u8; 4];
             stream.read_exact(&mut octets).await?;
-            Host::Ip(IpAddr::V4(octets.into()))
+            TargetHost::Ip(IpAddr::V4(octets.into()))
         }
         0x04 => {
             let mut octets = [0u8; 16];
             stream.read_exact(&mut octets).await?;
-            Host::Ip(IpAddr::V6(octets.into()))
+            TargetHost::Ip(IpAddr::V6(octets.into()))
         }
         0x03 => {
             let mut length = [0u8; 1];
@@ -201,7 +213,7 @@ where
             stream.read_exact(&mut bytes).await?;
             let domain = String::from_utf8(bytes)
                 .map_err(|_| ProtocolError::Reply(REP_ADDRESS_TYPE_NOT_SUPPORTED))?;
-            Host::Domain(domain)
+            TargetHost::Domain(domain)
         }
         _ => return Err(ProtocolError::Reply(REP_ADDRESS_TYPE_NOT_SUPPORTED)),
     };
@@ -209,21 +221,13 @@ where
     let mut port_bytes = [0u8; 2];
     stream.read_exact(&mut port_bytes).await?;
     let port = u16::from_be_bytes(port_bytes);
-    Ok(match host {
-        Host::Ip(ip) => Target::Ip(SocketAddr::new(ip, port)),
-        Host::Domain(domain) => Target::Domain(domain, port),
-    })
+    Ok(RequestTarget { host, port })
 }
 
-enum Host {
-    Ip(IpAddr),
-    Domain(String),
-}
-
-async fn connect_target(target: &Target) -> io::Result<TcpStream> {
-    match target {
-        Target::Ip(address) => TcpStream::connect(address).await,
-        Target::Domain(domain, port) => TcpStream::connect((domain.as_str(), *port)).await,
+async fn connect_target(target: &RequestTarget) -> io::Result<TcpStream> {
+    match &target.host {
+        TargetHost::Ip(address) => TcpStream::connect(SocketAddr::new(*address, target.port)).await,
+        TargetHost::Domain(domain) => TcpStream::connect((domain.as_str(), target.port)).await,
     }
 }
 
@@ -267,11 +271,18 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn start_one_connection() -> (TcpStream, tokio::task::JoinHandle<io::Result<()>>) {
+        start_one_connection_with_rules(RuleSet::default()).await
+    }
+
+    async fn start_one_connection_with_rules(
+        rules: RuleSet,
+    ) -> (TcpStream, tokio::task::JoinHandle<io::Result<()>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let routing = Arc::new(rules);
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await?;
-            handle_connection(stream, Duration::from_secs(2)).await
+            handle_connection_with_rules(stream, Duration::from_secs(2), routing).await
         });
         let client = TcpStream::connect(address).await.unwrap();
         (client, task)
@@ -300,7 +311,7 @@ mod tests {
         (header[0], header[1])
     }
 
-    async fn parse_target(request: &[u8]) -> Result<Target, ProtocolError> {
+    async fn parse_target(request: &[u8]) -> Result<RequestTarget, ProtocolError> {
         let (mut writer, mut reader) = tokio::io::duplex(request.len() + 1);
         writer.write_all(request).await.unwrap();
         read_connect_request(&mut reader).await
@@ -313,7 +324,9 @@ mod tests {
         request.extend_from_slice(&443u16.to_be_bytes());
 
         let target = parse_target(&request).await.unwrap();
-        assert!(matches!(target, Target::Domain(domain, 443) if domain == "example.com"));
+        assert!(
+            matches!(target, RequestTarget { host: TargetHost::Domain(domain), port: 443 } if domain == "example.com")
+        );
     }
 
     #[tokio::test]
@@ -323,7 +336,9 @@ mod tests {
         request.extend_from_slice(&8443u16.to_be_bytes());
 
         let target = parse_target(&request).await.unwrap();
-        assert!(matches!(target, Target::Ip(address) if address == "[::1]:8443".parse().unwrap()));
+        assert!(
+            matches!(target, RequestTarget { host: TargetHost::Ip(address), port: 8443 } if address == IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
+        );
     }
 
     #[tokio::test]
@@ -391,6 +406,22 @@ mod tests {
         let mut response = [0u8; 2];
         client.read_exact(&mut response).await.unwrap();
         assert_eq!(response, [SOCKS_VERSION, METHOD_NO_ACCEPTABLE]);
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn reject_rule_sends_connection_not_allowed_without_dialing() {
+        let rules = RuleSet::parse(&["DST-PORT,80,REJECT".to_owned()]).unwrap();
+        let (mut client, server_task) = start_one_connection_with_rules(rules).await;
+        negotiate_no_auth(&mut client).await;
+        client
+            .write_all(&[SOCKS_VERSION, CMD_CONNECT, 0, 0x01, 127, 0, 0, 1, 0, 80])
+            .await
+            .unwrap();
+        assert_eq!(
+            read_reply(&mut client).await,
+            (SOCKS_VERSION, REP_CONNECTION_NOT_ALLOWED)
+        );
         server_task.await.unwrap().unwrap();
     }
 }
