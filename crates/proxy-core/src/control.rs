@@ -15,6 +15,7 @@ use tokio::{
     sync::{Semaphore, watch},
     time::timeout,
 };
+use tracing::warn;
 
 use crate::routing::{ProxyGroupSnapshot, RuleError, RuleSet};
 
@@ -156,6 +157,13 @@ async fn select_proxy_group(
             StatusCode::BAD_REQUEST,
             "member is not configured in this group",
         ),
+        Err(RuleError::ProxyGroupStatePersistence { reason }) => {
+            warn!(group = %group, error = %reason, "could not persist proxy group selection");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not persist proxy group selection",
+            )
+        }
         Err(_) => error_response(StatusCode::BAD_REQUEST, "invalid proxy group selection"),
     }
 }
@@ -251,6 +259,109 @@ mod tests {
             .unwrap();
         let status: Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
         assert_eq!(status["now"], "REJECT");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn persisted_selection_survives_restart_and_invalid_requests_do_not_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.yaml");
+        std::fs::write(
+            &config_path,
+            "proxy-group-state-file: groups.json\nproxy-groups:\n  - { name: selected, type: select, proxies: [DIRECT, REJECT] }\nrules:\n  - MATCH,selected\n",
+        )
+        .unwrap();
+        let config = Config::load(&config_path).unwrap();
+        let state_path = directory.path().join("groups.json");
+        let (base_url, server, routing) = start_controller(config.routing_rules().unwrap()).await;
+        wait_for_server().await;
+        let client = reqwest::Client::new();
+
+        let response = client
+            .put(format!("{base_url}/proxies/selected"))
+            .bearer_auth(TEST_SECRET)
+            .header("content-type", "application/json")
+            .body(r#"{"name":"missing"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!state_path.exists());
+
+        let response = client
+            .put(format!("{base_url}/proxies/selected"))
+            .bearer_auth(TEST_SECRET)
+            .header("content-type", "application/json")
+            .body(r#"{"name":"REJECT"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let saved_state = std::fs::read(&state_path).unwrap();
+        assert_eq!(
+            routing.borrow().selected_proxy_group_member("selected"),
+            Some("REJECT".to_owned())
+        );
+
+        let response = client
+            .put(format!("{base_url}/proxies/selected"))
+            .header("content-type", "application/json")
+            .body(r#"{"name":"DIRECT"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(std::fs::read(&state_path).unwrap(), saved_state);
+        server.abort();
+
+        let restarted = Config::load(&config_path).unwrap().routing_rules().unwrap();
+        assert_eq!(
+            restarted.selected_proxy_group_member("selected"),
+            Some("REJECT".to_owned())
+        );
+        assert_eq!(
+            restarted.route(&RequestTarget {
+                host: TargetHost::Domain("example.org".to_owned()),
+                port: 443,
+            }),
+            RouteAction::Reject
+        );
+    }
+
+    #[tokio::test]
+    async fn persistence_failure_returns_server_error_without_changing_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let blocker = directory.path().join("not-a-directory");
+        std::fs::write(&blocker, b"block").unwrap();
+        let config_path = directory.path().join("config.yaml");
+        std::fs::write(
+            &config_path,
+            "proxy-group-state-file: not-a-directory/state.json\nproxy-groups:\n  - { name: selected, type: select, proxies: [DIRECT, REJECT] }\nrules:\n  - MATCH,selected\n",
+        )
+        .unwrap();
+        let config = Config::load(&config_path).unwrap();
+        let (base_url, server, routing) = start_controller(config.routing_rules().unwrap()).await;
+        wait_for_server().await;
+        let response = reqwest::Client::new()
+            .put(format!("{base_url}/proxies/selected"))
+            .bearer_auth(TEST_SECRET)
+            .header("content-type", "application/json")
+            .body(r#"{"name":"REJECT"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            routing.borrow().selected_proxy_group_member("selected"),
+            Some("DIRECT".to_owned())
+        );
+        assert_eq!(
+            routing.borrow().route(&RequestTarget {
+                host: TargetHost::Domain("example.org".to_owned()),
+                port: 443,
+            }),
+            RouteAction::Direct
+        );
         server.abort();
     }
 

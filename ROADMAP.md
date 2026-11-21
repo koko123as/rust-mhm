@@ -38,7 +38,8 @@
 - [x] 严格配置支持有限 `select` 组子集：代理/组前向及嵌套引用、`DIRECT`/`REJECT`、成员与名称校验、引用环路检测；`default-selected` 无效或缺省时回退首成员，组名可用于规则及 `RULE-SET` 动作。
 - [x] 核心库的 `RuleSet` 保留可变进程内选择状态，并提供手动选择/读取成员方法；嵌套组及 `RULE-SET` 组动作按当前选择解析。克隆共享状态，独立构建的 `RuleSet` 隔离。
 - [x] 可选 loopback 组控制 API：Bearer 密钥保护，支持列出组状态和选择成员；请求体、并发和 handler 时限有界。规则 provider 刷新时保留仍然有效的手动选择；若组/成员消失则使用新默认值。
-- [ ] 选择状态持久化、`url-test`、`fallback`、`load-balance`、健康检查与组过滤器；控制 API 目前仅为有限手动 `select` 子集，不代表完整 Mihomo API。
+- [x] 可选 `proxy-group-state-file` 本地状态文件：启动只恢复当前配置中仍存在的组及成员，缺失/损坏/过期状态安全回退；API 切换先原子写盘再更新运行状态，写入失败明确报错。
+- [ ] `url-test`、`fallback`、`load-balance`、健康检查与组过滤器；控制 API 仍仅为有限手动 `select` 子集，不代表完整 Mihomo API。
 - [ ] 扩展真实 Mihomo 代理类型及协议互操作测试；当前代理 schema 是严格子集。
 - [ ] 重试与多级代理尚未实现。
 

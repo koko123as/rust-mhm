@@ -256,7 +256,7 @@ async fn refresh_rule_provider_loop(
             }
             match config.refresh_rule_provider(name).await {
                 Ok(()) => match config.routing_rules() {
-                    Ok(updated_rules) => {
+                    Ok(mut updated_rules) => {
                         let previous_rules = Arc::clone(&routing.borrow());
                         updated_rules.inherit_proxy_group_selections_from(&previous_rules);
                         routing.send_replace(Arc::new(updated_rules));
@@ -1406,7 +1406,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_selection_survives_scheduled_provider_refresh() {
+    async fn control_selection_survives_provider_refresh_and_restart() {
         let directory = std::env::temp_dir().join(format!(
             "rust-mhm-control-refresh-test-{}",
             std::time::SystemTime::now()
@@ -1420,7 +1420,7 @@ mod tests {
         let config_path = directory.join("config.yaml");
         std::fs::write(
             &config_path,
-            "proxy-groups:\n  - name: selected\n    type: select\n    proxies: [DIRECT, REJECT]\n    default-selected: REJECT\nrule-providers:\n  local:\n    type: file\n    behavior: classical\n    path: provider.rules\n    interval: 1\nrules:\n  - RULE-SET,local,REJECT\n  - MATCH,selected\n",
+            "proxy-group-state-file: selections.json\nproxy-groups:\n  - name: selected\n    type: select\n    proxies: [DIRECT, REJECT]\n    default-selected: REJECT\nrule-providers:\n  local:\n    type: file\n    behavior: classical\n    path: provider.rules\n    interval: 1\nrules:\n  - RULE-SET,local,REJECT\n  - MATCH,selected\n",
         )
         .unwrap();
 
@@ -1497,6 +1497,12 @@ mod tests {
         let status: serde_json::Value =
             serde_json::from_str(&response.text().await.unwrap()).unwrap();
         assert_eq!(status["now"], "DIRECT");
+        let restarted = Config::load(&config_path).unwrap().routing_rules().unwrap();
+        assert_eq!(
+            restarted.selected_proxy_group_member("selected"),
+            Some("DIRECT".to_owned())
+        );
+        assert_eq!(restarted.route(&new_target), RouteAction::Reject);
 
         refresh.abort();
         let _ = refresh.await;

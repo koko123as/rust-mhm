@@ -1,11 +1,26 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
+    fs::File,
+    io::{Read, Write},
     net::{IpAddr, SocketAddr},
+    path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
+use tempfile::NamedTempFile;
 use thiserror::Error;
+use tracing::warn;
+
+const MAX_PROXY_GROUP_STATE_BYTES: u64 = 1024 * 1024;
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProxyGroupSelectionState {
+    version: u8,
+    selected: BTreeMap<String, String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteAction {
@@ -60,7 +75,8 @@ struct RoutingRule {
 #[derive(Debug, Clone, Default)]
 struct ProxyGroupSelections {
     definitions: HashMap<String, ProxyGroupDefinition>,
-    selected: HashMap<String, String>,
+    selected: BTreeMap<String, String>,
+    persistence_path: Option<PathBuf>,
 }
 
 impl ProxyGroupSelections {
@@ -72,6 +88,7 @@ impl ProxyGroupSelections {
         Self {
             definitions: definitions.clone(),
             selected,
+            persistence_path: None,
         }
     }
 
@@ -148,6 +165,8 @@ pub enum RuleError {
     UnknownProxyGroup { name: String },
     #[error("member {member} is not configured in proxy group {group}")]
     InvalidProxyGroupMember { group: String, member: String },
+    #[error("could not persist proxy group selection state: {reason}")]
+    ProxyGroupStatePersistence { reason: String },
 }
 
 impl Default for RuleSet {
@@ -382,6 +401,37 @@ impl RuleSet {
         self.route_with_source(target, None)
     }
 
+    pub(crate) fn load_persistent_proxy_group_selections(&self, path: PathBuf) {
+        let mut selections = self
+            .proxy_groups
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        selections.persistence_path = Some(path.clone());
+        match read_proxy_group_selection_state(&path) {
+            Ok(Some(state)) => {
+                let mut ignored = 0;
+                for (group, member) in state.selected {
+                    if selections
+                        .definitions
+                        .get(&group)
+                        .is_some_and(|definition| definition.members.contains(&member))
+                    {
+                        selections.selected.insert(group, member);
+                    } else {
+                        ignored += 1;
+                    }
+                }
+                if ignored > 0 {
+                    warn!(ignored, "ignored stale proxy-group selection entries");
+                }
+            }
+            Ok(None) => {}
+            Err(reason) => {
+                warn!(error = %reason, "ignoring invalid proxy-group selection state file")
+            }
+        }
+    }
+
     /// Evaluate rules with the source address of the inbound connection when available.
     pub(crate) fn route_with_source(
         &self,
@@ -451,9 +501,16 @@ impl RuleSet {
                 member: member.to_owned(),
             });
         }
-        selections
-            .selected
-            .insert(group.to_owned(), member.to_owned());
+        let mut updated = selections.selected.clone();
+        updated.insert(group.to_owned(), member.to_owned());
+        if let Some(path) = selections.persistence_path.as_deref() {
+            persist_proxy_group_selection_state(path, &updated).map_err(|error| {
+                RuleError::ProxyGroupStatePersistence {
+                    reason: error.to_string(),
+                }
+            })?;
+        }
+        selections.selected = updated;
         Ok(())
     }
 
@@ -506,27 +563,33 @@ impl RuleSet {
         })
     }
 
-    /// Preserve valid user selections when replacing rules after a provider refresh.
-    pub(crate) fn inherit_proxy_group_selections_from(&self, previous: &Self) {
-        let previous_selections = previous
+    /// Preserve valid selections and share their lock when replacing rules after refresh.
+    pub(crate) fn inherit_proxy_group_selections_from(&mut self, previous: &Self) {
+        let new_definitions = self
             .proxy_groups
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .selected
+            .definitions
             .clone();
-        let mut current = self
+        let mut previous_state = previous
             .proxy_groups
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for (group, selected) in previous_selections {
-            if current
-                .definitions
-                .get(&group)
-                .is_some_and(|definition| definition.members.contains(&selected))
-            {
-                current.selected.insert(group, selected);
-            }
-        }
+        let selected = new_definitions
+            .iter()
+            .map(|(group, definition)| {
+                let member = previous_state
+                    .selected
+                    .get(group)
+                    .filter(|member| definition.members.contains(member))
+                    .unwrap_or(&definition.default_selected);
+                (group.clone(), member.clone())
+            })
+            .collect();
+        previous_state.definitions = new_definitions;
+        previous_state.selected = selected;
+        drop(previous_state);
+        self.proxy_groups = previous.proxy_groups.clone();
     }
 
     fn resolve_action(&self, action: &RuleAction) -> RouteAction {
@@ -544,6 +607,63 @@ impl RuleSet {
     pub fn rule_count(&self) -> usize {
         self.rules.len()
     }
+}
+
+fn read_proxy_group_selection_state(
+    path: &Path,
+) -> Result<Option<ProxyGroupSelectionState>, String> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    let size = file.metadata().map_err(|error| error.to_string())?.len();
+    if size > MAX_PROXY_GROUP_STATE_BYTES {
+        return Err(format!(
+            "state file exceeds {MAX_PROXY_GROUP_STATE_BYTES} bytes"
+        ));
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    file.take(MAX_PROXY_GROUP_STATE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_PROXY_GROUP_STATE_BYTES {
+        return Err(format!(
+            "state file exceeds {MAX_PROXY_GROUP_STATE_BYTES} bytes"
+        ));
+    }
+    let state: ProxyGroupSelectionState =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if state.version != 1 {
+        return Err(format!("unsupported state file version {}", state.version));
+    }
+    Ok(Some(state))
+}
+
+fn persist_proxy_group_selection_state(
+    path: &Path,
+    selected: &BTreeMap<String, String>,
+) -> std::io::Result<()> {
+    let state = ProxyGroupSelectionState {
+        version: 1,
+        selected: selected.clone(),
+    };
+    let bytes = serde_json::to_vec(&state).map_err(std::io::Error::other)?;
+    if bytes.len() as u64 > MAX_PROXY_GROUP_STATE_BYTES {
+        return Err(std::io::Error::other(format!(
+            "state file exceeds {MAX_PROXY_GROUP_STATE_BYTES} bytes"
+        )));
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut temporary = NamedTempFile::new_in(parent)?;
+    temporary.write_all(&bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
 }
 
 impl RoutingRule {
@@ -773,7 +893,7 @@ mod tests {
             .select_proxy_group_member("selected", "REJECT")
             .unwrap();
 
-        let refreshed = RuleSet::parse_with_rule_providers_and_groups(
+        let mut refreshed = RuleSet::parse_with_rule_providers_and_groups(
             &lines,
             &[],
             &definitions,
@@ -785,6 +905,17 @@ mod tests {
             refreshed.route(&domain_target("example.org", 443)),
             RouteAction::Reject
         );
+        let late_handle = previous.clone();
+        late_handle
+            .select_proxy_group_member("selected", "DIRECT")
+            .unwrap();
+        assert_eq!(
+            refreshed.route(&domain_target("example.org", 443)),
+            RouteAction::Direct
+        );
+        late_handle
+            .select_proxy_group_member("selected", "REJECT")
+            .unwrap();
 
         let changed_definitions = HashMap::from([(
             "selected".to_owned(),
@@ -793,7 +924,7 @@ mod tests {
                 default_selected: "DIRECT".to_owned(),
             },
         )]);
-        let changed = RuleSet::parse_with_rule_providers_and_groups(
+        let mut changed = RuleSet::parse_with_rule_providers_and_groups(
             &lines,
             &[],
             &changed_definitions,
@@ -1152,5 +1283,50 @@ mod tests {
             RuleSet::parse(&["DST-PORT,90-80,REJECT".to_owned()]),
             Err(RuleError::InvalidPort { .. })
         ));
+    }
+
+    #[test]
+    fn concurrent_persistent_selections_leave_a_complete_matching_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("groups.json");
+        let definitions = HashMap::from([(
+            "selected".to_owned(),
+            ProxyGroupDefinition {
+                members: vec!["DIRECT".to_owned(), "REJECT".to_owned()],
+                default_selected: "DIRECT".to_owned(),
+            },
+        )]);
+        let rules = RuleSet::parse_with_rule_providers_and_groups(
+            &["MATCH,selected".to_owned()],
+            &[],
+            &definitions,
+            &HashMap::new(),
+        )
+        .unwrap();
+        rules.load_persistent_proxy_group_selections(path.clone());
+
+        let workers = (0..4)
+            .map(|index| {
+                let rules = rules.clone();
+                std::thread::spawn(move || {
+                    let member = if index % 2 == 0 { "DIRECT" } else { "REJECT" };
+                    for _ in 0..4 {
+                        rules.select_proxy_group_member("selected", member).unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let disk = read_proxy_group_selection_state(&path)
+            .unwrap()
+            .expect("selection state should be persisted");
+        assert_eq!(
+            disk.selected.get("selected"),
+            rules.selected_proxy_group_member("selected").as_ref()
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 }

@@ -54,6 +54,8 @@ pub struct Config {
     external_controller: Option<String>,
     #[serde(default)]
     secret: Option<String>,
+    #[serde(default, rename = "proxy-group-state-file")]
+    proxy_group_state_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -117,6 +119,7 @@ impl Default for Config {
             skip_auth_prefixes: Vec::new(),
             external_controller: None,
             secret: None,
+            proxy_group_state_file: None,
         }
     }
 }
@@ -138,6 +141,9 @@ impl Config {
             .any(|provider| provider.provider_type == "http")
         {
             return Err(ConfigError::HttpProviderRequiresAsyncLoad);
+        }
+        if config.proxy_group_state_file.is_some() {
+            return Err(ConfigError::ProxyGroupStateRequiresConfigPath);
         }
         config.validate()?;
         Ok(config)
@@ -229,12 +235,16 @@ impl Config {
             .iter()
             .map(|(name, provider)| (name.clone(), provider.normalized_payload()))
             .collect::<HashMap<_, _>>();
-        Ok(RuleSet::parse_with_rule_providers_and_groups(
+        let rules = RuleSet::parse_with_rule_providers_and_groups(
             &self.rules,
             &names,
             &group_definitions,
             &rule_providers,
-        )?)
+        )?;
+        if let Some(path) = self.resolved_proxy_group_state_file() {
+            rules.load_persistent_proxy_group_selections(path);
+        }
+        Ok(rules)
     }
 
     pub fn proxy_outbounds(&self) -> &[ProxyOutbound] {
@@ -515,6 +525,32 @@ impl Config {
             (Some(_), Some(_)) => {}
         }
         let _ = self.external_controller_addr()?;
+        if self
+            .proxy_group_state_file
+            .as_deref()
+            .is_some_and(|path| !cache_path_names_file(path))
+        {
+            return Err(ConfigError::InvalidProxyGroupState(
+                "proxy-group-state-file must name a file".to_owned(),
+            ));
+        }
+        let state_path = self.resolved_proxy_group_state_file();
+        if let Some(path) = state_path.as_deref() {
+            if path.is_dir() {
+                return Err(ConfigError::InvalidProxyGroupState(
+                    "proxy-group-state-file must not name a directory".to_owned(),
+                ));
+            }
+            if self
+                .config_path
+                .as_deref()
+                .is_some_and(|config_path| paths_refer_to_same_file(config_path, path))
+            {
+                return Err(ConfigError::InvalidProxyGroupState(
+                    "proxy-group-state-file must not overwrite the configuration file".to_owned(),
+                ));
+            }
+        }
         if !(MIN_CONNECT_TIMEOUT_MS..=MAX_CONNECT_TIMEOUT_MS).contains(&self.connect_timeout_ms) {
             return Err(ConfigError::InvalidConnectTimeout(self.connect_timeout_ms));
         }
@@ -540,6 +576,30 @@ impl Config {
         let mut cache_paths = std::collections::HashSet::new();
         for (name, provider) in &self.rule_providers {
             provider.validate(name)?;
+            if let Some(state_path) = state_path.as_deref() {
+                let provider_path = match provider.provider_type.as_str() {
+                    "file" => provider.path.as_deref().map(|path| {
+                        if path.is_absolute() {
+                            path.to_path_buf()
+                        } else {
+                            self.config_dir
+                                .as_deref()
+                                .expect("file providers are loaded only from a config file")
+                                .join(path)
+                        }
+                    }),
+                    "http" => Some(self.rule_provider_cache_path(name, provider)),
+                    _ => None,
+                };
+                if provider_path
+                    .as_deref()
+                    .is_some_and(|path| paths_refer_to_same_file(path, state_path))
+                {
+                    return Err(ConfigError::InvalidProxyGroupState(format!(
+                        "proxy-group-state-file conflicts with rule provider {name}"
+                    )));
+                }
+            }
             if provider.provider_type == "http" {
                 let cache_path = self.rule_provider_cache_path(name, provider);
                 if cache_path.is_dir() {
@@ -700,6 +760,19 @@ impl Config {
                 )
             })
             .collect())
+    }
+
+    fn resolved_proxy_group_state_file(&self) -> Option<PathBuf> {
+        self.proxy_group_state_file.as_ref().map(|path| {
+            if path.is_absolute() {
+                path.clone()
+            } else {
+                self.config_dir
+                    .as_deref()
+                    .expect("proxy-group-state-file requires a configuration path")
+                    .join(path)
+            }
+        })
     }
 }
 
@@ -1357,6 +1430,10 @@ pub enum ConfigError {
     InvalidProxy(String),
     #[error("invalid proxy group configuration: {0}")]
     InvalidProxyGroup(String),
+    #[error("invalid proxy-group state file configuration: {0}")]
+    InvalidProxyGroupState(String),
+    #[error("proxy-group-state-file requires Config::load with a configuration-file path")]
+    ProxyGroupStateRequiresConfigPath,
     #[error("invalid rule provider {name}: {reason}")]
     InvalidRuleProvider { name: String, reason: String },
     #[error("file rule providers require Config::load with a configuration-file path")]
@@ -1614,6 +1691,125 @@ mod tests {
     fn repository_example_config_parses() {
         let config = Config::from_yaml_str(include_str!("../../../config.example.yaml")).unwrap();
         assert_eq!(config.routing_rules().unwrap().rule_count(), 5);
+    }
+
+    #[test]
+    fn proxy_group_state_restores_valid_members_and_ignores_stale_or_malformed_entries() {
+        let directory = temporary_directory();
+        let config_path = directory.join("config.yaml");
+        std::fs::write(
+            &config_path,
+            "proxy-group-state-file: groups.json\nproxy-groups:\n  - { name: selected, type: select, proxies: [DIRECT, REJECT] }\nrules:\n  - MATCH,selected\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            Config::from_yaml_str("proxy-group-state-file: groups.json\n"),
+            Err(ConfigError::ProxyGroupStateRequiresConfigPath)
+        ));
+
+        let state_path = directory.join("groups.json");
+        let config = Config::load(&config_path).unwrap();
+        assert_eq!(
+            config
+                .routing_rules()
+                .unwrap()
+                .selected_proxy_group_member("selected"),
+            Some("DIRECT".to_owned())
+        );
+
+        std::fs::write(
+            &state_path,
+            r#"{"version":1,"selected":{"selected":"REJECT","removed":"DIRECT"}}"#,
+        )
+        .unwrap();
+        let restored = Config::load(&config_path).unwrap().routing_rules().unwrap();
+        assert_eq!(
+            restored.selected_proxy_group_member("selected"),
+            Some("REJECT".to_owned())
+        );
+
+        std::fs::write(
+            &state_path,
+            r#"{"version":1,"selected":{"selected":"no-longer-a-member","removed":"DIRECT"}}"#,
+        )
+        .unwrap();
+        let stale = Config::load(&config_path).unwrap().routing_rules().unwrap();
+        assert_eq!(
+            stale.selected_proxy_group_member("selected"),
+            Some("DIRECT".to_owned())
+        );
+
+        std::fs::write(&state_path, b"not valid JSON").unwrap();
+        let malformed = Config::load(&config_path).unwrap().routing_rules().unwrap();
+        assert_eq!(
+            malformed.selected_proxy_group_member("selected"),
+            Some("DIRECT".to_owned())
+        );
+
+        std::fs::write(
+            &state_path,
+            r#"{"version":2,"selected":{"selected":"REJECT"}}"#,
+        )
+        .unwrap();
+        let unsupported_version = Config::load(&config_path).unwrap().routing_rules().unwrap();
+        assert_eq!(
+            unsupported_version.selected_proxy_group_member("selected"),
+            Some("DIRECT".to_owned())
+        );
+
+        std::fs::write(&state_path, vec![b' '; 1024 * 1024 + 1]).unwrap();
+        let oversized = Config::load(&config_path).unwrap().routing_rules().unwrap();
+        assert_eq!(
+            oversized.selected_proxy_group_member("selected"),
+            Some("DIRECT".to_owned())
+        );
+    }
+
+    #[test]
+    fn proxy_group_state_path_cannot_overwrite_config_provider_data_or_a_directory() {
+        let directory = temporary_directory();
+        let config_path = directory.join("config.yaml");
+        std::fs::write(&config_path, "proxy-group-state-file: config.yaml\n").unwrap();
+        assert!(matches!(
+            Config::load(&config_path),
+            Err(ConfigError::InvalidProxyGroupState(_))
+        ));
+
+        std::fs::write(directory.join("rules.txt"), "example.org\n").unwrap();
+        std::fs::write(
+            &config_path,
+            "proxy-group-state-file: rules.txt\nrule-providers:\n  local:\n    type: file\n    behavior: domain\n    path: rules.txt\nrules:\n  - RULE-SET,local,REJECT\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            Config::load(&config_path),
+            Err(ConfigError::InvalidProxyGroupState(_))
+        ));
+
+        let state_directory = directory.join("state-dir");
+        std::fs::create_dir(&state_directory).unwrap();
+        std::fs::write(&config_path, "proxy-group-state-file: state-dir\n").unwrap();
+        assert!(matches!(
+            Config::load(&config_path),
+            Err(ConfigError::InvalidProxyGroupState(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn proxy_group_state_path_cannot_overwrite_http_provider_cache() {
+        let directory = temporary_directory();
+        let config_path = directory.join("config.yaml");
+        std::fs::write(
+            &config_path,
+            "proxy-group-state-file: provider.cache\nrule-providers:\n  remote:\n    type: http\n    behavior: domain\n    path: provider.cache\n    url: https://example.invalid/rules.yaml\nrules:\n  - RULE-SET,remote,REJECT\n",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            Config::load_async(&config_path).await,
+            Err(ConfigError::InvalidProxyGroupState(_))
+        ));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

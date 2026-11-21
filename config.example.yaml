@@ -6,6 +6,8 @@ max_connections: 256
 # Use a private visible-ASCII secret and restrict access to this config file.
 # external-controller: "127.0.0.1:9090"
 # secret: "replace-with-a-private-token"
+# Optional rust-mhm extension: persist manual select-group choices locally.
+# proxy-group-state-file: ".rust-mhm/proxy-groups.json"
 rules:
   - DOMAIN,ads.example,REJECT
   - DOMAIN-SUFFIX,example.org,DIRECT

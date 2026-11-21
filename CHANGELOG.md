@@ -2,16 +2,21 @@
 
 ## Unreleased
 
+- 新增本项目自有可选 `proxy-group-state-file`：以版本化 JSON 保存手动 `select` 选择；相对路径基于配置文件目录，拒绝覆盖配置或 provider 数据文件/缓存。
+- 启动时只恢复当前配置仍存在的组和成员；缺失、损坏、超限或未知/过期状态安全回退默认值。未配置时仍保持进程内状态行为。
+- API 手动切换通过同目录临时文件原子替换状态快照后再更新运行选择；写入失败返回 500 且不改变内存状态。provider 刷新继续继承有效选择。
+- 修复 provider 刷新和并发 API 选择在规则表替换时可能丢失后续选择的竞态；新旧规则句柄在刷新过渡期共享组状态锁。
+- 新增控制 API 重启恢复、过期/损坏状态、路径冲突、写盘失败和并发更新覆盖；端到端验证持久化状态经过 provider 刷新仍可在重启后恢复。
 - TCP 域名目标的 `IP-CIDR`/`IP-CIDR6` 路由现在按规则顺序按需执行一次有界系统解析；支持 `no-resolve`，DIRECT 复用最多 16 个去重答案并以 250ms 间隔交错尝试，避免慢失败的 IPv6 地址阻塞后续地址，具名代理仍接收原始域名。超时、DNS 失败、无答案或超限不回退 DIRECT；UDP 路径未改变，也未新增通用 DNS 策略/缓存。
 - 新增解析顺序与调用次数、IPv4/IPv6 多答案、空/失败/超限/超时，以及 SOCKS5 DIRECT、REJECT 无拨号和 HTTP 上游保留原域名的测试。
 - 增加严格配置的有限 `select` 代理组子集：支持代理与嵌套组前向引用、`DIRECT`/`REJECT`、有效 `default-selected` 默认项；缺省或无效默认项回退首成员，并校验成员、名称及引用环路。
 - `RuleSet` 增加进程内手动选择/读取组成员的方法；普通规则与 `RULE-SET` 组动作保留符号化组名并按当前选择递归解析。克隆共享选择状态，另一次 `Config::routing_rules()` 创建独立状态。
 - 覆盖默认值、合法选择、嵌套组变化、`DIRECT`/`REJECT`、未知组/非成员拒绝且不改变状态、克隆共享、独立实例隔离，以及 `RULE-SET` 动作跟随当前选择。
-- 增加可选 loopback 组控制 API：使用 Bearer secret 保护 `GET /proxies`、`GET /proxies/{name}` 和 `PUT /proxies/{name}`；只支持手动 `select` 组，不支持 TLS、WebSocket、持久化或完整 Mihomo API。
+- 增加可选 loopback 组控制 API：使用 Bearer secret 保护 `GET /proxies`、`GET /proxies/{name}` 和 `PUT /proxies/{name}`；只支持手动 `select` 组，不支持 TLS、WebSocket 或完整 Mihomo API。
 - 控制 API 请求体限制为 4 KiB、并发请求限制为 32、处理时限为 10 秒；配置要求 `external-controller` 与 `secret` 同时设置，且仅允许 loopback IP socket。
 - provider 刷新在新组仍含当前已选成员时继承进程内选择；组或成员被移除时采用新配置默认成员。
 - 新增控制 API 认证、非法/超大请求、服务启动/关闭与真实 SOCKS 路由联动测试，以及手动选择跨 provider 刷新的端到端测试。
-- 控制 API 当前没有持久化；`url-test`、`fallback`、`load-balance`、健康检查与过滤器仍未实现。
+- `url-test`、`fallback`、`load-balance`、健康检查与过滤器仍未实现。
 - 增加受限 SOCKS5 UDP 代理出站：按数据报路由到具名 SOCKS5 上游，保留目标域名供代理解析，并维持上游 TCP 控制连接直至入站关联结束；HTTP 代理 UDP 与分片仍不支持，也不回退直连。
 - 增加 SOCKS5 UDP ASSOCIATE 认证与上游 relay 协商测试，以及经本地假 SOCKS5 UDP relay 的域名请求/响应端到端测试。
 - 增加受限 SOCKS5 UDP ASSOCIATE 入站：关联随 TCP 控制连接结束，支持 loopback relay、客户端端点固定、IPv4/IPv6/域名目标和逐数据报规则判断；可选择 DIRECT 或具名 SOCKS5 UDP 出站，REJECT/HTTP 代理/畸形/分片数据报丢弃且不回退直连。
