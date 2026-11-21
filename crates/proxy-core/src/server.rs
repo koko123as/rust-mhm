@@ -21,7 +21,9 @@ use crate::routing::{RequestTarget, RouteAction, RuleSet, TargetHost};
 
 const SOCKS_VERSION: u8 = 0x05;
 const METHOD_NO_AUTH: u8 = 0x00;
+const METHOD_USERNAME_PASSWORD: u8 = 0x02;
 const METHOD_NO_ACCEPTABLE: u8 = 0xff;
+const AUTH_VERSION: u8 = 0x01;
 const CMD_CONNECT: u8 = 0x01;
 const REP_SUCCEEDED: u8 = 0x00;
 const REP_GENERAL_FAILURE: u8 = 0x01;
@@ -46,6 +48,7 @@ pub async fn run(config: Config) -> Result<(), ServerError> {
     let listen_addr = config.listen_addr()?;
     let routing = Arc::new(config.routing_rules()?);
     let outbounds = Arc::new(config.proxy_outbounds().to_vec());
+    let authentication = Arc::new(config.authentication_credentials());
     let listener = TcpListener::bind(listen_addr).await?;
     let connection_limit = Arc::new(Semaphore::new(config.max_connections()));
     let connect_timeout = Duration::from_millis(config.connect_timeout_ms());
@@ -67,9 +70,10 @@ pub async fn run(config: Config) -> Result<(), ServerError> {
                     Ok(permit) => {
                         let routing = Arc::clone(&routing);
                         let outbounds = Arc::clone(&outbounds);
+                        let authentication = Arc::clone(&authentication);
                         tasks.spawn(async move {
                             let _permit = permit;
-                            handle_connection_with_rules(stream, connect_timeout, routing, outbounds).await
+                            handle_connection_with_rules(stream, connect_timeout, routing, outbounds, authentication).await
                         });
                     }
                     Err(_) => {
@@ -106,6 +110,7 @@ pub async fn handle_connection(client: TcpStream, connect_timeout: Duration) -> 
         connect_timeout,
         Arc::new(RuleSet::default()),
         Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
     )
     .await
 }
@@ -115,8 +120,9 @@ async fn handle_connection_with_rules(
     connect_timeout: Duration,
     routing: Arc<RuleSet>,
     outbounds: Arc<Vec<ProxyOutbound>>,
+    authentication: Arc<Vec<(String, String)>>,
 ) -> io::Result<()> {
-    let target = match timeout(HANDSHAKE_TIMEOUT, negotiate(&mut client)).await {
+    let target = match timeout(HANDSHAKE_TIMEOUT, negotiate(&mut client, &authentication)).await {
         Err(_) => return Ok(()),
         Ok(Ok(Some(target))) => target,
         Ok(Ok(None)) => return Ok(()),
@@ -179,7 +185,10 @@ impl From<io::Error> for ProtocolError {
     }
 }
 
-async fn negotiate<S>(stream: &mut S) -> Result<Option<RequestTarget>, ProtocolError>
+async fn negotiate<S>(
+    stream: &mut S,
+    authentication: &[(String, String)],
+) -> Result<Option<RequestTarget>, ProtocolError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -194,15 +203,58 @@ where
 
     let mut methods = vec![0u8; usize::from(greeting[1])];
     stream.read_exact(&mut methods).await?;
-    if !methods.contains(&METHOD_NO_AUTH) {
+    let selected_method = if authentication.is_empty() {
+        METHOD_NO_AUTH
+    } else {
+        METHOD_USERNAME_PASSWORD
+    };
+    if !methods.contains(&selected_method) {
         stream
             .write_all(&[SOCKS_VERSION, METHOD_NO_ACCEPTABLE])
             .await?;
         return Ok(None);
     }
-    stream.write_all(&[SOCKS_VERSION, METHOD_NO_AUTH]).await?;
+    stream.write_all(&[SOCKS_VERSION, selected_method]).await?;
+    if selected_method == METHOD_USERNAME_PASSWORD
+        && !authenticate_user(stream, authentication).await?
+    {
+        return Ok(None);
+    }
 
     read_connect_request(stream).await.map(Some)
+}
+
+async fn authenticate_user<S>(
+    stream: &mut S,
+    authentication: &[(String, String)],
+) -> Result<bool, ProtocolError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut header = [0u8; 2];
+    stream.read_exact(&mut header).await?;
+    if header[0] != AUTH_VERSION || header[1] == 0 {
+        stream.write_all(&[AUTH_VERSION, 0x01]).await?;
+        return Ok(false);
+    }
+    let mut username = vec![0u8; usize::from(header[1])];
+    stream.read_exact(&mut username).await?;
+    let password_len = stream.read_u8().await?;
+    if password_len == 0 {
+        stream.write_all(&[AUTH_VERSION, 0x01]).await?;
+        return Ok(false);
+    }
+    let mut password = vec![0u8; usize::from(password_len)];
+    stream.read_exact(&mut password).await?;
+    let authenticated = authentication
+        .iter()
+        .any(|(expected_user, expected_password)| {
+            expected_user.as_bytes() == username && expected_password.as_bytes() == password
+        });
+    stream
+        .write_all(&[AUTH_VERSION, if authenticated { 0x00 } else { 0x01 }])
+        .await?;
+    Ok(authenticated)
 }
 
 async fn read_connect_request<S>(stream: &mut S) -> Result<RequestTarget, ProtocolError>
@@ -310,13 +362,29 @@ mod tests {
         rules: RuleSet,
         outbounds: Vec<ProxyOutbound>,
     ) -> (TcpStream, tokio::task::JoinHandle<io::Result<()>>) {
+        start_one_connection_with_authentication(rules, outbounds, Vec::new()).await
+    }
+
+    async fn start_one_connection_with_authentication(
+        rules: RuleSet,
+        outbounds: Vec<ProxyOutbound>,
+        authentication: Vec<(String, String)>,
+    ) -> (TcpStream, tokio::task::JoinHandle<io::Result<()>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let routing = Arc::new(rules);
         let outbounds = Arc::new(outbounds);
+        let authentication = Arc::new(authentication);
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await?;
-            handle_connection_with_rules(stream, Duration::from_secs(2), routing, outbounds).await
+            handle_connection_with_rules(
+                stream,
+                Duration::from_secs(2),
+                routing,
+                outbounds,
+                authentication,
+            )
+            .await
         });
         let client = TcpStream::connect(address).await.unwrap();
         (client, task)
@@ -440,6 +508,60 @@ mod tests {
         let mut response = [0u8; 2];
         client.read_exact(&mut response).await.unwrap();
         assert_eq!(response, [SOCKS_VERSION, METHOD_NO_ACCEPTABLE]);
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn configured_user_must_authenticate_before_connect_commands() {
+        let users = vec![("alice".to_owned(), "secret".to_owned())];
+        let (mut client, server_task) =
+            start_one_connection_with_authentication(RuleSet::default(), Vec::new(), users).await;
+        client
+            .write_all(&[SOCKS_VERSION, 2, METHOD_NO_AUTH, METHOD_USERNAME_PASSWORD])
+            .await
+            .unwrap();
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [SOCKS_VERSION, METHOD_USERNAME_PASSWORD]);
+        client.write_all(&[AUTH_VERSION, 5]).await.unwrap();
+        client.write_all(b"alice").await.unwrap();
+        client.write_all(&[6]).await.unwrap();
+        client.write_all(b"secret").await.unwrap();
+        let mut auth_reply = [0u8; 2];
+        client.read_exact(&mut auth_reply).await.unwrap();
+        assert_eq!(auth_reply, [AUTH_VERSION, 0x00]);
+        client
+            .write_all(&[SOCKS_VERSION, 0x03, 0, 0x01, 127, 0, 0, 1, 0, 53])
+            .await
+            .unwrap();
+        assert_eq!(
+            read_reply(&mut client).await,
+            (SOCKS_VERSION, REP_COMMAND_NOT_SUPPORTED)
+        );
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_user_password_is_rejected_and_connection_closes() {
+        let users = vec![("alice".to_owned(), "secret".to_owned())];
+        let (mut client, server_task) =
+            start_one_connection_with_authentication(RuleSet::default(), Vec::new(), users).await;
+        client
+            .write_all(&[SOCKS_VERSION, 1, METHOD_USERNAME_PASSWORD])
+            .await
+            .unwrap();
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [SOCKS_VERSION, METHOD_USERNAME_PASSWORD]);
+        client.write_all(&[AUTH_VERSION, 3]).await.unwrap();
+        client.write_all(b"bob").await.unwrap();
+        client.write_all(&[6]).await.unwrap();
+        client.write_all(b"secret").await.unwrap();
+        let mut auth_reply = [0u8; 2];
+        client.read_exact(&mut auth_reply).await.unwrap();
+        assert_eq!(auth_reply, [AUTH_VERSION, 0x01]);
+        let mut trailing = [0u8; 1];
+        assert_eq!(client.read(&mut trailing).await.unwrap(), 0);
         server_task.await.unwrap().unwrap();
     }
 

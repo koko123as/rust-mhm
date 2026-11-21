@@ -26,6 +26,8 @@ pub struct Config {
     rules: Vec<String>,
     #[serde(default)]
     proxies: Vec<ProxyOutbound>,
+    #[serde(default)]
+    authentication: Vec<String>,
 }
 
 impl Default for Config {
@@ -36,6 +38,7 @@ impl Default for Config {
             max_connections: default_max_connections(),
             rules: default_rules(),
             proxies: Vec::new(),
+            authentication: Vec::new(),
         }
     }
 }
@@ -81,6 +84,18 @@ impl Config {
         &self.proxies
     }
 
+    pub(crate) fn authentication_credentials(&self) -> Vec<(String, String)> {
+        self.authentication
+            .iter()
+            .map(|entry| {
+                let (username, password) = entry
+                    .split_once(':')
+                    .expect("validated authentication entry");
+                (username.to_owned(), password.to_owned())
+            })
+            .collect()
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         let listen_addr = self.listen_addr()?;
         if !listen_addr.ip().is_loopback() {
@@ -108,6 +123,25 @@ impl Config {
             .map(|proxy| proxy.name.clone())
             .collect::<Vec<_>>();
         RuleSet::parse_with_proxies(&self.rules, &proxy_names)?;
+        let mut usernames = std::collections::HashSet::new();
+        for entry in &self.authentication {
+            let Some((username, password)) = entry.split_once(':') else {
+                return Err(ConfigError::InvalidAuthentication(
+                    "entries must use username:password format".into(),
+                ));
+            };
+            if username.is_empty()
+                || password.is_empty()
+                || username.len() > 255
+                || password.len() > 255
+                || !usernames.insert(username)
+            {
+                return Err(ConfigError::InvalidAuthentication(
+                    "usernames must be unique and both fields must fit in 1..=255 UTF-8 bytes"
+                        .into(),
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -148,6 +182,8 @@ pub enum ConfigError {
     Routing(#[from] RuleError),
     #[error("invalid proxy configuration: {0}")]
     InvalidProxy(String),
+    #[error("invalid SOCKS5 authentication configuration: {0}")]
+    InvalidAuthentication(String),
 }
 
 #[cfg(test)]
@@ -251,5 +287,22 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(duplicate, ConfigError::InvalidProxy(_)));
+    }
+
+    #[test]
+    fn parses_global_authentication_and_rejects_invalid_entries() {
+        let config = Config::from_yaml_str("authentication:\n  - alice:secret\n").unwrap();
+        assert_eq!(
+            config.authentication_credentials(),
+            vec![("alice".into(), "secret".into())]
+        );
+        assert!(matches!(
+            Config::from_yaml_str("authentication:\n  - missing-separator\n"),
+            Err(ConfigError::InvalidAuthentication(_))
+        ));
+        assert!(matches!(
+            Config::from_yaml_str("authentication:\n  - alice:one\n  - alice:two\n"),
+            Err(ConfigError::InvalidAuthentication(_))
+        ));
     }
 }

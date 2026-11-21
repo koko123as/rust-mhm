@@ -15,6 +15,12 @@
 
 规则依配置顺序评估，首个匹配决定动作。动作可为 `DIRECT`（TCP 直连）、`REJECT`（拨号前返回 SOCKS5 `REP=0x02`）或已声明的代理名。代理引用必须精确匹配 `proxies[].name`；未配置名称、重复名称和保留名称 `DIRECT`/`REJECT` 均不接受。
 
+## 当前入站认证
+
+本项目接受与 Mihomo 全局 `authentication` 相同形式的用户名/密码字符串列表，例如 `authentication: ["alice:secret"]`。列表为空或省略时使用 SOCKS5 无认证；列表非空时只协商 RFC 1929 用户名/密码方法，不向无认证客户端回退。用户名必须唯一，用户名和密码长度均为 1–255 个 UTF-8 字节；每个失败认证回复失败状态并关闭连接。
+
+这只是本地 SOCKS5 TCP 监听的认证子集：不支持 `skip-auth-prefixes`、监听器级 `users` 覆盖、HTTP 入站或 UDP。RFC 1929 凭据是明文传输；本项目同时仍强制 loopback 监听，不应把这视为安全的远程访问机制。
+
 ## 当前出站切片
 
 | 配置 `type` | 支持范围 | 不包含 |
@@ -32,13 +38,15 @@
 - IP-CIDR 只检查请求中提供的字面地址。规则不执行 DNS；`no-resolve` 可作为 `IP-CIDR` 的可选参数接受，但本项目不会触发供其抑制的 DNS 路由查询。
 - `DST-PORT` 目前只接受单值或单个 `-` 区间，不承诺上游语法中的所有端口集合/表达式形式。
 - 没有规则时，或列表未写 `MATCH` 时，本项目会追加 `MATCH,DIRECT`。这是本项目的 fallback 约定，不代表完整 Mihomo 的默认值。
-- 顶层只识别 `listen`、`connect_timeout_ms`、`max_connections`、`rules`、`proxies`。`mixed-port`、`proxy-groups`、`rule-providers`、完整 DNS 配置等仍会失败。
+- 顶层只识别 `listen`、`connect_timeout_ms`、`max_connections`、`rules`、`proxies`、`authentication`。`mixed-port`、`skip-auth-prefixes`、`proxy-groups`、`rule-providers`、完整 DNS 配置等仍会失败。
 - 代理组（手动选择、故障转移、负载均衡）、规则集、DNS 策略、UDP、透明代理与 TUN 均未实现。
 
 ## 官方参考
 
 - [Mihomo 官方 Routing Rules 文档](https://wiki.metacubex.one/en/config/rules/)：规则顺序和规则类型参考。
 - [Mihomo 官方 Proxy 配置文档](https://wiki.metacubex.one/en/config/proxies/) 与[配置语法手册](https://wiki.metacubex.one/en/handbook/syntax/)：上游出站配置参考；本项目使用不同 YAML 子集，不代表相同语义或完整支持。
+- [Mihomo 官方全局配置](https://wiki.metacubex.one/en/config/general/)：`authentication` 与 `skip-auth-prefixes` 参考；本项目只支持全局认证列表的 SOCKS5 子集。
+- [Mihomo 官方 SOCKS 入站文档](https://wiki.metacubex.one/en/config/inbound/listeners/socks/)：监听器级 `users` 覆盖语义参考，当前未实现。
 - [Mihomo 官方 Rule Providers 文档](https://wiki.metacubex.one/en/config/rule-providers/) 与[内容格式说明](https://wiki.metacubex.one/en/config/rule-providers/content/)：供后续独立实现阶段评估。
 - [RFC 1928](https://www.rfc-editor.org/rfc/rfc1928)：SOCKS5 协议与回复码。
 - [RFC 1929](https://www.rfc-editor.org/rfc/rfc1929)：SOCKS5 用户名/密码认证。
