@@ -9,9 +9,9 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional},
     net::{TcpListener, TcpStream},
-    sync::Semaphore,
+    sync::{Semaphore, watch},
     task::JoinSet,
-    time::timeout,
+    time::{Instant, sleep_until, timeout},
 };
 use tracing::{debug, info, warn};
 
@@ -41,6 +41,15 @@ struct ConnectionTimeouts {
     handshake: Duration,
 }
 
+#[derive(Clone)]
+struct ConnectionContext {
+    timeouts: ConnectionTimeouts,
+    routing: watch::Receiver<Arc<RuleSet>>,
+    outbounds: Arc<Vec<ProxyOutbound>>,
+    authentication: Arc<Vec<(String, String)>>,
+    skip_auth_prefixes: Arc<Vec<AuthSkipPrefix>>,
+}
+
 #[derive(Debug, Error)]
 pub enum ServerError {
     #[error(transparent)]
@@ -52,7 +61,7 @@ pub enum ServerError {
 /// Bind the configured loopback listener and serve until Ctrl-C.
 pub async fn run(config: Config) -> Result<(), ServerError> {
     let listen_addr = config.listen_addr()?;
-    let routing = Arc::new(config.routing_rules()?);
+    let (routing_sender, routing) = watch::channel(Arc::new(config.routing_rules()?));
     let outbounds = Arc::new(config.proxy_outbounds().to_vec());
     let authentication = Arc::new(config.authentication_credentials());
     let skip_auth_prefixes = Arc::new(config.skip_auth_prefixes()?);
@@ -62,7 +71,23 @@ pub async fn run(config: Config) -> Result<(), ServerError> {
         connect: Duration::from_millis(config.connect_timeout_ms()),
         handshake: HANDSHAKE_TIMEOUT,
     };
+    let connection_context = ConnectionContext {
+        timeouts,
+        routing,
+        outbounds,
+        authentication,
+        skip_auth_prefixes,
+    };
     let mut tasks: JoinSet<io::Result<()>> = JoinSet::new();
+    let refreshes = config.rule_provider_refreshes();
+    if !refreshes.is_empty() {
+        let refresh_config = config.clone();
+        let refresh_sender = routing_sender.clone();
+        tasks.spawn(async move {
+            refresh_rule_provider_loop(refresh_config, refreshes, refresh_sender).await;
+            Ok(())
+        });
+    }
     let shutdown_signal = tokio::signal::ctrl_c();
     tokio::pin!(shutdown_signal);
 
@@ -76,21 +101,14 @@ pub async fn run(config: Config) -> Result<(), ServerError> {
         tokio::select! {
             result = listener.accept() => {
                 let (stream, peer) = result?;
-                match connection_limit.clone().try_acquire_owned() {
-                    Ok(permit) => {
-                        let routing = Arc::clone(&routing);
-                        let outbounds = Arc::clone(&outbounds);
-                        let authentication = Arc::clone(&authentication);
-                        let skip_auth_prefixes = Arc::clone(&skip_auth_prefixes);
-                        tasks.spawn(async move {
-                            let _permit = permit;
-                            handle_connection_with_rules(stream, timeouts, routing, outbounds, authentication, skip_auth_prefixes, peer).await
-                        });
-                    }
-                    Err(_) => {
-                        debug!("connection limit reached; dropping accepted connection");
-                        drop(stream);
-                    }
+                if !try_spawn_connection(
+                    &mut tasks,
+                    &connection_limit,
+                    stream,
+                    peer,
+                    &connection_context,
+                ) {
+                    debug!("connection limit reached; dropping accepted connection");
                 }
             }
             result = tasks.join_next(), if !tasks.is_empty() => {
@@ -113,6 +131,75 @@ pub async fn run(config: Config) -> Result<(), ServerError> {
     Ok(())
 }
 
+fn try_spawn_connection(
+    tasks: &mut JoinSet<io::Result<()>>,
+    connection_limit: &Arc<Semaphore>,
+    stream: TcpStream,
+    peer: SocketAddr,
+    context: &ConnectionContext,
+) -> bool {
+    let Ok(permit) = connection_limit.clone().try_acquire_owned() else {
+        drop(stream);
+        return false;
+    };
+    let context = context.clone();
+    tasks.spawn(async move {
+        let _permit = permit;
+        handle_connection_with_rules(
+            stream,
+            context.timeouts,
+            context.routing,
+            context.outbounds,
+            context.authentication,
+            context.skip_auth_prefixes,
+            peer,
+        )
+        .await
+    });
+    true
+}
+
+async fn refresh_rule_provider_loop(
+    mut config: Config,
+    refreshes: Vec<(String, Duration)>,
+    routing: watch::Sender<Arc<RuleSet>>,
+) {
+    if refreshes.is_empty() {
+        return;
+    }
+    let now = Instant::now();
+    let mut deadlines = refreshes
+        .iter()
+        .map(|(_, interval)| now + *interval)
+        .collect::<Vec<_>>();
+
+    loop {
+        let deadline = *deadlines.iter().min().expect("non-empty refresh schedule");
+        sleep_until(deadline).await;
+        let now = Instant::now();
+        for (index, (name, interval)) in refreshes.iter().enumerate() {
+            if deadlines[index] > now {
+                continue;
+            }
+            match config.refresh_http_rule_provider(name).await {
+                Ok(()) => match config.routing_rules() {
+                    Ok(updated_rules) => {
+                        routing.send_replace(Arc::new(updated_rules));
+                        info!(provider = %name, "rule-provider refreshed");
+                    }
+                    Err(error) => {
+                        warn!(provider = %name, error = %error, "refreshed rules are invalid; keeping previous routing table")
+                    }
+                },
+                Err(error) => {
+                    warn!(provider = %name, error = %error, "rule-provider refresh failed; keeping previous routing table")
+                }
+            }
+            deadlines[index] = Instant::now() + *interval;
+        }
+    }
+}
+
 /// Handle one SOCKS5 TCP stream with the default direct-only routing table.
 /// Exposed for local integration tests and embedding.
 pub async fn handle_connection(client: TcpStream, connect_timeout: Duration) -> io::Result<()> {
@@ -123,7 +210,7 @@ pub async fn handle_connection(client: TcpStream, connect_timeout: Duration) -> 
             connect: connect_timeout,
             handshake: HANDSHAKE_TIMEOUT,
         },
-        Arc::new(RuleSet::default()),
+        watch::channel(Arc::new(RuleSet::default())).1,
         Arc::new(Vec::new()),
         Arc::new(Vec::new()),
         Arc::new(Vec::new()),
@@ -135,7 +222,7 @@ pub async fn handle_connection(client: TcpStream, connect_timeout: Duration) -> 
 async fn handle_connection_with_rules(
     mut client: TcpStream,
     timeouts: ConnectionTimeouts,
-    routing: Arc<RuleSet>,
+    routing: watch::Receiver<Arc<RuleSet>>,
     outbounds: Arc<Vec<ProxyOutbound>>,
     authentication: Arc<Vec<(String, String)>>,
     skip_auth_prefixes: Arc<Vec<AuthSkipPrefix>>,
@@ -161,7 +248,8 @@ async fn handle_connection_with_rules(
         Ok(Err(ProtocolError::Io(error))) => return Err(error),
     };
 
-    let action = routing.route_with_source(&target, Some(peer));
+    let routing_table = Arc::clone(&routing.borrow());
+    let action = routing_table.route_with_source(&target, Some(peer));
     if action == RouteAction::Reject {
         send_reply(&mut client, REP_CONNECTION_NOT_ALLOWED, None).await?;
         return Ok(());
@@ -427,7 +515,7 @@ mod tests {
     ) -> (TcpStream, tokio::task::JoinHandle<io::Result<()>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let routing = Arc::new(rules);
+        let (_, routing) = watch::channel(Arc::new(rules));
         let outbounds = Arc::new(outbounds);
         let authentication = Arc::new(authentication);
         let skip_auth_prefixes = Arc::new(skip_auth_prefixes);
@@ -477,7 +565,167 @@ mod tests {
     async fn parse_target(request: &[u8]) -> Result<RequestTarget, ProtocolError> {
         let (mut writer, mut reader) = tokio::io::duplex(request.len() + 1);
         writer.write_all(request).await.unwrap();
+        drop(writer);
         read_connect_request(&mut reader).await
+    }
+
+    async fn start_provider_response_sequence(
+        bodies: Vec<Vec<u8>>,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            for body in bodies {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") && request.len() < 16 * 1024 {
+                    let mut byte = [0u8; 1];
+                    if stream.read_exact(&mut byte).await.is_err() {
+                        return;
+                    }
+                    request.push(byte[0]);
+                }
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                if stream.write_all(headers.as_bytes()).await.is_err()
+                    || stream.write_all(&body).await.is_err()
+                {
+                    return;
+                }
+            }
+        });
+        (address, task)
+    }
+
+    #[tokio::test]
+    async fn scheduled_provider_refresh_replaces_routing_and_persists_snapshot() {
+        let directory = std::env::temp_dir().join(format!(
+            "rust-mhm-refresh-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let (address, server) = start_provider_response_sequence(vec![
+            b"payload:\n  - .old.example\n".to_vec(),
+            b"payload:\n  - .new.example\n".to_vec(),
+        ])
+        .await;
+        let config_path = directory.join("config.yaml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "rule-providers:\n  remote:\n    type: http\n    behavior: domain\n    url: 'http://{address}/rules'\n    path: provider.cache\n    interval: 1\nrules:\n  - RULE-SET,remote,REJECT\n  - MATCH,DIRECT\n"
+            ),
+        )
+        .unwrap();
+
+        let config = Config::load_async(&config_path).await.unwrap();
+        let refreshes = config.rule_provider_refreshes();
+        let (sender, mut routing) = watch::channel(Arc::new(config.routing_rules().unwrap()));
+        let refresh_task = tokio::spawn(refresh_rule_provider_loop(config, refreshes, sender));
+        let new_target = RequestTarget {
+            host: TargetHost::Domain("cdn.new.example".into()),
+            port: 443,
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                routing.changed().await.unwrap();
+                if routing.borrow().route(&new_target) == RouteAction::Reject {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("scheduled refresh should publish the new routing table");
+        assert_eq!(
+            routing.borrow().route(&RequestTarget {
+                host: TargetHost::Domain("cdn.old.example".into()),
+                port: 443,
+            }),
+            RouteAction::Direct
+        );
+        assert_eq!(
+            std::fs::read(directory.join("provider.cache")).unwrap(),
+            b"payload:\n  - .new.example\n"
+        );
+
+        refresh_task.abort();
+        let _ = refresh_task.await;
+        server.await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn slow_provider_refresh_waits_full_interval_after_completion() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let directory = std::env::temp_dir().join(format!(
+            "rust-mhm-slow-refresh-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let server_request_count = Arc::clone(&request_count);
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") && request.len() < 16 * 1024 {
+                    let mut byte = [0u8; 1];
+                    if stream.read_exact(&mut byte).await.is_err() {
+                        return;
+                    }
+                    request.push(byte[0]);
+                }
+                server_request_count.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let body = b"payload:\n  - .slow.example\n";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                if stream.write_all(response.as_bytes()).await.is_err()
+                    || stream.write_all(body).await.is_err()
+                {
+                    return;
+                }
+            }
+        });
+        let config_path = directory.join("config.yaml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "rule-providers:\n  remote:\n    type: http\n    behavior: domain\n    url: 'http://{address}/rules'\n    path: provider.cache\n    interval: 1\nrules:\n  - RULE-SET,remote,REJECT\n  - MATCH,DIRECT\n"
+            ),
+        )
+        .unwrap();
+        let config = Config::load_async(&config_path).await.unwrap();
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        let refreshes = config.rule_provider_refreshes();
+        let (sender, mut routing) = watch::channel(Arc::new(config.routing_rules().unwrap()));
+        let refresh_task = tokio::spawn(refresh_rule_provider_loop(config, refreshes, sender));
+
+        tokio::time::timeout(Duration::from_secs(4), routing.changed())
+            .await
+            .expect("first scheduled refresh should finish")
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+
+        refresh_task.abort();
+        let _ = refresh_task.await;
+        server.abort();
+        let _ = server.await;
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
@@ -493,6 +741,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_provider_refresh_keeps_active_routes_and_cached_snapshot() {
+        let directory = std::env::temp_dir().join(format!(
+            "rust-mhm-invalid-refresh-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let initial = b"payload:\n  - DOMAIN-SUFFIX,old.example\n".to_vec();
+        let invalid = b"payload:\n  - GEOIP,CN\n".to_vec();
+        let (address, server) =
+            start_provider_response_sequence(vec![initial.clone(), invalid]).await;
+        let config_path = directory.join("config.yaml");
+        let cache_path = directory.join("provider.cache");
+        std::fs::write(
+            &config_path,
+            format!(
+                "rule-providers:\n  remote:\n    type: http\n    behavior: classical\n    url: 'http://{address}/rules'\n    path: provider.cache\n    interval: 1\nrules:\n  - RULE-SET,remote,REJECT\n  - MATCH,DIRECT\n"
+            ),
+        )
+        .unwrap();
+        let config = Config::load_async(&config_path).await.unwrap();
+        let refreshes = config.rule_provider_refreshes();
+        let (sender, routing) = watch::channel(Arc::new(config.routing_rules().unwrap()));
+        let refresh_task = tokio::spawn(refresh_rule_provider_loop(config, refreshes, sender));
+
+        server.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!routing.has_changed().unwrap());
+        assert_eq!(
+            routing.borrow().route(&RequestTarget {
+                host: TargetHost::Domain("cdn.old.example".into()),
+                port: 443,
+            }),
+            RouteAction::Reject
+        );
+        assert_eq!(std::fs::read(&cache_path).unwrap(), initial);
+
+        refresh_task.abort();
+        let _ = refresh_task.await;
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
     async fn parses_ipv6_target() {
         let mut request = vec![SOCKS_VERSION, CMD_CONNECT, 0, 0x04];
         request.extend_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
@@ -502,6 +795,60 @@ mod tests {
         assert!(
             matches!(target, RequestTarget { host: TargetHost::Ip(address), port: 8443 } if address == IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
         );
+    }
+
+    #[tokio::test]
+    async fn every_truncated_connect_frame_returns_unexpected_eof() {
+        let mut ipv4 = vec![SOCKS_VERSION, CMD_CONNECT, 0, 0x01, 127, 0, 0, 1];
+        ipv4.extend_from_slice(&443u16.to_be_bytes());
+        let mut ipv6 = vec![SOCKS_VERSION, CMD_CONNECT, 0, 0x04];
+        ipv6.extend_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
+        ipv6.extend_from_slice(&443u16.to_be_bytes());
+        let domain = b"example.test";
+        let mut domain_frame = vec![SOCKS_VERSION, CMD_CONNECT, 0, 0x03, domain.len() as u8];
+        domain_frame.extend_from_slice(domain);
+        domain_frame.extend_from_slice(&443u16.to_be_bytes());
+
+        for frame in [ipv4, ipv6, domain_frame] {
+            for prefix_length in 0..frame.len() {
+                let result = parse_target(&frame[..prefix_length]).await;
+                assert!(
+                    matches!(result, Err(ProtocolError::Io(ref error)) if error.kind() == io::ErrorKind::UnexpectedEof),
+                    "truncated frame with prefix length {prefix_length} must return UnexpectedEof"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_connect_fields_return_protocol_errors() {
+        for (frame, expected) in [
+            (
+                vec![SOCKS_VERSION, CMD_CONNECT, 0, 0x02],
+                REP_ADDRESS_TYPE_NOT_SUPPORTED,
+            ),
+            (
+                vec![SOCKS_VERSION, CMD_CONNECT, 0, 0x03, 0],
+                REP_ADDRESS_TYPE_NOT_SUPPORTED,
+            ),
+            (
+                vec![SOCKS_VERSION, CMD_CONNECT, 0, 0x03, 1, 0xff],
+                REP_ADDRESS_TYPE_NOT_SUPPORTED,
+            ),
+            (
+                vec![SOCKS_VERSION, CMD_CONNECT, 1, 0x01, 127, 0, 0, 1, 0, 80],
+                REP_GENERAL_FAILURE,
+            ),
+            (
+                vec![0x04, CMD_CONNECT, 0, 0x01, 127, 0, 0, 1, 0, 80],
+                REP_GENERAL_FAILURE,
+            ),
+        ] {
+            assert!(matches!(
+                parse_target(&frame).await,
+                Err(ProtocolError::Reply(reply)) if reply == expected
+            ));
+        }
     }
 
     #[tokio::test]
@@ -568,6 +915,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelling_a_negotiated_session_closes_the_client_stream() {
+        let (mut client, server_task) = start_one_connection().await;
+        negotiate_no_auth(&mut client).await;
+        server_task.abort();
+        assert!(server_task.await.unwrap_err().is_cancelled());
+
+        let mut byte = [0u8; 1];
+        let result = timeout(Duration::from_secs(1), client.read(&mut byte))
+            .await
+            .expect("cancelling the session should close its client stream");
+        match result {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::BrokenPipe
+                ) => {}
+            other => panic!("unexpected read after cancelling session: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn truncated_connect_frame_closes_without_success_reply() {
         let (mut client, server_task) = start_one_connection().await;
         negotiate_no_auth(&mut client).await;
@@ -600,6 +971,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_greetings_are_rejected_with_no_acceptable_method() {
+        for greeting in [
+            vec![0x04, 1, METHOD_NO_AUTH],
+            vec![SOCKS_VERSION, 0],
+            vec![SOCKS_VERSION, 1, METHOD_USERNAME_PASSWORD],
+        ] {
+            let (mut client, mut server) = tokio::io::duplex(64);
+            client.write_all(&greeting).await.unwrap();
+            assert!(negotiate(&mut server, &[], false).await.unwrap().is_none());
+            let mut response = [0u8; 2];
+            client.read_exact(&mut response).await.unwrap();
+            assert_eq!(response, [SOCKS_VERSION, METHOD_NO_ACCEPTABLE]);
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_limit_bounds_parallel_socks5_sessions() {
+        const CONNECTION_LIMIT: usize = 8;
+        const CLIENT_COUNT: usize = 20;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connection_limit = Arc::new(Semaphore::new(CONNECTION_LIMIT));
+        let (routing_sender, routing) = watch::channel(Arc::new(RuleSet::default()));
+        let outbounds = Arc::new(Vec::new());
+        let authentication = Arc::new(Vec::new());
+        let skip_auth_prefixes = Arc::new(Vec::new());
+        let timeouts = ConnectionTimeouts {
+            connect: Duration::from_secs(2),
+            handshake: Duration::from_secs(2),
+        };
+        let connection_context = ConnectionContext {
+            timeouts,
+            routing,
+            outbounds,
+            authentication,
+            skip_auth_prefixes,
+        };
+        let mut clients = Vec::with_capacity(CLIENT_COUNT);
+        for _ in 0..CLIENT_COUNT {
+            clients.push(TcpStream::connect(address).await.unwrap());
+        }
+
+        let mut connection_tasks = JoinSet::new();
+        let mut started = 0;
+        for _ in 0..CLIENT_COUNT {
+            let (stream, peer) = listener.accept().await.unwrap();
+            started += usize::from(try_spawn_connection(
+                &mut connection_tasks,
+                &connection_limit,
+                stream,
+                peer,
+                &connection_context,
+            ));
+        }
+        assert_eq!(started, CONNECTION_LIMIT);
+
+        let mut client_tasks = JoinSet::new();
+        for mut client in clients {
+            client_tasks.spawn(async move {
+                client
+                    .write_all(&[SOCKS_VERSION, 1, METHOD_NO_AUTH])
+                    .await
+                    .unwrap();
+                let mut method_response = [0u8; 2];
+                match timeout(
+                    Duration::from_secs(2),
+                    client.read_exact(&mut method_response),
+                )
+                .await
+                .expect("accepted session should respond and excess session should close")
+                {
+                    Ok(_) => {
+                        assert_eq!(method_response, [SOCKS_VERSION, METHOD_NO_AUTH]);
+                        client
+                            .write_all(&[SOCKS_VERSION, 0x03, 0, 0x01, 127, 0, 0, 1, 0, 53])
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            read_reply(&mut client).await,
+                            (SOCKS_VERSION, REP_COMMAND_NOT_SUPPORTED)
+                        );
+                        true
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::UnexpectedEof
+                                | io::ErrorKind::ConnectionReset
+                                | io::ErrorKind::ConnectionAborted
+                        ) =>
+                    {
+                        false
+                    }
+                    Err(error) => panic!("unexpected read error for handshake: {error}"),
+                }
+            });
+        }
+        let mut completed = 0;
+        let mut accepted = 0;
+        while let Some(result) = client_tasks.join_next().await {
+            completed += 1;
+            accepted += usize::from(result.unwrap());
+        }
+        assert_eq!(completed, CLIENT_COUNT);
+        assert_eq!(accepted, CONNECTION_LIMIT);
+
+        while let Some(result) = connection_tasks.join_next().await {
+            result.unwrap().unwrap();
+        }
+        drop(routing_sender);
+    }
+
+    #[tokio::test]
     async fn unsupported_authentication_is_refused() {
         let (mut client, server_task) = start_one_connection().await;
         client.write_all(&[SOCKS_VERSION, 1, 0x02]).await.unwrap();
@@ -607,6 +1092,45 @@ mod tests {
         client.read_exact(&mut response).await.unwrap();
         assert_eq!(response, [SOCKS_VERSION, METHOD_NO_ACCEPTABLE]);
         server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_username_password_frames_are_rejected_or_closed() {
+        let cases = [
+            (vec![0x02, 1], false),
+            (vec![AUTH_VERSION, 0], false),
+            (vec![AUTH_VERSION, 1, b'a', 0], false),
+            (vec![AUTH_VERSION], true),
+            (vec![AUTH_VERSION, 3, b'a'], true),
+            (vec![AUTH_VERSION, 1, b'a', 3, b'x'], true),
+        ];
+        for (frame, truncated) in cases {
+            let users = vec![("alice".to_owned(), "secret".to_owned())];
+            let (mut client, server_task) =
+                start_one_connection_with_authentication(RuleSet::default(), Vec::new(), users)
+                    .await;
+            client
+                .write_all(&[SOCKS_VERSION, 1, METHOD_USERNAME_PASSWORD])
+                .await
+                .unwrap();
+            let mut method = [0u8; 2];
+            client.read_exact(&mut method).await.unwrap();
+            assert_eq!(method, [SOCKS_VERSION, METHOD_USERNAME_PASSWORD]);
+            client.write_all(&frame).await.unwrap();
+
+            if truncated {
+                client.shutdown().await.unwrap();
+                let mut byte = [0u8; 1];
+                assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+                let error = server_task.await.unwrap().unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+            } else {
+                let mut response = [0u8; 2];
+                client.read_exact(&mut response).await.unwrap();
+                assert_eq!(response, [AUTH_VERSION, 0x01]);
+                server_task.await.unwrap().unwrap();
+            }
+        }
     }
 
     #[tokio::test]

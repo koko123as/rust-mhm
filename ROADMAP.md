@@ -16,7 +16,7 @@
 - [x] DIRECT TCP 出站、超时、错误回复和双向转发。
 - [x] 默认 loopback 监听、并发连接上限。
 - [x] 补充截断 CONNECT 帧断连与慢速握手超时回归测试。
-- [ ] 补充完整畸形帧矩阵、并发压力和取消边界回归测试。
+- [x] 补充 SOCKS5 greeting/RFC 1929/CONNECT 畸形帧与 IPv4/IPv6/域名 CONNECT 全截断前缀矩阵、连接上限并发压力和已协商会话取消回归测试；长时压力测试仍未覆盖。
 
 ## Phase 2 — 受限配置与确定性路由
 
@@ -28,7 +28,8 @@
 - [ ] 与更广泛 Mihomo 规则/配置语料逐项差异测试；当前规则子集不等于完整兼容。
 - [x] 支持启动时载入 `file` rule-provider（classical/domain/ipcidr 有限行为），相对配置路径、4 MiB 上限和 YAML payload/逐行文本解析。
 - [x] 支持启动时下载 HTTP/HTTPS rule-provider 快照：异步配置加载、最多 5 次重定向、`connect_timeout_ms` 超时、4 MiB 上限、成功状态检查与有限文本/YAML 解析；测试使用本地假 HTTP 服务。
-- [ ] 实现 HTTP provider 持久缓存、刷新间隔、请求头、MRS/自定义格式与自动更新生命周期；当前所有 provider 都只在启动时静态载入。
+- [x] HTTP provider 持久原文缓存、离线时回退到有效快照、请求头、按 `interval` 定时刷新及原子替换运行中的路由表；刷新失败保留旧路由，服务退出时取消刷新任务。
+- [ ] MRS/自定义格式、上游完整缓存校验器与 provider 生命周期兼容；当前只有受限 YAML payload/逐行文本解析，没有配置文件热重载。
 
 ## Phase 3 — TCP 出站与策略组
 

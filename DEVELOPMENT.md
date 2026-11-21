@@ -14,7 +14,7 @@
 | yaml_serde | YAML 解码 | 0.10.7 | MIT OR Apache-2.0；采用 YAML 组织维护的实现，避免依赖已停止维护的 `serde_yaml`。 |
 | thiserror | 结构化配置/服务错误 | 2.0.21 | MIT OR Apache-2.0；仅派生错误类型。 |
 | regex | `DOMAIN-REGEX` 规则解析时编译及运行时匹配 | 1.13.2 | MIT OR Apache-2.0；只用于路由规则，不参与转发数据面。 |
-| reqwest | 异步 HTTP/HTTPS rule-provider 启动下载 | 0.12.28（Cargo.lock） | MIT OR Apache-2.0；关闭默认特性，只启用 rustls TLS 与流式响应；仅配置加载阶段使用，响应限制 4 MiB。锁定依赖和 workspace 全套测试已在 Rust 1.85.0 下通过。 |
+| reqwest | 异步 HTTP/HTTPS rule-provider 启动下载与后台刷新 | 0.12.28（Cargo.lock） | MIT OR Apache-2.0；关闭默认特性，只启用 rustls TLS 与流式响应；响应限制 4 MiB，后台更新仅在配置的刷新周期触发。锁定依赖和 workspace 全套测试已在 Rust 1.85.0 下通过。 |
 | tracing | 结构化日志事件 | 0.1.44 | MIT；CLI 记录生命周期，不记录代理目标域名。 |
 | tracing-subscriber | CLI 日志格式化与 `RUST_LOG` 过滤 | 0.3.23 | MIT；只在 CLI 层使用。 |
 

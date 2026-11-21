@@ -1,13 +1,16 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    fs::File,
-    io::Read,
+    fs::{File, OpenOptions},
+    io::{Read, Write},
     net::{IpAddr, SocketAddr},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
+    time::Duration,
 };
 
+use reqwest::header::{HeaderName, HeaderValue};
 use serde::Deserialize;
 use thiserror::Error;
+use tracing::warn;
 
 use crate::outbound::ProxyOutbound;
 use crate::routing::{RuleError, RuleSet};
@@ -19,6 +22,8 @@ const MAX_CONNECTIONS: usize = 4_096;
 const MIN_CONNECT_TIMEOUT_MS: u64 = 100;
 const MAX_CONNECT_TIMEOUT_MS: u64 = 120_000;
 const MAX_RULE_PROVIDER_BYTES: u64 = 4 * 1024 * 1024;
+const DEFAULT_RULE_PROVIDER_INTERVAL_SECS: u64 = 24 * 60 * 60;
+const MAX_RULE_PROVIDER_INTERVAL_SECS: u64 = 365 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -35,6 +40,8 @@ pub struct Config {
     rule_providers: BTreeMap<String, RuleProviderConfig>,
     #[serde(skip)]
     config_dir: Option<PathBuf>,
+    #[serde(skip)]
+    config_path: Option<PathBuf>,
     #[serde(default)]
     proxies: Vec<ProxyOutbound>,
     #[serde(default)]
@@ -55,6 +62,26 @@ struct RuleProviderConfig {
     path: Option<PathBuf>,
     #[serde(default)]
     url: Option<String>,
+    #[serde(default)]
+    interval: Option<u64>,
+    #[serde(default, rename = "header")]
+    headers: BTreeMap<String, ProviderHeaderValues>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ProviderHeaderValues {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl ProviderHeaderValues {
+    fn values(&self) -> &[String] {
+        match self {
+            Self::One(value) => std::slice::from_ref(value),
+            Self::Many(values) => values,
+        }
+    }
 }
 
 impl Default for Config {
@@ -66,6 +93,7 @@ impl Default for Config {
             rules: default_rules(),
             rule_providers: BTreeMap::new(),
             config_dir: None,
+            config_path: None,
             proxies: Vec::new(),
             authentication: Vec::new(),
             skip_auth_prefixes: Vec::new(),
@@ -113,6 +141,7 @@ impl Config {
                 .unwrap_or_else(|| Path::new("."))
                 .to_path_buf(),
         );
+        config.config_path = Some(path.to_path_buf());
         config.load_file_rule_providers()?;
         config.validate()?;
         Ok(config)
@@ -129,6 +158,8 @@ impl Config {
                 .unwrap_or_else(|| Path::new("."))
                 .to_path_buf(),
         );
+        config.config_path = Some(path.to_path_buf());
+        config.validate()?;
         config.load_file_rule_providers()?;
         config.load_http_rule_providers().await?;
         config.validate()?;
@@ -194,6 +225,83 @@ impl Config {
                 })
             })
             .collect()
+    }
+
+    pub(crate) fn rule_provider_refreshes(&self) -> Vec<(String, Duration)> {
+        self.rule_providers
+            .iter()
+            .filter(|(_, provider)| provider.provider_type == "http")
+            .map(|(name, provider)| {
+                (
+                    name.clone(),
+                    Duration::from_secs(
+                        provider
+                            .interval
+                            .unwrap_or(DEFAULT_RULE_PROVIDER_INTERVAL_SECS),
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    pub(crate) async fn refresh_http_rule_provider(
+        &mut self,
+        name: &str,
+    ) -> Result<(), ConfigError> {
+        let provider = self
+            .rule_providers
+            .get(name)
+            .filter(|provider| provider.provider_type == "http")
+            .cloned()
+            .ok_or_else(|| ConfigError::InvalidRuleProvider {
+                name: name.to_owned(),
+                reason: "provider is not an HTTP provider".to_owned(),
+            })?;
+        let client = build_rule_provider_client(provider.headers.is_empty())?;
+        let timeout = Duration::from_millis(self.connect_timeout_ms);
+        let bytes = download_rule_provider(&client, name, &provider, timeout)
+            .await
+            .map_err(|reason| ConfigError::RuleProviderHttp {
+                name: name.to_owned(),
+                reason,
+            })?;
+        let payload =
+            parse_rule_provider_bytes(&bytes).map_err(|reason| ConfigError::RuleProviderHttp {
+                name: name.to_owned(),
+                reason: format!("could not parse response: {reason}"),
+            })?;
+        let mut updated = provider;
+        updated.payload = payload;
+        updated
+            .validate_payload()
+            .map_err(|reason| ConfigError::RuleProviderHttp {
+                name: name.to_owned(),
+                reason: format!("response contains invalid rules: {reason}"),
+            })?;
+        let mut candidate = self.clone();
+        candidate
+            .rule_providers
+            .get_mut(name)
+            .expect("provider was found above")
+            .payload = updated.payload.clone();
+        candidate.routing_rules()?;
+        let cache_path = self.rule_provider_cache_path(name, &updated);
+        if let Err(error) = write_rule_provider_cache(&cache_path, &bytes) {
+            warn!(provider = %name, error = %error, "could not persist refreshed rule-provider cache");
+        }
+        self.rule_providers
+            .get_mut(name)
+            .expect("provider was found above")
+            .payload = updated.payload;
+        Ok(())
+    }
+
+    fn rule_provider_cache_path(&self, name: &str, provider: &RuleProviderConfig) -> PathBuf {
+        let config_dir = self
+            .config_dir
+            .as_deref()
+            .expect("HTTP providers are loaded only from a config file");
+        provider_cache_path(config_dir, name, provider)
     }
 
     fn load_file_rule_providers(&mut self) -> Result<(), ConfigError> {
@@ -285,14 +393,12 @@ impl Config {
         {
             return Ok(());
         }
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .build()
-            .map_err(|error| ConfigError::RuleProviderHttp {
-                name: "<client>".to_owned(),
-                reason: error.without_url().to_string(),
-            })?;
-        let timeout_duration = std::time::Duration::from_millis(self.connect_timeout_ms);
+        let timeout_duration = Duration::from_millis(self.connect_timeout_ms);
+        let config_dir = self
+            .config_dir
+            .as_deref()
+            .expect("HTTP providers are loaded only from a config file")
+            .to_path_buf();
         for (name, provider) in &mut self.rule_providers {
             if provider.provider_type != "http" {
                 continue;
@@ -303,74 +409,62 @@ impl Config {
                     reason: "type: http cannot define an inline payload".to_owned(),
                 });
             }
-            let url = provider
-                .url
-                .as_deref()
-                .ok_or_else(|| ConfigError::InvalidRuleProvider {
-                    name: name.clone(),
-                    reason: "type: http requires a url".to_owned(),
-                })?;
-            let parsed_url =
-                reqwest::Url::parse(url).map_err(|_| ConfigError::InvalidRuleProvider {
-                    name: name.clone(),
-                    reason: "type: http url must be a valid http or https URL".to_owned(),
-                })?;
-            if !matches!(parsed_url.scheme(), "http" | "https")
-                || parsed_url.host_str().is_none()
-                || !parsed_url.username().is_empty()
-                || parsed_url.password().is_some()
-            {
-                return Err(ConfigError::InvalidRuleProvider {
-                    name: name.clone(),
-                    reason: "type: http url must use http/https and contain no user credentials"
-                        .to_owned(),
-                });
-            }
-            let download = async {
-                let mut response = client
-                    .get(parsed_url)
-                    .send()
-                    .await
-                    .map_err(reqwest_error_reason)?;
-                if !response.status().is_success() {
-                    return Err(format!("server returned HTTP status {}", response.status()));
-                }
-                if response
-                    .content_length()
-                    .is_some_and(|length| length > MAX_RULE_PROVIDER_BYTES)
-                {
-                    return Err(format!("response exceeds {MAX_RULE_PROVIDER_BYTES} bytes"));
-                }
-                let mut bytes = Vec::new();
-                while let Some(chunk) = response.chunk().await.map_err(reqwest_error_reason)? {
-                    if bytes.len() as u64 + chunk.len() as u64 > MAX_RULE_PROVIDER_BYTES {
-                        return Err(format!("response exceeds {MAX_RULE_PROVIDER_BYTES} bytes"));
-                    }
-                    bytes.extend_from_slice(&chunk);
-                }
-                Ok::<_, String>(bytes)
-            };
-            let bytes = tokio::time::timeout(timeout_duration, download)
+            let client = build_rule_provider_client(provider.headers.is_empty())?;
+            let cache_path = provider_cache_path(&config_dir, name, provider);
+            let fetched = match download_rule_provider(&client, name, provider, timeout_duration)
                 .await
-                .map_err(|_| ConfigError::RuleProviderHttp {
-                    name: name.clone(),
-                    reason: "request exceeded connect_timeout_ms".to_owned(),
-                })?
-                .map_err(|reason| ConfigError::RuleProviderHttp {
-                    name: name.clone(),
-                    reason,
-                })?;
-            let source =
-                String::from_utf8(bytes).map_err(|error| ConfigError::RuleProviderHttp {
-                    name: name.clone(),
-                    reason: format!("response is not valid UTF-8: {error}"),
-                })?;
-            provider.payload = parse_rule_provider_file(&source).map_err(|reason| {
-                ConfigError::RuleProviderHttp {
-                    name: name.clone(),
-                    reason: format!("could not parse response: {reason}"),
+            {
+                Ok(bytes) => match parse_rule_provider_bytes(&bytes) {
+                    Ok(parsed) => {
+                        let mut updated = provider.clone();
+                        updated.payload = parsed;
+                        updated
+                            .validate_payload()
+                            .map(|()| (bytes, updated.payload))
+                            .map_err(|reason| format!("response contains invalid rules: {reason}"))
+                    }
+                    Err(reason) => Err(format!("could not parse response: {reason}")),
+                },
+                Err(reason) => Err(reason),
+            };
+            match fetched {
+                Ok((bytes, payload)) => {
+                    if let Err(error) = write_rule_provider_cache(&cache_path, &bytes) {
+                        warn!(provider = %name, error = %error, "could not persist rule-provider cache");
+                    }
+                    provider.payload = payload;
                 }
-            })?;
+                Err(network_error) => match read_rule_provider_cache(&cache_path) {
+                    Ok(Some(payload)) => {
+                        let mut cached = provider.clone();
+                        cached.payload = payload;
+                        cached.validate_payload().map_err(|reason| {
+                            ConfigError::RuleProviderHttp {
+                                name: name.clone(),
+                                reason: format!(
+                                    "download failed ({network_error}); cached snapshot is invalid: {reason}"
+                                ),
+                            }
+                        })?;
+                        warn!(provider = %name, "using cached rule-provider snapshot after refresh failed");
+                        provider.payload = cached.payload;
+                    }
+                    Ok(None) => {
+                        return Err(ConfigError::RuleProviderHttp {
+                            name: name.clone(),
+                            reason: network_error,
+                        });
+                    }
+                    Err(cache_error) => {
+                        return Err(ConfigError::RuleProviderHttp {
+                            name: name.clone(),
+                            reason: format!(
+                                "download failed ({network_error}); could not read cached snapshot: {cache_error}"
+                            ),
+                        });
+                    }
+                },
+            }
         }
         Ok(())
     }
@@ -401,8 +495,35 @@ impl Config {
             .iter()
             .map(|proxy| proxy.name.clone())
             .collect::<Vec<_>>();
+        let mut cache_paths = std::collections::HashSet::new();
         for (name, provider) in &self.rule_providers {
             provider.validate(name)?;
+            if provider.provider_type == "http" {
+                let cache_path = self.rule_provider_cache_path(name, provider);
+                if cache_path.is_dir() {
+                    return Err(ConfigError::InvalidRuleProvider {
+                        name: name.clone(),
+                        reason: "cache path must name a file, not a directory".to_owned(),
+                    });
+                }
+                let cache_path_key = normalized_path_for_comparison(&cache_path);
+                if self
+                    .config_path
+                    .as_deref()
+                    .is_some_and(|config_path| paths_refer_to_same_file(config_path, &cache_path))
+                {
+                    return Err(ConfigError::InvalidRuleProvider {
+                        name: name.clone(),
+                        reason: "cache path must not overwrite the configuration file".to_owned(),
+                    });
+                }
+                if !cache_paths.insert(cache_path_key) {
+                    return Err(ConfigError::InvalidRuleProvider {
+                        name: name.clone(),
+                        reason: "HTTP providers must use distinct cache paths".to_owned(),
+                    });
+                }
+            }
         }
         let rule_providers = self
             .rule_providers
@@ -485,6 +606,264 @@ fn reqwest_error_reason(error: reqwest::Error) -> String {
     reason
 }
 
+fn build_rule_provider_client(allow_redirects: bool) -> Result<reqwest::Client, ConfigError> {
+    reqwest::Client::builder()
+        .redirect(if allow_redirects {
+            reqwest::redirect::Policy::limited(5)
+        } else {
+            reqwest::redirect::Policy::none()
+        })
+        .build()
+        .map_err(|error| ConfigError::RuleProviderHttp {
+            name: "<client>".to_owned(),
+            reason: error.without_url().to_string(),
+        })
+}
+
+async fn download_rule_provider(
+    client: &reqwest::Client,
+    name: &str,
+    provider: &RuleProviderConfig,
+    timeout_duration: Duration,
+) -> Result<Vec<u8>, String> {
+    let url = provider
+        .url
+        .as_deref()
+        .ok_or_else(|| "type: http requires a url".to_owned())?;
+    let parsed_url = reqwest::Url::parse(url)
+        .map_err(|_| "type: http url must be a valid http or https URL".to_owned())?;
+    if !matches!(parsed_url.scheme(), "http" | "https")
+        || parsed_url.host_str().is_none()
+        || !parsed_url.username().is_empty()
+        || parsed_url.password().is_some()
+    {
+        return Err("type: http url must use http/https and contain no user credentials".into());
+    }
+
+    let download = async {
+        let mut request = client.get(parsed_url);
+        for (key, value) in &provider.headers {
+            for value in value.values() {
+                request = request.header(key, value);
+            }
+        }
+        let mut response = request.send().await.map_err(reqwest_error_reason)?;
+        if !response.status().is_success() {
+            return Err(format!("server returned HTTP status {}", response.status()));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_RULE_PROVIDER_BYTES)
+        {
+            return Err(format!("response exceeds {MAX_RULE_PROVIDER_BYTES} bytes"));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(reqwest_error_reason)? {
+            if bytes.len() as u64 + chunk.len() as u64 > MAX_RULE_PROVIDER_BYTES {
+                return Err(format!("response exceeds {MAX_RULE_PROVIDER_BYTES} bytes"));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok::<_, String>(bytes)
+    };
+    tokio::time::timeout(timeout_duration, download)
+        .await
+        .map_err(|_| format!("request exceeded connect_timeout_ms for provider {name}"))?
+}
+
+fn parse_rule_provider_bytes(bytes: &[u8]) -> Result<Vec<String>, String> {
+    let source = std::str::from_utf8(bytes)
+        .map_err(|error| format!("response is not valid UTF-8: {error}"))?;
+    parse_rule_provider_file(source)
+}
+
+fn provider_cache_path(config_dir: &Path, name: &str, provider: &RuleProviderConfig) -> PathBuf {
+    if let Some(path) = &provider.path {
+        return if path.is_absolute() {
+            path.clone()
+        } else {
+            config_dir.join(path)
+        };
+    }
+    let encoded_name = name
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    config_dir
+        .join(".rust-mhm-cache")
+        .join(format!("provider-{encoded_name}.cache"))
+}
+
+fn cache_path_names_file(path: &Path) -> bool {
+    let path_text = path.as_os_str().to_string_lossy();
+    path.file_name().is_some()
+        && !path_text.ends_with(std::path::MAIN_SEPARATOR)
+        && !(cfg!(windows) && path_text.ends_with('/'))
+}
+
+fn normalized_path_for_comparison(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normalized.file_name().is_some() {
+                    normalized.pop();
+                } else {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+
+    let mut ancestor = normalized.clone();
+    let mut suffix = Vec::new();
+    loop {
+        let candidate = if ancestor.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            &ancestor
+        };
+        if let Ok(mut canonical) = std::fs::canonicalize(candidate) {
+            for component in suffix.iter().rev() {
+                canonical.push(component);
+            }
+            return path_comparison_key(canonical);
+        }
+        let Some(file_name) = ancestor.file_name() else {
+            break;
+        };
+        suffix.push(file_name.to_os_string());
+        if !ancestor.pop() {
+            break;
+        }
+    }
+
+    path_comparison_key(normalized)
+}
+
+fn path_comparison_key(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(path.to_string_lossy().to_lowercase())
+    }
+    #[cfg(not(windows))]
+    {
+        path
+    }
+}
+
+fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
+    normalized_path_for_comparison(left) == normalized_path_for_comparison(right)
+}
+
+fn read_rule_provider_cache(path: &Path) -> Result<Option<Vec<String>>, String> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    let size = file.metadata().map_err(|error| error.to_string())?.len();
+    if size > MAX_RULE_PROVIDER_BYTES {
+        return Err(format!(
+            "cached snapshot exceeds {MAX_RULE_PROVIDER_BYTES} bytes"
+        ));
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    file.take(MAX_RULE_PROVIDER_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_RULE_PROVIDER_BYTES {
+        return Err(format!(
+            "cached snapshot exceeds {MAX_RULE_PROVIDER_BYTES} bytes"
+        ));
+    }
+    parse_rule_provider_bytes(&bytes)
+        .map(Some)
+        .map_err(|reason| format!("cached snapshot is invalid: {reason}"))
+}
+
+fn write_rule_provider_cache(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut temporary_name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("provider-cache"))
+        .to_os_string();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    temporary_name.push(format!(".tmp-{}-{nonce}", std::process::id()));
+    let temporary_path = parent.join(temporary_name);
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        replace_rule_provider_cache(&temporary_path, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
+    }
+    result
+}
+
+fn replace_rule_provider_cache(temporary_path: &Path, cache_path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+        const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+        #[link(name = "Kernel32")]
+        unsafe extern "system" {
+            #[link_name = "MoveFileExW"]
+            fn move_file_ex_w(
+                existing_file_name: *const u16,
+                new_file_name: *const u16,
+                flags: u32,
+            ) -> i32;
+        }
+
+        let existing = temporary_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let destination = cache_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        // The temporary file is created beside the cache, so replacement stays on one volume.
+        let replaced = unsafe {
+            move_file_ex_w(
+                existing.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if replaced == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(temporary_path, cache_path)
+    }
+}
+
 impl RuleProviderConfig {
     fn normalized_payload(&self) -> Vec<String> {
         match self.behavior.as_str() {
@@ -530,15 +909,34 @@ impl RuleProviderConfig {
                     .to_owned(),
             ));
         }
+        if self.provider_type == "http"
+            && self
+                .path
+                .as_deref()
+                .is_some_and(|path| !cache_path_names_file(path))
+        {
+            return Err(invalid("type: http path must name a cache file".to_owned()));
+        }
         match self.provider_type.as_str() {
-            "inline" if self.path.is_none() && self.url.is_none() => {}
+            "inline"
+                if self.path.is_none()
+                    && self.url.is_none()
+                    && self.interval.is_none()
+                    && self.headers.is_empty() => {}
             "file"
                 if self
                     .path
                     .as_ref()
                     .is_some_and(|path| !path.as_os_str().is_empty())
-                    && self.url.is_none() => {}
-            "http" if self.path.is_none() => {
+                    && self.url.is_none()
+                    && self.interval.is_none()
+                    && self.headers.is_empty() => {}
+            "http"
+                if self
+                    .path
+                    .as_ref()
+                    .is_none_or(|path| !path.as_os_str().is_empty()) =>
+            {
                 let Some(url) = self.url.as_deref() else {
                     return Err(invalid("type: http requires a url".to_owned()));
                 };
@@ -555,14 +953,45 @@ impl RuleProviderConfig {
                             .to_owned(),
                     ));
                 }
+                let interval = self.interval.unwrap_or(DEFAULT_RULE_PROVIDER_INTERVAL_SECS);
+                if !(1..=MAX_RULE_PROVIDER_INTERVAL_SECS).contains(&interval) {
+                    return Err(invalid(format!(
+                        "interval must be between 1 and {MAX_RULE_PROVIDER_INTERVAL_SECS} seconds"
+                    )));
+                }
+                if self.headers.len() > 64
+                    || self
+                        .headers
+                        .values()
+                        .map(|values| values.values().len())
+                        .sum::<usize>()
+                        > 64
+                {
+                    return Err(invalid("at most 64 HTTP headers are allowed".to_owned()));
+                }
+                let mut header_names = std::collections::HashSet::new();
+                for (key, values) in &self.headers {
+                    let Ok(header_name) = HeaderName::from_bytes(key.as_bytes()) else {
+                        return Err(invalid(format!("invalid HTTP header name: {key}")));
+                    };
+                    if !header_names.insert(header_name.as_str().to_owned())
+                        || values.values().is_empty()
+                        || values.values().iter().any(|value| {
+                            value.len() > 8 * 1024
+                                || HeaderValue::from_bytes(value.as_bytes()).is_err()
+                        })
+                    {
+                        return Err(invalid(format!("invalid or duplicate HTTP header: {key}")));
+                    }
+                }
             }
-            "inline" => return Err(invalid("type: inline cannot define path or url".to_owned())),
-            "file" => return Err(invalid("type: file requires a path".to_owned())),
-            "http" => {
+            "inline" => {
                 return Err(invalid(
-                    "HTTP provider cache paths are not yet supported".to_owned(),
+                    "type: inline cannot define path, url, interval, or header".to_owned(),
                 ));
             }
+            "file" => return Err(invalid("type: file requires a path".to_owned())),
+            "http" => return Err(invalid("type: http requires a valid url".to_owned())),
             _ => {
                 return Err(invalid(
                     "supported types are inline, file, and http".to_owned(),
@@ -584,14 +1013,34 @@ impl RuleProviderConfig {
             ));
         }
 
+        self.validate_payload()
+            .map_err(|reason| invalid(format!("invalid provider payload: {reason}")))?;
+        Ok(())
+    }
+
+    fn validate_payload(&self) -> Result<(), String> {
+        if self
+            .payload
+            .iter()
+            .any(|rule| rule.trim().is_empty() || rule.contains(['\r', '\n']))
+        {
+            return Err("payload entries must be non-empty single-line rules".to_owned());
+        }
         let validation_rules = self
             .normalized_payload()
             .iter()
             .map(|rule| format!("{rule},DIRECT"))
             .collect::<Vec<_>>();
+        if validation_rules.iter().any(|rule| {
+            rule.split(',')
+                .next()
+                .is_some_and(|kind| kind.trim() == "MATCH")
+        }) {
+            return Err("MATCH cannot appear inside a rule-provider payload".to_owned());
+        }
         RuleSet::parse(&validation_rules)
-            .map_err(|error| invalid(format!("invalid provider payload: {error}")))?;
-        Ok(())
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -693,13 +1142,30 @@ mod tests {
     use crate::routing::{RequestTarget, RouteAction, TargetHost};
 
     fn temporary_directory() -> PathBuf {
-        let unique = std::time::SystemTime::now()
+        static NEXT_TEMP_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("rust-mhm-test-{unique}"));
+        let sequence = NEXT_TEMP_DIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "rust-mhm-test-{}-{timestamp}-{sequence}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn cache_writer_replaces_an_existing_snapshot() {
+        let directory = temporary_directory();
+        let cache_path = directory.join("provider.cache");
+        std::fs::write(&cache_path, b"old snapshot").unwrap();
+
+        write_rule_provider_cache(&cache_path, b"new snapshot").unwrap();
+
+        assert_eq!(std::fs::read(&cache_path).unwrap(), b"new snapshot");
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     async fn start_http_response(
@@ -992,6 +1458,7 @@ rules:
     #[tokio::test]
     async fn http_provider_downloads_and_routes_a_startup_snapshot() {
         let body = b"payload:\n  - .remote.example\n  - '*.static.example'\n".to_vec();
+        let expected_body = body.clone();
         let (address, server) = start_http_response("200 OK", body, None).await;
         let directory = temporary_directory();
         let config_path = directory.join("config.yaml");
@@ -1025,8 +1492,174 @@ rules:
             }),
             RouteAction::Direct
         );
+        let cache_path = directory
+            .join(".rust-mhm-cache")
+            .join("provider-72656d6f7465.cache");
+        assert_eq!(std::fs::read(cache_path).unwrap(), expected_body);
         server.await.unwrap();
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_provider_uses_a_valid_persistent_cache_when_offline() {
+        let directory = temporary_directory();
+        let config_path = directory.join("offline.yaml");
+        let cache_path = directory.join("snapshots/remote.rules");
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        std::fs::write(&cache_path, "payload:\n  - .cached.example\n").unwrap();
+        let unavailable = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = unavailable.local_addr().unwrap();
+        drop(unavailable);
+        std::fs::write(
+            &config_path,
+            format!(
+                "rule-providers:\n  remote:\n    type: http\n    behavior: domain\n    url: 'http://{address}/rules'\n    path: snapshots/remote.rules\nrules:\n  - RULE-SET,remote,REJECT\n  - MATCH,DIRECT\n"
+            ),
+        )
+        .unwrap();
+
+        let config = Config::load_async(&config_path).await.unwrap();
+        let rules = config.routing_rules().unwrap();
+        assert_eq!(
+            rules.route(&RequestTarget {
+                host: TargetHost::Domain("cdn.cached.example".into()),
+                port: 443,
+            }),
+            RouteAction::Reject
+        );
+        assert_eq!(
+            rules.route(&RequestTarget {
+                host: TargetHost::Domain("safe.example".into()),
+                port: 443,
+            }),
+            RouteAction::Direct
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_provider_falls_back_when_downloaded_rules_are_invalid() {
+        let (address, server) =
+            start_http_response("200 OK", b"payload:\n  - GEOIP,CN\n".to_vec(), None).await;
+        let directory = temporary_directory();
+        let config_path = directory.join("invalid-remote.yaml");
+        let cache_path = directory.join("valid-cache.yaml");
+        let cached_snapshot = b"payload:\n  - DOMAIN-SUFFIX,cached.example\n";
+        std::fs::write(&cache_path, cached_snapshot).unwrap();
+        std::fs::write(
+            &config_path,
+            format!(
+                "rule-providers:\n  remote:\n    type: http\n    behavior: classical\n    url: 'http://{address}/rules'\n    path: valid-cache.yaml\nrules:\n  - RULE-SET,remote,REJECT\n  - MATCH,DIRECT\n"
+            ),
+        )
+        .unwrap();
+
+        let config = Config::load_async(&config_path).await.unwrap();
+        assert_eq!(
+            config.routing_rules().unwrap().route(&RequestTarget {
+                host: TargetHost::Domain("cdn.cached.example".into()),
+                port: 443,
+            }),
+            RouteAction::Reject
+        );
+        assert_eq!(std::fs::read(&cache_path).unwrap(), cached_snapshot);
+        server.await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_provider_sends_configured_headers_and_uses_explicit_cache_path() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") && request.len() < 16 * 1024 {
+                let mut byte = [0u8; 1];
+                if stream.read_exact(&mut byte).await.is_err() {
+                    return;
+                }
+                request.push(byte[0]);
+            }
+            let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+            assert!(request.contains("x-provider-key: local-test-token\r\n"));
+            assert!(request.contains("x-provider-key: second-token\r\n"));
+            assert!(request.contains("x-provider-single: scalar-value\r\n"));
+            let body = b"payload:\n  - .headered.example\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+        let directory = temporary_directory();
+        let config_path = directory.join("headers.yaml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "rule-providers:\n  remote:\n    type: http\n    behavior: domain\n    url: 'http://{address}/rules'\n    path: snapshots/header.rules\n    interval: 3600\n    header:\n      X-Provider-Key:\n        - local-test-token\n        - second-token\n      X-Provider-Single: scalar-value\nrules:\n  - RULE-SET,remote,REJECT\n  - MATCH,DIRECT\n"
+            ),
+        )
+        .unwrap();
+
+        let config = Config::load_async(&config_path).await.unwrap();
+        assert_eq!(
+            config.rule_provider_refreshes(),
+            vec![("remote".to_owned(), Duration::from_secs(3600))]
+        );
+        assert_eq!(
+            std::fs::read(directory.join("snapshots/header.rules")).unwrap(),
+            b"payload:\n  - .headered.example\n"
+        );
+        assert_eq!(
+            config.routing_rules().unwrap().route(&RequestTarget {
+                host: TargetHost::Domain("cdn.headered.example".into()),
+                port: 443,
+            }),
+            RouteAction::Reject
+        );
+        server.await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_http_refresh_options_are_rejected_before_network_access() {
+        let directory = temporary_directory();
+        let cases = [
+            ("zero-interval", "    interval: 0\n"),
+            (
+                "bad-header",
+                "    header:\n      'Bad Header':\n        - value\n",
+            ),
+            ("overwrite-config", "    path: overwrite-config.yaml\n"),
+        ];
+        for (name, extra) in cases {
+            let config_path = directory.join(format!("{name}.yaml"));
+            std::fs::write(
+                &config_path,
+                format!(
+                    "rule-providers:\n  remote:\n    type: http\n    behavior: classical\n    url: 'http://127.0.0.1:9/rules'\n{extra}"
+                ),
+            )
+            .unwrap();
+            assert!(matches!(
+                Config::load_async(&config_path).await,
+                Err(ConfigError::InvalidRuleProvider { .. })
+            ));
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejects_noncanonical_plural_provider_header_field() {
+        let error = Config::from_yaml_str(
+            "rule-providers:\n  remote:\n    type: http\n    behavior: classical\n    url: 'http://example.test/rules'\n    headers:\n      X-Test: value\n",
+        )
+        .unwrap_err();
+        assert!(matches!(error, ConfigError::Yaml(_)));
     }
 
     #[tokio::test]
@@ -1055,6 +1688,101 @@ rules:
         );
         redirect_server.await.unwrap();
         destination_server.await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_provider_with_custom_headers_does_not_follow_redirects() {
+        let (address, redirect_server) =
+            start_http_redirect("http://127.0.0.1:9/untrusted".to_owned()).await;
+        let directory = temporary_directory();
+        let config_path = directory.join("redirect-with-header.yaml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "rule-providers:\n  remote:\n    type: http\n    behavior: classical\n    url: 'http://{address}/start'\n    header:\n      Authorization:\n        - Bearer local-test-token\n"
+            ),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            Config::load_async(&config_path).await,
+            Err(ConfigError::RuleProviderHttp { reason, .. }) if reason.contains("302 Found")
+        ));
+        redirect_server.await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_providers_cannot_share_a_cache_path() {
+        let directory = temporary_directory();
+        let config_path = directory.join("duplicate-cache.yaml");
+        std::fs::write(
+            &config_path,
+            "rule-providers:\n  first:\n    type: http\n    behavior: classical\n    url: 'http://127.0.0.1:9/first'\n    path: shared.cache\n  second:\n    type: http\n    behavior: classical\n    url: 'http://127.0.0.1:9/second'\n    path: nested/../shared.cache\n",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            Config::load_async(&config_path).await,
+            Err(ConfigError::InvalidRuleProvider { reason, .. })
+                if reason.contains("distinct cache paths")
+        ));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn http_providers_cannot_share_case_insensitive_cache_paths() {
+        let directory = temporary_directory();
+        let config_path = directory.join("case-cache.yaml");
+        std::fs::write(
+            &config_path,
+            "rule-providers:\n  first:\n    type: http\n    behavior: classical\n    url: 'http://127.0.0.1:9/first'\n    path: shared.cache\n  second:\n    type: http\n    behavior: classical\n    url: 'http://127.0.0.1:9/second'\n    path: SHARED.CACHE\n",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            Config::load_async(&config_path).await,
+            Err(ConfigError::InvalidRuleProvider { reason, .. })
+                if reason.contains("distinct cache paths")
+        ));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_provider_cache_cannot_overwrite_config_through_path_alias() {
+        let directory = temporary_directory();
+        let config_path = directory.join("protected.yaml");
+        std::fs::write(
+            &config_path,
+            "rule-providers:\n  remote:\n    type: http\n    behavior: classical\n    url: 'http://127.0.0.1:9/remote'\n    path: nested/../protected.yaml\n",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            Config::load_async(&config_path).await,
+            Err(ConfigError::InvalidRuleProvider { reason, .. })
+                if reason.contains("must not overwrite the configuration file")
+        ));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_provider_rejects_directory_cache_paths() {
+        let directory = temporary_directory();
+        let config_path = directory.join("directory-cache.yaml");
+        std::fs::write(
+            &config_path,
+            "rule-providers:\n  remote:\n    type: http\n    behavior: classical\n    url: 'http://127.0.0.1:9/remote'\n    path: .\n",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            Config::load_async(&config_path).await,
+            Err(ConfigError::InvalidRuleProvider { reason, .. })
+                if reason.contains("path must name a cache file")
+        ));
         std::fs::remove_dir_all(directory).unwrap();
     }
 
