@@ -1,6 +1,6 @@
 # Compatibility ledger
 
-`rust-mhm` 当前只在本项目自己的严格 YAML 配置中采用部分 Mihomo 规则字符串语法。它不是完整 Mihomo 配置解析器，也没有完整规则、DNS 或出站系统；表格中的“支持”仅指本仓库已实现并有本地测试覆盖的有限行为。
+`rust-mhm` 当前只在本项目自己的严格 YAML 配置中实现部分 Mihomo 风格规则和有限 TCP 出站。它不是完整 Mihomo 配置解析器，也没有完整规则、DNS、代理组或数据面；表中“支持”只表示该有限行为已在本仓库实现并有本地测试覆盖。
 
 ## 当前规则子集
 
@@ -8,24 +8,38 @@
 |---|---|---|
 | `DOMAIN` | 支持 | 与规范化后的完整 ASCII 域名精确匹配。 |
 | `DOMAIN-SUFFIX` | 支持 | 匹配域名本身及标签边界上的子域；`notexample.com` 不会命中 `example.com`。 |
-| `IP-CIDR` / `IP-CIDR6` | 支持 | 对 SOCKS5 请求给出的字面 IP 做同地址族 CIDR 前缀比较；两种类型名按同一解析器处理。 |
+| `IP-CIDR` / `IP-CIDR6` | 支持 | 对 SOCKS5 请求给出的字面 IP 做同地址族 CIDR 前缀比较；不会为域名查询 DNS。 |
 | `DST-PORT` | 有限支持 | 匹配一个端口或一个闭区间，例如 `443` 或 `8000-8100`。 |
 | `MATCH` | 支持 | 匹配所有剩余请求；显式出现时必须是唯一且最后一条规则。 |
-| `RULE-SET` | 未支持 | 上游语法要求相应 rule provider；本项目尚无 provider 读取、格式解析、缓存或更新生命周期。 |
+| `RULE-SET` | 未支持 | 尚无 rule provider 的读取、格式解析、缓存或更新生命周期。 |
 
-规则依配置顺序从上到下评估，首个匹配决定动作。当前动作只有 `DIRECT` 与 `REJECT`：`DIRECT` 执行 TCP 直连；`REJECT` 在拨号前返回 SOCKS5 `REP=0x02`。代理名称、代理组及其他策略均会显式报错，不会假装成功。
+规则依配置顺序评估，首个匹配决定动作。动作可为 `DIRECT`（TCP 直连）、`REJECT`（拨号前返回 SOCKS5 `REP=0x02`）或已声明的代理名。代理引用必须精确匹配 `proxies[].name`；未配置名称、重复名称和保留名称 `DIRECT`/`REJECT` 均不接受。
+
+## 当前出站切片
+
+| 配置 `type` | 支持范围 | 不包含 |
+|---|---|---|
+| `http` | HTTP/1.x `CONNECT` 隧道；可选 Basic 用户名/密码；只接受 2xx 成功响应。 | 明文 HTTP 代理连接、非 CONNECT 转发、TLS-to-proxy、代理链、重试与连接池。 |
+| `socks5` | SOCKS5 TCP `CONNECT`；支持 IPv4、IPv6、域名目标；无认证或 RFC 1929 用户名/密码认证。 | UDP ASSOCIATE、GSSAPI、SOCKS4、DNS 缓存或代理端点健康管理。 |
+
+代理对象采用本项目自有 YAML 结构：`name`、`type`、`server`、`port`、可选的成对 `username`/`password`。凭据以明文保存在 YAML 里；使用者须自行限制文件访问并避免提交真实账号。出站连接与协议握手共用 `connect_timeout_ms`。收到 HTTP 或 SOCKS5 错误响应时，客户端收到失败回复；SOCKS5 返回的连接拒绝/不可达映射为对应的 SOCKS 回复。
 
 ## 项目约定与未实现语义
 
-- `DOMAIN`/`DOMAIN-SUFFIX` 只接收 ASCII DNS A-label（国际化域名需预先转为 `xn--...`）；匹配时转小写，并接受/去掉一个末尾根点。官方规则页面说明匹配类型，但这些正规化细节是本项目选择，尚未承诺与上游完全一致。
-- 目前不为规则执行 DNS 查询。域名目标不会为 `IP-CIDR` 规则先解析；因此 `no-resolve` 可作为 `IP-CIDR` 的可选参数接受，但本项目不会触发供其抑制的 DNS 路由查询。域名 `DIRECT` 出站仍使用 Tokio/系统解析路径，这不等于实现了 Mihomo DNS 子系统。
+- `DOMAIN`/`DOMAIN-SUFFIX` 只接收 ASCII DNS A-label（国际化域名需预先转为 `xn--...`）；匹配时转小写，并接受/去掉一个末尾根点。这些正规化细节是本项目选择，未承诺完整等同上游。
+- HTTP CONNECT 的域名目标会做 ASCII DNS 格式校验后再写入 authority；这限制可表达的域名，但避免 HTTP 请求行/头注入。
+- SOCKS5 代理会在连接请求中传递域名地址；代理端通常负责目标解析。DIRECT 域名目标仍使用 Tokio/系统解析路径。
+- IP-CIDR 只检查请求中提供的字面地址。规则不执行 DNS；`no-resolve` 可作为 `IP-CIDR` 的可选参数接受，但本项目不会触发供其抑制的 DNS 路由查询。
 - `DST-PORT` 目前只接受单值或单个 `-` 区间，不承诺上游语法中的所有端口集合/表达式形式。
-- 没有规则时，或列表未写 `MATCH` 时，本项目在末尾添加 `MATCH,DIRECT`。这是本项目的显式 fallback 约定；不要据此推断完整 Mihomo 配置默认值。
-- 当前顶层只识别 `listen`、`connect_timeout_ms`、`max_connections` 和 `rules`。`mixed-port`、`proxies`、`proxy-groups`、`rule-providers` 等完整配置结构尚未支持。
+- 没有规则时，或列表未写 `MATCH` 时，本项目会追加 `MATCH,DIRECT`。这是本项目的 fallback 约定，不代表完整 Mihomo 的默认值。
+- 顶层只识别 `listen`、`connect_timeout_ms`、`max_connections`、`rules`、`proxies`。`mixed-port`、`proxy-groups`、`rule-providers`、完整 DNS 配置等仍会失败。
+- 代理组（手动选择、故障转移、负载均衡）、规则集、DNS 策略、UDP、透明代理与 TUN 均未实现。
 
 ## 官方参考
 
-- [Mihomo 官方 Routing Rules 文档](https://wiki.metacubex.one/en/config/rules/)：规则从上到下匹配；说明 `DOMAIN`、`DOMAIN-SUFFIX` 的域名边界、`IP-CIDR`/`IP-CIDR6`、目的端口、`MATCH` 与 `no-resolve`。
-- [Mihomo 官方 Rule Providers 文档](https://wiki.metacubex.one/en/config/rule-providers/) 与[内容格式说明](https://wiki.metacubex.one/en/config/rule-providers/content/)：provider 配置及规则内容格式，供后续单独阶段评估。
-- [Mihomo 官方配置语法手册](https://wiki.metacubex.one/en/handbook/syntax/)：通用配置及端口范围语法参考。
-- [RFC 1928](https://www.rfc-editor.org/rfc/rfc1928)：SOCKS5 回复码定义；本项目 `REJECT` 使用 connection-not-allowed（`0x02`）。
+- [Mihomo 官方 Routing Rules 文档](https://wiki.metacubex.one/en/config/rules/)：规则顺序和规则类型参考。
+- [Mihomo 官方 Proxy 配置文档](https://wiki.metacubex.one/en/config/proxies/) 与[配置语法手册](https://wiki.metacubex.one/en/handbook/syntax/)：上游出站配置参考；本项目使用不同 YAML 子集，不代表相同语义或完整支持。
+- [Mihomo 官方 Rule Providers 文档](https://wiki.metacubex.one/en/config/rule-providers/) 与[内容格式说明](https://wiki.metacubex.one/en/config/rule-providers/content/)：供后续独立实现阶段评估。
+- [RFC 1928](https://www.rfc-editor.org/rfc/rfc1928)：SOCKS5 协议与回复码。
+- [RFC 1929](https://www.rfc-editor.org/rfc/rfc1929)：SOCKS5 用户名/密码认证。
+- [RFC 9110, Section 9.3.6](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.3.6)：HTTP CONNECT 方法语义。

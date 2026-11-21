@@ -3,6 +3,7 @@ use std::{net::SocketAddr, path::Path};
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::outbound::ProxyOutbound;
 use crate::routing::{RuleError, RuleSet};
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:1080";
@@ -23,6 +24,8 @@ pub struct Config {
     max_connections: usize,
     #[serde(default = "default_rules")]
     rules: Vec<String>,
+    #[serde(default)]
+    proxies: Vec<ProxyOutbound>,
 }
 
 impl Default for Config {
@@ -32,6 +35,7 @@ impl Default for Config {
             connect_timeout_ms: default_connect_timeout_ms(),
             max_connections: default_max_connections(),
             rules: default_rules(),
+            proxies: Vec::new(),
         }
     }
 }
@@ -65,7 +69,16 @@ impl Config {
     }
 
     pub fn routing_rules(&self) -> Result<RuleSet, ConfigError> {
-        Ok(RuleSet::parse(&self.rules)?)
+        let names = self
+            .proxies
+            .iter()
+            .map(|proxy| proxy.name.clone())
+            .collect::<Vec<_>>();
+        Ok(RuleSet::parse_with_proxies(&self.rules, &names)?)
+    }
+
+    pub fn proxy_outbounds(&self) -> &[ProxyOutbound] {
+        &self.proxies
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -79,7 +92,22 @@ impl Config {
         if !(1..=MAX_CONNECTIONS).contains(&self.max_connections) {
             return Err(ConfigError::InvalidMaxConnections(self.max_connections));
         }
-        RuleSet::parse(&self.rules)?;
+        let mut names = std::collections::HashSet::new();
+        for proxy in &self.proxies {
+            proxy.validate().map_err(ConfigError::InvalidProxy)?;
+            if !names.insert(proxy.name.as_str()) {
+                return Err(ConfigError::InvalidProxy(format!(
+                    "duplicate proxy name: {}",
+                    proxy.name
+                )));
+            }
+        }
+        let proxy_names = self
+            .proxies
+            .iter()
+            .map(|proxy| proxy.name.clone())
+            .collect::<Vec<_>>();
+        RuleSet::parse_with_proxies(&self.rules, &proxy_names)?;
         Ok(())
     }
 }
@@ -118,6 +146,8 @@ pub enum ConfigError {
     InvalidMaxConnections(usize),
     #[error(transparent)]
     Routing(#[from] RuleError),
+    #[error("invalid proxy configuration: {0}")]
+    InvalidProxy(String),
 }
 
 #[cfg(test)]
@@ -192,5 +222,34 @@ mod tests {
             error,
             ConfigError::Routing(RuleError::UnsupportedRuleType { .. })
         ));
+    }
+
+    #[test]
+    fn accepts_named_http_proxy_and_routes_to_it() {
+        let config = Config::from_yaml_str(
+            "proxies:\n  - name: upstream\n    type: http\n    server: 127.0.0.1\n    port: 8080\nrules:\n  - MATCH,upstream\n",
+        )
+        .unwrap();
+        let rules = config.routing_rules().unwrap();
+        let target = RequestTarget {
+            host: TargetHost::Domain("example.org".into()),
+            port: 443,
+        };
+        assert_eq!(rules.route(&target), RouteAction::Proxy("upstream".into()));
+        assert_eq!(config.proxy_outbounds().len(), 1);
+    }
+
+    #[test]
+    fn rejects_unknown_proxy_references_and_duplicate_names() {
+        let missing = Config::from_yaml_str("rules:\n  - MATCH,not-configured\n").unwrap_err();
+        assert!(matches!(
+            missing,
+            ConfigError::Routing(RuleError::UnsupportedAction { .. })
+        ));
+        let duplicate = Config::from_yaml_str(
+            "proxies:\n  - { name: same, type: http, server: localhost, port: 80 }\n  - { name: same, type: socks5, server: localhost, port: 1080 }\n",
+        )
+        .unwrap_err();
+        assert!(matches!(duplicate, ConfigError::InvalidProxy(_)));
     }
 }

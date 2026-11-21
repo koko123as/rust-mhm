@@ -16,6 +16,7 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::config::{Config, ConfigError};
+use crate::outbound::ProxyOutbound;
 use crate::routing::{RequestTarget, RouteAction, RuleSet, TargetHost};
 
 const SOCKS_VERSION: u8 = 0x05;
@@ -44,6 +45,7 @@ pub enum ServerError {
 pub async fn run(config: Config) -> Result<(), ServerError> {
     let listen_addr = config.listen_addr()?;
     let routing = Arc::new(config.routing_rules()?);
+    let outbounds = Arc::new(config.proxy_outbounds().to_vec());
     let listener = TcpListener::bind(listen_addr).await?;
     let connection_limit = Arc::new(Semaphore::new(config.max_connections()));
     let connect_timeout = Duration::from_millis(config.connect_timeout_ms());
@@ -64,9 +66,10 @@ pub async fn run(config: Config) -> Result<(), ServerError> {
                 match connection_limit.clone().try_acquire_owned() {
                     Ok(permit) => {
                         let routing = Arc::clone(&routing);
+                        let outbounds = Arc::clone(&outbounds);
                         tasks.spawn(async move {
                             let _permit = permit;
-                            handle_connection_with_rules(stream, connect_timeout, routing).await
+                            handle_connection_with_rules(stream, connect_timeout, routing, outbounds).await
                         });
                     }
                     Err(_) => {
@@ -98,13 +101,20 @@ pub async fn run(config: Config) -> Result<(), ServerError> {
 /// Handle one SOCKS5 TCP stream with the default direct-only routing table.
 /// Exposed for local integration tests and embedding.
 pub async fn handle_connection(client: TcpStream, connect_timeout: Duration) -> io::Result<()> {
-    handle_connection_with_rules(client, connect_timeout, Arc::new(RuleSet::default())).await
+    handle_connection_with_rules(
+        client,
+        connect_timeout,
+        Arc::new(RuleSet::default()),
+        Arc::new(Vec::new()),
+    )
+    .await
 }
 
 async fn handle_connection_with_rules(
     mut client: TcpStream,
     connect_timeout: Duration,
     routing: Arc<RuleSet>,
+    outbounds: Arc<Vec<ProxyOutbound>>,
 ) -> io::Result<()> {
     let target = match timeout(HANDSHAKE_TIMEOUT, negotiate(&mut client)).await {
         Err(_) => return Ok(()),
@@ -117,12 +127,28 @@ async fn handle_connection_with_rules(
         Ok(Err(ProtocolError::Io(error))) => return Err(error),
     };
 
-    if routing.route(&target) == RouteAction::Reject {
+    let action = routing.route(&target);
+    if action == RouteAction::Reject {
         send_reply(&mut client, REP_CONNECTION_NOT_ALLOWED, None).await?;
         return Ok(());
     }
 
-    let connect_result = timeout(connect_timeout, connect_target(&target)).await;
+    let connect_result = timeout(connect_timeout, async {
+        match action {
+            RouteAction::Direct => connect_target(&target).await,
+            RouteAction::Proxy(name) => {
+                let proxy = outbounds
+                    .iter()
+                    .find(|proxy| proxy.name == name)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "configured proxy not found")
+                    })?;
+                proxy.connect(&target).await
+            }
+            RouteAction::Reject => unreachable!("REJECT returns before dialing"),
+        }
+    })
+    .await;
     let mut upstream = match connect_result {
         Ok(Ok(upstream)) => upstream,
         Ok(Err(error)) => {
@@ -277,12 +303,20 @@ mod tests {
     async fn start_one_connection_with_rules(
         rules: RuleSet,
     ) -> (TcpStream, tokio::task::JoinHandle<io::Result<()>>) {
+        start_one_connection_with_rules_and_outbounds(rules, Vec::new()).await
+    }
+
+    async fn start_one_connection_with_rules_and_outbounds(
+        rules: RuleSet,
+        outbounds: Vec<ProxyOutbound>,
+    ) -> (TcpStream, tokio::task::JoinHandle<io::Result<()>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let routing = Arc::new(rules);
+        let outbounds = Arc::new(outbounds);
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await?;
-            handle_connection_with_rules(stream, Duration::from_secs(2), routing).await
+            handle_connection_with_rules(stream, Duration::from_secs(2), routing, outbounds).await
         });
         let client = TcpStream::connect(address).await.unwrap();
         (client, task)
@@ -423,5 +457,140 @@ mod tests {
             (SOCKS_VERSION, REP_CONNECTION_NOT_ALLOWED)
         );
         server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn named_http_connect_proxy_authenticates_and_relays_tcp() {
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            let (mut stream, _) = proxy_listener.accept().await.unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                headers.push(stream.read_u8().await.unwrap());
+            }
+            let headers = String::from_utf8(headers).unwrap();
+            assert!(headers.starts_with("CONNECT example.com:443 HTTP/1.1\r\n"));
+            assert!(headers.contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 Connection established\r\nX-Proxy-Extension: \xff\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let mut buffer = [0u8; 256];
+            loop {
+                let count = stream.read(&mut buffer).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                stream.write_all(&buffer[..count]).await.unwrap();
+            }
+        });
+        let proxy = ProxyOutbound {
+            name: "upstream".into(),
+            kind: "http".into(),
+            server: proxy_address.ip().to_string(),
+            port: proxy_address.port(),
+            username: Some("user".into()),
+            password: Some("pass".into()),
+        };
+        let names = vec!["upstream".to_owned()];
+        let rules = RuleSet::parse_with_proxies(&["MATCH,upstream".to_owned()], &names).unwrap();
+        let (mut client, server_task) =
+            start_one_connection_with_rules_and_outbounds(rules, vec![proxy]).await;
+        negotiate_no_auth(&mut client).await;
+        client
+            .write_all(&[SOCKS_VERSION, CMD_CONNECT, 0, 0x03, 11])
+            .await
+            .unwrap();
+        client.write_all(b"example.com").await.unwrap();
+        client.write_all(&443u16.to_be_bytes()).await.unwrap();
+        assert_eq!(
+            read_reply(&mut client).await,
+            (SOCKS_VERSION, REP_SUCCEEDED)
+        );
+        client.write_all(b"through-http-proxy").await.unwrap();
+        let mut echoed = [0u8; 18];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"through-http-proxy");
+        client.shutdown().await.unwrap();
+        server_task.await.unwrap().unwrap();
+        proxy_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn named_socks5_proxy_authenticates_and_relays_tcp() {
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            let (mut stream, _) = proxy_listener.accept().await.unwrap();
+            let mut greeting = [0u8; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [0x05, 0x01, 0x02]);
+            stream.write_all(&[0x05, 0x02]).await.unwrap();
+            let mut auth_header = [0u8; 2];
+            stream.read_exact(&mut auth_header).await.unwrap();
+            assert_eq!(auth_header[0], 0x01);
+            let mut username = vec![0u8; auth_header[1] as usize];
+            stream.read_exact(&mut username).await.unwrap();
+            let password_len = stream.read_u8().await.unwrap() as usize;
+            let mut password = vec![0u8; password_len];
+            stream.read_exact(&mut password).await.unwrap();
+            assert_eq!(username, b"user");
+            assert_eq!(password, b"pass");
+            stream.write_all(&[0x01, 0x00]).await.unwrap();
+            let mut request_header = [0u8; 5];
+            stream.read_exact(&mut request_header).await.unwrap();
+            assert_eq!(request_header, [0x05, 0x01, 0x00, 0x03, 11]);
+            let mut domain = [0u8; 11];
+            stream.read_exact(&mut domain).await.unwrap();
+            let mut port = [0u8; 2];
+            stream.read_exact(&mut port).await.unwrap();
+            assert_eq!(&domain, b"example.com");
+            assert_eq!(u16::from_be_bytes(port), 443);
+            stream
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                .await
+                .unwrap();
+            let mut buffer = [0u8; 256];
+            loop {
+                let count = stream.read(&mut buffer).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                stream.write_all(&buffer[..count]).await.unwrap();
+            }
+        });
+        let proxy = ProxyOutbound {
+            name: "upstream".into(),
+            kind: "socks5".into(),
+            server: proxy_address.ip().to_string(),
+            port: proxy_address.port(),
+            username: Some("user".into()),
+            password: Some("pass".into()),
+        };
+        let names = vec!["upstream".to_owned()];
+        let rules = RuleSet::parse_with_proxies(&["MATCH,upstream".to_owned()], &names).unwrap();
+        let (mut client, server_task) =
+            start_one_connection_with_rules_and_outbounds(rules, vec![proxy]).await;
+        negotiate_no_auth(&mut client).await;
+        client
+            .write_all(&[SOCKS_VERSION, CMD_CONNECT, 0, 0x03, 11])
+            .await
+            .unwrap();
+        client.write_all(b"example.com").await.unwrap();
+        client.write_all(&443u16.to_be_bytes()).await.unwrap();
+        assert_eq!(
+            read_reply(&mut client).await,
+            (SOCKS_VERSION, REP_SUCCEEDED)
+        );
+        client.write_all(b"through-socks5-proxy").await.unwrap();
+        let mut echoed = [0u8; 20];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"through-socks5-proxy");
+        client.shutdown().await.unwrap();
+        server_task.await.unwrap().unwrap();
+        proxy_task.await.unwrap();
     }
 }

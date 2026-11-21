@@ -2,10 +2,11 @@ use std::net::IpAddr;
 
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteAction {
     Direct,
     Reject,
+    Proxy(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +86,11 @@ impl RuleSet {
     /// Parse the supported comma-separated Mihomo-style rule subset.
     /// An implicit MATCH,DIRECT is appended when no MATCH rule is supplied.
     pub fn parse(lines: &[String]) -> Result<Self, RuleError> {
+        Self::parse_with_proxies(lines, &[])
+    }
+
+    /// Parse rules whose actions may also name one of the configured outbounds.
+    pub fn parse_with_proxies(lines: &[String], proxy_names: &[String]) -> Result<Self, RuleError> {
         if lines.is_empty() {
             return Ok(Self::default());
         }
@@ -144,7 +150,7 @@ impl RuleSet {
 
             rules.push(RoutingRule {
                 matcher,
-                action: parse_action(action_field, index)?,
+                action: parse_action(action_field, index, proxy_names)?,
             });
         }
 
@@ -163,7 +169,7 @@ impl RuleSet {
         self.rules
             .iter()
             .find(|rule| rule.matches(target))
-            .map(|rule| rule.action)
+            .map(|rule| rule.action.clone())
             .unwrap_or(RouteAction::Direct)
     }
 
@@ -194,10 +200,17 @@ impl RoutingRule {
     }
 }
 
-fn parse_action(value: &str, index: usize) -> Result<RouteAction, RuleError> {
+fn parse_action(
+    value: &str,
+    index: usize,
+    proxy_names: &[String],
+) -> Result<RouteAction, RuleError> {
     match value {
         "DIRECT" => Ok(RouteAction::Direct),
         "REJECT" => Ok(RouteAction::Reject),
+        name if proxy_names.iter().any(|proxy_name| proxy_name == name) => {
+            Ok(RouteAction::Proxy(name.to_owned()))
+        }
         other => Err(RuleError::UnsupportedAction {
             index,
             action: other.to_owned(),
