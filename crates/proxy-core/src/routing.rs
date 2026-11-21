@@ -1,5 +1,6 @@
 use std::net::{IpAddr, SocketAddr};
 
+use regex::Regex;
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +39,7 @@ enum Matcher {
     DomainSuffix(String),
     DomainKeyword(String),
     DomainWildcard(String),
+    DomainRegex(Regex),
     IpCidr(Cidr),
     SourceIpCidr(Cidr),
     SourcePort(PortMatcher),
@@ -71,6 +73,8 @@ pub enum RuleError {
     InvalidDomainKeyword { index: usize },
     #[error("invalid domain wildcard in routing rule at index {index}")]
     InvalidDomainWildcard { index: usize },
+    #[error("invalid domain regular expression in routing rule at index {index}")]
+    InvalidDomainRegex { index: usize },
     #[error("invalid CIDR in routing rule at index {index}")]
     InvalidCidr { index: usize },
     #[error("invalid destination port or range in routing rule at index {index}")]
@@ -109,11 +113,11 @@ impl RuleSet {
         for (offset, line) in lines.iter().enumerate() {
             let index = offset + 1;
             let fields: Vec<&str> = line.split(',').map(str::trim).collect();
-            if fields.iter().any(|field| field.is_empty()) {
+            let kind = fields.first().copied().unwrap_or_default();
+            if kind != "DOMAIN-REGEX" && fields.iter().any(|field| field.is_empty()) {
                 return Err(RuleError::InvalidSyntax { index });
             }
 
-            let kind = fields[0];
             let (matcher, action_field) = match kind {
                 "DOMAIN" if fields.len() == 3 => {
                     let domain =
@@ -154,6 +158,22 @@ impl RuleSet {
                         Matcher::DomainWildcard(pattern.to_ascii_lowercase()),
                         fields[2],
                     )
+                }
+                "DOMAIN-REGEX" => {
+                    let (rule, action) = line
+                        .rsplit_once(',')
+                        .ok_or(RuleError::InvalidDomainRegex { index })?;
+                    let (_, pattern) = rule
+                        .split_once(',')
+                        .ok_or(RuleError::InvalidDomainRegex { index })?;
+                    let pattern = pattern.trim();
+                    let action = action.trim();
+                    if pattern.is_empty() || pattern.len() > 4096 || action.is_empty() {
+                        return Err(RuleError::InvalidDomainRegex { index });
+                    }
+                    let regex =
+                        Regex::new(pattern).map_err(|_| RuleError::InvalidDomainRegex { index })?;
+                    (Matcher::DomainRegex(regex), action)
                 }
                 "IP-CIDR" | "IP-CIDR6"
                     if fields.len() == 3
@@ -256,6 +276,12 @@ impl RoutingRule {
             Matcher::DomainWildcard(pattern) => match &target.host {
                 TargetHost::Domain(domain) => normalize_domain(domain)
                     .is_some_and(|domain| wildcard_matches(pattern, &domain)),
+                TargetHost::Ip(_) => false,
+            },
+            Matcher::DomainRegex(regex) => match &target.host {
+                TargetHost::Domain(domain) => {
+                    normalize_domain(domain).is_some_and(|domain| regex.is_match(&domain))
+                }
                 TargetHost::Ip(_) => false,
             },
             Matcher::IpCidr(cidr) => match target.host {
@@ -520,6 +546,26 @@ mod tests {
     }
 
     #[test]
+    fn domain_regex_matches_normalized_domains_and_preserves_comma_quantifiers() {
+        let rules = rule_set(&[
+            r"DOMAIN-REGEX,^api[0-9]{2,4}\.example\.com$,REJECT",
+            "MATCH,DIRECT",
+        ]);
+        assert_eq!(
+            rules.route(&domain_target("API12.EXAMPLE.COM", 443)),
+            RouteAction::Reject
+        );
+        assert_eq!(
+            rules.route(&domain_target("api.example.com", 443)),
+            RouteAction::Direct
+        );
+        assert_eq!(
+            rules.route(&domain_target("xapi12.example.com", 443)),
+            RouteAction::Direct
+        );
+    }
+
+    #[test]
     fn source_ip_cidr_matches_only_the_supplied_peer_address() {
         let rules = rule_set(&[
             "SRC-IP-CIDR,192.0.2.0/24,REJECT",
@@ -678,6 +724,10 @@ mod tests {
         assert!(matches!(
             RuleSet::parse(&["DOMAIN-WILDCARD,*.éxample.com,REJECT".to_owned()]),
             Err(RuleError::InvalidDomainWildcard { .. })
+        ));
+        assert!(matches!(
+            RuleSet::parse(&["DOMAIN-REGEX,[,REJECT".to_owned()]),
+            Err(RuleError::InvalidDomainRegex { .. })
         ));
         assert!(matches!(
             RuleSet::parse(&["DST-PORT,90-80,REJECT".to_owned()]),

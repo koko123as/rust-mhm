@@ -13,6 +13,7 @@
 | Serde | 配置反序列化和严格字段检查 | 1.0.229 | MIT OR Apache-2.0；只作配置模型，不进入数据面。 |
 | yaml_serde | YAML 解码 | 0.10.7 | MIT OR Apache-2.0；采用 YAML 组织维护的实现，避免依赖已停止维护的 `serde_yaml`。 |
 | thiserror | 结构化配置/服务错误 | 2.0.21 | MIT OR Apache-2.0；仅派生错误类型。 |
+| regex | `DOMAIN-REGEX` 规则解析时编译及运行时匹配 | 1.13.2 | MIT OR Apache-2.0；只用于路由规则，不参与转发数据面。 |
 | tracing | 结构化日志事件 | 0.1.44 | MIT；CLI 记录生命周期，不记录代理目标域名。 |
 | tracing-subscriber | CLI 日志格式化与 `RUST_LOG` 过滤 | 0.3.23 | MIT；只在 CLI 层使用。 |
 

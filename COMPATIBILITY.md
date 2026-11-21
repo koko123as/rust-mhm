@@ -10,6 +10,7 @@
 | `DOMAIN-SUFFIX` | 支持 | 匹配域名本身及标签边界上的子域；`notexample.com` 不会命中 `example.com`。 |
 | `DOMAIN-KEYWORD` | 有限支持 | 在规范化后的 ASCII 域名中做大小写不敏感的子串匹配；不匹配 IP 字面量，也不要求标签边界。 |
 | `DOMAIN-WILDCARD` | 有限支持 | 在规范化 ASCII 域名上匹配完整模式；只支持 `*`（零个或多个字符）和 `?`（单个字符）。 |
+| `DOMAIN-REGEX` | 有限支持 | 规则加载时用 Rust `regex` crate 编译表达式，对规范化后的 ASCII 域名执行搜索匹配；表达式语法和上游引擎不保证等价。 |
 | `IP-CIDR` / `IP-CIDR6` | 支持 | 对 SOCKS5 请求给出的字面 IP 做同地址族 CIDR 前缀比较；不会为域名查询 DNS。 |
 | `SRC-IP-CIDR` | 有限支持 | 对已接受 SOCKS5 TCP 连接的客户端 peer IP 做 CIDR 匹配；不匹配源端口或来源地理信息。 |
 | `SRC-PORT` | 有限支持 | 匹配 TCP 客户端 peer 端口，接受单端口或闭区间格式。 |
@@ -36,7 +37,7 @@
 
 ## 项目约定与未实现语义
 
-- `DOMAIN`/`DOMAIN-SUFFIX` 只接收 ASCII DNS A-label（国际化域名需预先转为 `xn--...`）；匹配时转小写，并接受/去掉一个末尾根点。`DOMAIN-KEYWORD` 同样只在该规范化后的 ASCII 域名中做任意位置子串匹配。`DOMAIN-WILDCARD` 只接受 ASCII 字母数字、点、连字符、`*` 与 `?`；模式在完整域名上匹配。这些正规化细节是本项目选择，未承诺完整等同上游。
+- `DOMAIN`/`DOMAIN-SUFFIX` 只接收 ASCII DNS A-label（国际化域名需预先转为 `xn--...`）；匹配时转小写，并接受/去掉一个末尾根点。`DOMAIN-KEYWORD` 同样只在该规范化后的 ASCII 域名中做任意位置子串匹配。`DOMAIN-WILDCARD` 只接受 ASCII 字母数字、点、连字符、`*` 与 `?`；模式在完整域名上匹配。`DOMAIN-REGEX` 也在规范化后的域名上做搜索匹配（目标域名大小写不影响匹配）；正则表达式本身默认区分大小写，需要时可用 `(?i)` 标志。它采用 Rust `regex` crate 语法，表达式长度上限为 4096 字节，不承诺与 Mihomo 的 regex 引擎完全兼容。这些正规化细节是本项目选择。
 - HTTP CONNECT 的域名目标会做 ASCII DNS 格式校验后再写入 authority；这限制可表达的域名，但避免 HTTP 请求行/头注入。
 - SOCKS5 代理会在连接请求中传递域名地址；代理端通常负责目标解析。DIRECT 域名目标仍使用 Tokio/系统解析路径。
 - IP-CIDR 只检查请求中提供的字面地址。规则不执行 DNS；`no-resolve` 可作为 `IP-CIDR` 的可选参数接受，但本项目不会触发供其抑制的 DNS 路由查询。
@@ -48,7 +49,8 @@
 
 ## 官方参考
 
-- [Mihomo 官方 Routing Rules 文档](https://wiki.metacubex.one/en/config/rules/)：规则顺序和规则类型参考；官方将 `DOMAIN-KEYWORD` 定义为按域名关键词匹配、`SRC-IP-CIDR` 定义为匹配来源地址范围、`SRC-PORT` 定义为匹配来源端口，并说明 `DOMAIN-WILDCARD` 只支持 `*` 与 `?`（分别匹配零或多个字符、恰好一个字符）。
+- [Mihomo 官方 Routing Rules 文档](https://wiki.metacubex.one/en/config/rules/)：规则顺序和规则类型参考；官方将 `DOMAIN-REGEX` 定义为域名正则匹配，并将 `DOMAIN-KEYWORD` 定义为按域名关键词匹配、`SRC-IP-CIDR` 定义为匹配来源地址范围、`SRC-PORT` 定义为匹配来源端口，说明 `DOMAIN-WILDCARD` 只支持 `*` 与 `?`（分别匹配零或多个字符、恰好一个字符）。
+- [Rust regex crate 语法参考](https://docs.rs/regex/latest/regex/#syntax)：本项目 `DOMAIN-REGEX` 表达式编译所使用的语法实现。
 - [Mihomo 官方 Proxy 配置文档](https://wiki.metacubex.one/en/config/proxies/) 与[配置语法手册](https://wiki.metacubex.one/en/handbook/syntax/)：上游出站配置参考；本项目使用不同 YAML 子集，不代表相同语义或完整支持。
 - [Mihomo 官方全局配置](https://wiki.metacubex.one/en/config/general/)：`authentication` 与 `skip-auth-prefixes` 参考；本项目只支持全局认证列表及来源 CIDR 豁免的 SOCKS5 子集。
 - [Mihomo 官方 SOCKS 入站文档](https://wiki.metacubex.one/en/config/inbound/listeners/socks/)：监听器级 `users` 覆盖语义参考，当前未实现。

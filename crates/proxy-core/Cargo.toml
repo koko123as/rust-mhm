@@ -10,4 +10,5 @@ tokio.workspace = true
 serde.workspace = true
 yaml_serde.workspace = true
 thiserror.workspace = true
+regex.workspace = true
 tracing.workspace = true

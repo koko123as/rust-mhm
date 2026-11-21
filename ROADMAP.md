@@ -20,9 +20,9 @@
 ## Phase 2 — 受限配置与确定性路由
 
 - [x] 严格加载本项目 YAML；未知字段、规则类型和无效动作显式报错。
-- [x] 有序路由规则子集：`DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`DOMAIN-WILDCARD`、`IP-CIDR`/`IP-CIDR6`、`SRC-IP-CIDR`、`SRC-PORT`、`DST-PORT`、`MATCH`；首个命中优先。
+- [x] 有序路由规则子集：`DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`DOMAIN-WILDCARD`、有限的 `DOMAIN-REGEX`、`IP-CIDR`/`IP-CIDR6`、`SRC-IP-CIDR`、`SRC-PORT`、`DST-PORT`、`MATCH`；首个命中优先。
 - [x] 支持 `DIRECT`、`REJECT` 与已配置具名代理动作；拒绝动作在拨号前完成。
-- [x] 覆盖域名边界、IPv4/IPv6 目标及来源 CIDR、端口区间、规则顺序和拒绝路径。
+- [x] 覆盖域名边界与正则、IPv4/IPv6 目标及来源 CIDR、端口区间、规则顺序和拒绝路径。
 - [ ] 与更广泛 Mihomo 规则/配置语料逐项差异测试；当前规则子集不等于完整兼容。
 - [ ] 设计 rule-provider 文件/HTTP 加载、内容格式、缓存及更新策略；`RULE-SET` 尚不支持。
 
