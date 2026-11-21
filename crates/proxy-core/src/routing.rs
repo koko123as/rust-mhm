@@ -145,15 +145,26 @@ impl ProxyGroupSelections {
             ProxyGroupKind::LoadBalance => {
                 let next = self.round_robin_next.get(name)?;
                 let member_count = definition.members.len();
-                let index = next
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                        Some(if current + 1 == member_count {
-                            0
-                        } else {
-                            current + 1
-                        })
-                    })
-                    .unwrap_or_else(|current| current % member_count);
+                let index = loop {
+                    let current = next.load(Ordering::Relaxed);
+                    let index = current % member_count;
+                    let following = if index + 1 == member_count {
+                        0
+                    } else {
+                        index + 1
+                    };
+                    if next
+                        .compare_exchange_weak(
+                            current,
+                            following,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        break index;
+                    }
+                };
                 self.resolve_member(&definition.members[index], visiting)
             }
         }
