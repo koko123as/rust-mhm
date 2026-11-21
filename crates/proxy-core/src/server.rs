@@ -15,7 +15,7 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
-use crate::config::{Config, ConfigError};
+use crate::config::{AuthSkipPrefix, Config, ConfigError};
 use crate::outbound::ProxyOutbound;
 use crate::routing::{RequestTarget, RouteAction, RuleSet, TargetHost};
 
@@ -49,6 +49,7 @@ pub async fn run(config: Config) -> Result<(), ServerError> {
     let routing = Arc::new(config.routing_rules()?);
     let outbounds = Arc::new(config.proxy_outbounds().to_vec());
     let authentication = Arc::new(config.authentication_credentials());
+    let skip_auth_prefixes = Arc::new(config.skip_auth_prefixes()?);
     let listener = TcpListener::bind(listen_addr).await?;
     let connection_limit = Arc::new(Semaphore::new(config.max_connections()));
     let connect_timeout = Duration::from_millis(config.connect_timeout_ms());
@@ -65,15 +66,16 @@ pub async fn run(config: Config) -> Result<(), ServerError> {
     loop {
         tokio::select! {
             result = listener.accept() => {
-                let (stream, _peer) = result?;
+                let (stream, peer) = result?;
                 match connection_limit.clone().try_acquire_owned() {
                     Ok(permit) => {
                         let routing = Arc::clone(&routing);
                         let outbounds = Arc::clone(&outbounds);
                         let authentication = Arc::clone(&authentication);
+                        let skip_auth_prefixes = Arc::clone(&skip_auth_prefixes);
                         tasks.spawn(async move {
                             let _permit = permit;
-                            handle_connection_with_rules(stream, connect_timeout, routing, outbounds, authentication).await
+                            handle_connection_with_rules(stream, connect_timeout, routing, outbounds, authentication, skip_auth_prefixes, peer.ip()).await
                         });
                     }
                     Err(_) => {
@@ -105,12 +107,15 @@ pub async fn run(config: Config) -> Result<(), ServerError> {
 /// Handle one SOCKS5 TCP stream with the default direct-only routing table.
 /// Exposed for local integration tests and embedding.
 pub async fn handle_connection(client: TcpStream, connect_timeout: Duration) -> io::Result<()> {
+    let peer_ip = client.peer_addr()?.ip();
     handle_connection_with_rules(
         client,
         connect_timeout,
         Arc::new(RuleSet::default()),
         Arc::new(Vec::new()),
         Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+        peer_ip,
     )
     .await
 }
@@ -121,8 +126,19 @@ async fn handle_connection_with_rules(
     routing: Arc<RuleSet>,
     outbounds: Arc<Vec<ProxyOutbound>>,
     authentication: Arc<Vec<(String, String)>>,
+    skip_auth_prefixes: Arc<Vec<AuthSkipPrefix>>,
+    peer_ip: IpAddr,
 ) -> io::Result<()> {
-    let target = match timeout(HANDSHAKE_TIMEOUT, negotiate(&mut client, &authentication)).await {
+    let require_authentication = !authentication.is_empty()
+        && !skip_auth_prefixes
+            .iter()
+            .any(|prefix| prefix.contains(peer_ip));
+    let target = match timeout(
+        HANDSHAKE_TIMEOUT,
+        negotiate(&mut client, &authentication, require_authentication),
+    )
+    .await
+    {
         Err(_) => return Ok(()),
         Ok(Ok(Some(target))) => target,
         Ok(Ok(None)) => return Ok(()),
@@ -188,6 +204,7 @@ impl From<io::Error> for ProtocolError {
 async fn negotiate<S>(
     stream: &mut S,
     authentication: &[(String, String)],
+    require_authentication: bool,
 ) -> Result<Option<RequestTarget>, ProtocolError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -203,10 +220,10 @@ where
 
     let mut methods = vec![0u8; usize::from(greeting[1])];
     stream.read_exact(&mut methods).await?;
-    let selected_method = if authentication.is_empty() {
-        METHOD_NO_AUTH
-    } else {
+    let selected_method = if require_authentication {
         METHOD_USERNAME_PASSWORD
+    } else {
+        METHOD_NO_AUTH
     };
     if !methods.contains(&selected_method) {
         stream
@@ -370,19 +387,31 @@ mod tests {
         outbounds: Vec<ProxyOutbound>,
         authentication: Vec<(String, String)>,
     ) -> (TcpStream, tokio::task::JoinHandle<io::Result<()>>) {
+        start_one_connection_with_auth_policy(rules, outbounds, authentication, Vec::new()).await
+    }
+
+    async fn start_one_connection_with_auth_policy(
+        rules: RuleSet,
+        outbounds: Vec<ProxyOutbound>,
+        authentication: Vec<(String, String)>,
+        skip_auth_prefixes: Vec<AuthSkipPrefix>,
+    ) -> (TcpStream, tokio::task::JoinHandle<io::Result<()>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let routing = Arc::new(rules);
         let outbounds = Arc::new(outbounds);
         let authentication = Arc::new(authentication);
+        let skip_auth_prefixes = Arc::new(skip_auth_prefixes);
         let task = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await?;
+            let (stream, peer) = listener.accept().await?;
             handle_connection_with_rules(
                 stream,
                 Duration::from_secs(2),
                 routing,
                 outbounds,
                 authentication,
+                skip_auth_prefixes,
+                peer.ip(),
             )
             .await
         });
@@ -562,6 +591,31 @@ mod tests {
         assert_eq!(auth_reply, [AUTH_VERSION, 0x01]);
         let mut trailing = [0u8; 1];
         assert_eq!(client.read(&mut trailing).await.unwrap(), 0);
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn skip_auth_prefix_allows_no_auth_method_for_matching_peer() {
+        let config = Config::from_yaml_str(
+            "authentication:\n  - alice:secret\nskip-auth-prefixes:\n  - 127.0.0.1/32\n",
+        )
+        .unwrap();
+        let (mut client, server_task) = start_one_connection_with_auth_policy(
+            RuleSet::default(),
+            Vec::new(),
+            config.authentication_credentials(),
+            config.skip_auth_prefixes().unwrap(),
+        )
+        .await;
+        negotiate_no_auth(&mut client).await;
+        client
+            .write_all(&[SOCKS_VERSION, 0x03, 0, 0x01, 127, 0, 0, 1, 0, 53])
+            .await
+            .unwrap();
+        assert_eq!(
+            read_reply(&mut client).await,
+            (SOCKS_VERSION, REP_COMMAND_NOT_SUPPORTED)
+        );
         server_task.await.unwrap().unwrap();
     }
 

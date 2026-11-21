@@ -4,7 +4,7 @@
 
 ## 当前实现
 
-- SOCKS5 TCP `CONNECT` 入站，支持 IPv4、IPv6 与域名目标；默认无认证，可用 `authentication` 列表启用 RFC 1929 用户名/密码认证。
+- SOCKS5 TCP `CONNECT` 入站，支持 IPv4、IPv6 与域名目标；默认无认证，可用 `authentication` 列表启用 RFC 1929 用户名/密码认证，并可用 `skip-auth-prefixes` CIDR 允许指定来源免认证。
 - TCP 出站支持 `DIRECT`、HTTP `CONNECT`、SOCKS5；HTTP 与 SOCKS5 出站可选用户名/密码认证。
 - 有序首匹配规则支持 `DOMAIN`、`DOMAIN-SUFFIX`、`IP-CIDR`/`IP-CIDR6`、`DST-PORT`、`MATCH`；动作可为 `DIRECT`、`REJECT` 或配置中声明的代理名称。
 - `REJECT` 在拨号前返回 SOCKS5 connection-not-allowed；代理握手与连接共用配置的出站超时。
@@ -36,7 +36,7 @@ rules:
 
 代理类型目前只支持 `http`（HTTP CONNECT 隧道，不是通用正向 HTTP 转发，也不支持 TLS-to-proxy）和 `socks5`（SOCKS5 TCP CONNECT）。规则的第三列用代理名选择出站，例如 `MATCH,upstream`。省略规则时按本项目约定使用 `MATCH,DIRECT`。
 
-SOCKS5 入站认证和 SOCKS5 出站认证按 RFC 1929 传输明文凭据，因此仅应在可信本机网络使用；监听仍被限制为 loopback。**仍未实现：** UDP、HTTP 入站、`skip-auth-prefixes`、HTTPS/其他代理出站、代理组、`RULE-SET`/rule providers、Mihomo DNS 策略、TUN、订阅、REST API、UI 与 Android 服务。IP-CIDR 不会为域名目标先行解析。该项目不接受完整 Mihomo YAML；见 [兼容性台账](COMPATIBILITY.md)。
+`skip-auth-prefixes` 命中时将协商无认证方法；该功能应谨慎配置，避免把不可信来源列入豁免范围。SOCKS5 入站认证和 SOCKS5 出站认证按 RFC 1929 传输明文凭据，因此仅应在可信本机网络使用；监听仍被限制为 loopback。**仍未实现：** UDP、HTTP 入站、HTTPS/其他代理出站、代理组、`RULE-SET`/rule providers、Mihomo DNS 策略、TUN、订阅、REST API、UI 与 Android 服务。IP-CIDR 不会为域名目标先行解析。该项目不接受完整 Mihomo YAML；见 [兼容性台账](COMPATIBILITY.md)。
 
 ## 快速开始
 

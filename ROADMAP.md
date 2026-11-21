@@ -12,7 +12,7 @@
 
 ## Phase 1 — SOCKS5 到 DIRECT 的 TCP 切片
 
-- [x] SOCKS5 无认证协商或按配置强制 RFC 1929 用户名/密码协商、CONNECT、IPv4/IPv6/域名目标解析。
+- [x] SOCKS5 无认证协商或按配置强制 RFC 1929 用户名/密码协商；支持 `skip-auth-prefixes` CIDR 豁免、CONNECT 与 IPv4/IPv6/域名目标解析。
 - [x] DIRECT TCP 出站、超时、错误回复和双向转发。
 - [x] 默认 loopback 监听、并发连接上限。
 - [ ] 补充畸形帧、慢速客户端/超时、并发压力和取消回归测试。

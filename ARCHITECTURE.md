@@ -36,9 +36,9 @@ DIRECT TCP dial      SOCKS5 REP 0x02 <--------------+
 
 ## 配置与路由边界
 
-顶层只识别 `listen`、`connect_timeout_ms`、`max_connections`、`rules`、`proxies` 与 `authentication`。`authentication` 是 `username:password` 字符串列表；列表非空时服务强制 RFC 1929 子协商，不会回退到无认证。代理对象字段为 `name`、`type`（`http` 或 `socks5`）、`server`、`port` 和可选的成对 `username`/`password`。配置仍不是完整 Mihomo YAML；`skip-auth-prefixes`、`proxy-groups`、`rule-providers` 等未知字段会失败。规则第三列可用 `DIRECT`、`REJECT` 或配置中的代理名；未声明的动作/代理名失败。缺少 `MATCH` 时追加本项目约定的 `MATCH,DIRECT`。
+顶层只识别 `listen`、`connect_timeout_ms`、`max_connections`、`rules`、`proxies`、`authentication` 与 `skip-auth-prefixes`。`authentication` 是 `username:password` 字符串列表；列表非空时通常强制 RFC 1929 子协商。来源 IP 命中 `skip-auth-prefixes` 的 IPv4/IPv6 CIDR 时改为无认证协商。代理对象字段为 `name`、`type`（`http` 或 `socks5`）、`server`、`port` 和可选的成对 `username`/`password`。配置仍不是完整 Mihomo YAML；`proxy-groups`、`rule-providers` 等未知字段会失败。规则第三列可用 `DIRECT`、`REJECT` 或配置中的代理名；未声明的动作/代理名失败。缺少 `MATCH` 时追加本项目约定的 `MATCH,DIRECT`。
 
-SOCKS5 入站仅在配置非空 `authentication` 时要求 RFC 1929 用户名/密码，登录失败即关闭连接；该子协商本身没有加密。HTTP Basic 和 SOCKS5 用户密码在未加密代理链路上均可被观察，因此应限于可信主机/网络。HTTP 出站使用 HTTP/1.x `CONNECT` 并发送目标 authority；SOCKS5 出站将域名作为域名地址类型交给代理端解析；DIRECT 域名连接仍由 Tokio/系统解析。两种代理都仅支持 TCP `CONNECT`，没有 UDP associate、链式代理、健康检查、重试、TLS-to-proxy 或代理组。
+SOCKS5 入站仅在配置非空 `authentication` 且 peer 不匹配豁免 CIDR 时要求 RFC 1929 用户名/密码，登录失败即关闭连接；该子协商本身没有加密。HTTP Basic 和 SOCKS5 用户密码在未加密代理链路上均可被观察，因此应限于可信主机/网络。HTTP 出站使用 HTTP/1.x `CONNECT` 并发送目标 authority；SOCKS5 出站将域名作为域名地址类型交给代理端解析；DIRECT 域名连接仍由 Tokio/系统解析。两种代理都仅支持 TCP `CONNECT`，没有 UDP associate、链式代理、健康检查、重试、TLS-to-proxy 或代理组。
 
 规则层不执行 DNS 查询。IP-CIDR 规则只匹配 SOCKS5 请求中给出的字面 IP；域名目标不会为了路由先解析。域名规则接受 ASCII DNS A-label（如 `xn--...`），按小写比较并去掉一个末尾根点；这些均是本项目约定，不是完整上游行为承诺。HTTP CONNECT 的目标域名另作 ASCII DNS 名校验，以避免未经验证的控制字符进入 HTTP 请求头。
 

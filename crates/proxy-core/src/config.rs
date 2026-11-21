@@ -1,4 +1,7 @@
-use std::{net::SocketAddr, path::Path};
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::Path,
+};
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -28,6 +31,8 @@ pub struct Config {
     proxies: Vec<ProxyOutbound>,
     #[serde(default)]
     authentication: Vec<String>,
+    #[serde(default, rename = "skip-auth-prefixes")]
+    skip_auth_prefixes: Vec<String>,
 }
 
 impl Default for Config {
@@ -39,6 +44,7 @@ impl Default for Config {
             rules: default_rules(),
             proxies: Vec::new(),
             authentication: Vec::new(),
+            skip_auth_prefixes: Vec::new(),
         }
     }
 }
@@ -96,6 +102,19 @@ impl Config {
             .collect()
     }
 
+    pub(crate) fn skip_auth_prefixes(&self) -> Result<Vec<AuthSkipPrefix>, ConfigError> {
+        self.skip_auth_prefixes
+            .iter()
+            .map(|prefix| {
+                AuthSkipPrefix::parse(prefix).ok_or_else(|| {
+                    ConfigError::InvalidAuthentication(format!(
+                        "invalid skip-auth-prefix: {prefix}"
+                    ))
+                })
+            })
+            .collect()
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         let listen_addr = self.listen_addr()?;
         if !listen_addr.ip().is_loopback() {
@@ -142,6 +161,14 @@ impl Config {
                 ));
             }
         }
+        let mut skip_prefixes = std::collections::HashSet::new();
+        for prefix in &self.skip_auth_prefixes {
+            if AuthSkipPrefix::parse(prefix).is_none() || !skip_prefixes.insert(prefix) {
+                return Err(ConfigError::InvalidAuthentication(
+                    "skip-auth-prefixes must contain unique IPv4/IPv6 CIDR ranges".into(),
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -160,6 +187,44 @@ const fn default_max_connections() -> usize {
 
 fn default_rules() -> Vec<String> {
     vec!["MATCH,DIRECT".to_owned()]
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AuthSkipPrefix {
+    network: IpAddr,
+    prefix: u8,
+}
+
+impl AuthSkipPrefix {
+    fn parse(source: &str) -> Option<Self> {
+        let (address, prefix) = source.split_once('/')?;
+        let network = address.parse::<IpAddr>().ok()?;
+        let prefix = prefix.parse::<u8>().ok()?;
+        let max_prefix = if network.is_ipv4() { 32 } else { 128 };
+        (prefix <= max_prefix).then_some(Self { network, prefix })
+    }
+
+    pub(crate) fn contains(self, candidate: IpAddr) -> bool {
+        match (self.network, candidate) {
+            (IpAddr::V4(network), IpAddr::V4(candidate)) => {
+                let mask = if self.prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - u32::from(self.prefix))
+                };
+                (u32::from(network) & mask) == (u32::from(candidate) & mask)
+            }
+            (IpAddr::V6(network), IpAddr::V6(candidate)) => {
+                let mask = if self.prefix == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - u32::from(self.prefix))
+                };
+                (u128::from(network) & mask) == (u128::from(candidate) & mask)
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -302,6 +367,22 @@ mod tests {
         ));
         assert!(matches!(
             Config::from_yaml_str("authentication:\n  - alice:one\n  - alice:two\n"),
+            Err(ConfigError::InvalidAuthentication(_))
+        ));
+    }
+
+    #[test]
+    fn validates_skip_auth_prefixes_for_both_address_families() {
+        let config = Config::from_yaml_str(
+            "authentication:\n  - alice:secret\nskip-auth-prefixes:\n  - 127.0.0.0/8\n  - ::1/128\n",
+        )
+        .unwrap();
+        let prefixes = config.skip_auth_prefixes().unwrap();
+        assert!(prefixes[0].contains("127.0.0.1".parse().unwrap()));
+        assert!(!prefixes[0].contains("192.0.2.1".parse().unwrap()));
+        assert!(prefixes[1].contains("::1".parse().unwrap()));
+        assert!(matches!(
+            Config::from_yaml_str("skip-auth-prefixes:\n  - 192.0.2.1/33\n"),
             Err(ConfigError::InvalidAuthentication(_))
         ));
     }
