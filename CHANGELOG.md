@@ -9,6 +9,7 @@
 - 增加全局 `authentication` 与 IPv4/IPv6 `skip-auth-prefixes` 支持；按 RFC 1929 认证并在失败时关闭连接，匹配豁免来源时允许无认证。
 - 路由规则新增有限 `DOMAIN-KEYWORD` 支持：在规范化后的 ASCII 域名中执行大小写不敏感的子串匹配。
 - 路由规则新增有限 `DOMAIN-WILDCARD` 支持：仅支持 `*` 和 `?` 两种通配符。
+- 路由规则新增有限 `SRC-IP-CIDR` 与 `SRC-PORT` 支持：按入站 TCP peer 地址和来源端口匹配。
 - `RULE-SET`、代理组、UDP、DNS 策略、TUN 与平台集成仍未实现。
 
 ## 0.1.0 — 初始原型

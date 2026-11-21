@@ -11,6 +11,8 @@
 | `DOMAIN-KEYWORD` | 有限支持 | 在规范化后的 ASCII 域名中做大小写不敏感的子串匹配；不匹配 IP 字面量，也不要求标签边界。 |
 | `DOMAIN-WILDCARD` | 有限支持 | 在规范化 ASCII 域名上匹配完整模式；只支持 `*`（零个或多个字符）和 `?`（单个字符）。 |
 | `IP-CIDR` / `IP-CIDR6` | 支持 | 对 SOCKS5 请求给出的字面 IP 做同地址族 CIDR 前缀比较；不会为域名查询 DNS。 |
+| `SRC-IP-CIDR` | 有限支持 | 对已接受 SOCKS5 TCP 连接的客户端 peer IP 做 CIDR 匹配；不匹配源端口或来源地理信息。 |
+| `SRC-PORT` | 有限支持 | 匹配 TCP 客户端 peer 端口，接受单端口或闭区间格式。 |
 | `DST-PORT` | 有限支持 | 匹配一个端口或一个闭区间，例如 `443` 或 `8000-8100`。 |
 | `MATCH` | 支持 | 匹配所有剩余请求；显式出现时必须是唯一且最后一条规则。 |
 | `RULE-SET` | 未支持 | 尚无 rule provider 的读取、格式解析、缓存或更新生命周期。 |
@@ -38,6 +40,7 @@
 - HTTP CONNECT 的域名目标会做 ASCII DNS 格式校验后再写入 authority；这限制可表达的域名，但避免 HTTP 请求行/头注入。
 - SOCKS5 代理会在连接请求中传递域名地址；代理端通常负责目标解析。DIRECT 域名目标仍使用 Tokio/系统解析路径。
 - IP-CIDR 只检查请求中提供的字面地址。规则不执行 DNS；`no-resolve` 可作为 `IP-CIDR` 的可选参数接受，但本项目不会触发供其抑制的 DNS 路由查询。
+- `SRC-IP-CIDR` 与 `SRC-PORT` 检查接入 socket 提供的客户端 peer IP 和端口。入站仍限制在 loopback，因此来源网段当前只代表 loopback 客户端地址；本项目也仅接受 TCP CONNECT。
 - `DST-PORT` 目前只接受单值或单个 `-` 区间，不承诺上游语法中的所有端口集合/表达式形式。
 - 没有规则时，或列表未写 `MATCH` 时，本项目会追加 `MATCH,DIRECT`。这是本项目的 fallback 约定，不代表完整 Mihomo 的默认值。
 - 顶层只识别 `listen`、`connect_timeout_ms`、`max_connections`、`rules`、`proxies`、`authentication`、`skip-auth-prefixes`。`mixed-port`、`proxy-groups`、`rule-providers`、完整 DNS 配置等仍会失败。
@@ -45,7 +48,7 @@
 
 ## 官方参考
 
-- [Mihomo 官方 Routing Rules 文档](https://wiki.metacubex.one/en/config/rules/)：规则顺序和规则类型参考；官方将 `DOMAIN-KEYWORD` 定义为按域名关键词匹配，并说明 `DOMAIN-WILDCARD` 只支持 `*` 与 `?`（分别匹配零或多个字符、恰好一个字符）。
+- [Mihomo 官方 Routing Rules 文档](https://wiki.metacubex.one/en/config/rules/)：规则顺序和规则类型参考；官方将 `DOMAIN-KEYWORD` 定义为按域名关键词匹配、`SRC-IP-CIDR` 定义为匹配来源地址范围、`SRC-PORT` 定义为匹配来源端口，并说明 `DOMAIN-WILDCARD` 只支持 `*` 与 `?`（分别匹配零或多个字符、恰好一个字符）。
 - [Mihomo 官方 Proxy 配置文档](https://wiki.metacubex.one/en/config/proxies/) 与[配置语法手册](https://wiki.metacubex.one/en/handbook/syntax/)：上游出站配置参考；本项目使用不同 YAML 子集，不代表相同语义或完整支持。
 - [Mihomo 官方全局配置](https://wiki.metacubex.one/en/config/general/)：`authentication` 与 `skip-auth-prefixes` 参考；本项目只支持全局认证列表及来源 CIDR 豁免的 SOCKS5 子集。
 - [Mihomo 官方 SOCKS 入站文档](https://wiki.metacubex.one/en/config/inbound/listeners/socks/)：监听器级 `users` 覆盖语义参考，当前未实现。

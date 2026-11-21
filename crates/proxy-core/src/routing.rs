@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use thiserror::Error;
 
@@ -39,6 +39,8 @@ enum Matcher {
     DomainKeyword(String),
     DomainWildcard(String),
     IpCidr(Cidr),
+    SourceIpCidr(Cidr),
+    SourcePort(PortMatcher),
     DstPort(PortMatcher),
     Any,
 }
@@ -160,6 +162,15 @@ impl RuleSet {
                     let cidr = Cidr::parse(fields[1]).ok_or(RuleError::InvalidCidr { index })?;
                     (Matcher::IpCidr(cidr), fields[2])
                 }
+                "SRC-IP-CIDR" if fields.len() == 3 => {
+                    let cidr = Cidr::parse(fields[1]).ok_or(RuleError::InvalidCidr { index })?;
+                    (Matcher::SourceIpCidr(cidr), fields[2])
+                }
+                "SRC-PORT" if fields.len() == 3 => {
+                    let port =
+                        PortMatcher::parse(fields[1]).ok_or(RuleError::InvalidPort { index })?;
+                    (Matcher::SourcePort(port), fields[2])
+                }
                 "DST-PORT" if fields.len() == 3 => {
                     let port =
                         PortMatcher::parse(fields[1]).ok_or(RuleError::InvalidPort { index })?;
@@ -167,7 +178,7 @@ impl RuleSet {
                 }
                 "MATCH" if fields.len() == 2 => (Matcher::Any, fields[1]),
                 "DOMAIN" | "DOMAIN-SUFFIX" | "DOMAIN-KEYWORD" | "DOMAIN-WILDCARD" | "IP-CIDR"
-                | "IP-CIDR6" | "DST-PORT" | "MATCH" => {
+                | "IP-CIDR6" | "SRC-IP-CIDR" | "SRC-PORT" | "DST-PORT" | "MATCH" => {
                     return Err(RuleError::InvalidSyntax { index });
                 }
                 other => {
@@ -203,9 +214,18 @@ impl RuleSet {
 
     /// Evaluate rules in source order; the first matching rule wins.
     pub fn route(&self, target: &RequestTarget) -> RouteAction {
+        self.route_with_source(target, None)
+    }
+
+    /// Evaluate rules with the source address of the inbound connection when available.
+    pub(crate) fn route_with_source(
+        &self,
+        target: &RequestTarget,
+        source: Option<SocketAddr>,
+    ) -> RouteAction {
         self.rules
             .iter()
-            .find(|rule| rule.matches(target))
+            .find(|rule| rule.matches(target, source))
             .map(|rule| rule.action.clone())
             .unwrap_or(RouteAction::Direct)
     }
@@ -216,7 +236,7 @@ impl RuleSet {
 }
 
 impl RoutingRule {
-    fn matches(&self, target: &RequestTarget) -> bool {
+    fn matches(&self, target: &RequestTarget, source: Option<SocketAddr>) -> bool {
         match &self.matcher {
             Matcher::DomainExact(expected) => match &target.host {
                 TargetHost::Domain(domain) => normalize_domain(domain).as_deref() == Some(expected),
@@ -242,6 +262,8 @@ impl RoutingRule {
                 TargetHost::Ip(ip) => cidr.contains(ip),
                 TargetHost::Domain(_) => false,
             },
+            Matcher::SourceIpCidr(cidr) => source.is_some_and(|peer| cidr.contains(peer.ip())),
+            Matcher::SourcePort(port) => source.is_some_and(|peer| port.contains(peer.port())),
             Matcher::DstPort(port) => port.contains(target.port),
             Matcher::Any => true,
         }
@@ -498,6 +520,45 @@ mod tests {
     }
 
     #[test]
+    fn source_ip_cidr_matches_only_the_supplied_peer_address() {
+        let rules = rule_set(&[
+            "SRC-IP-CIDR,192.0.2.0/24,REJECT",
+            "SRC-IP-CIDR,2001:db8::/32,REJECT",
+            "MATCH,DIRECT",
+        ]);
+        let target = domain_target("example.com", 443);
+        assert_eq!(
+            rules.route_with_source(&target, Some("192.0.2.44:41234".parse().unwrap())),
+            RouteAction::Reject
+        );
+        assert_eq!(
+            rules.route_with_source(&target, Some("[2001:db8::44]:41234".parse().unwrap())),
+            RouteAction::Reject
+        );
+        assert_eq!(
+            rules.route_with_source(&target, Some("192.0.3.1:41234".parse().unwrap())),
+            RouteAction::Direct
+        );
+        assert_eq!(rules.route_with_source(&target, None), RouteAction::Direct);
+        assert_eq!(rules.route(&target), RouteAction::Direct);
+    }
+
+    #[test]
+    fn source_port_matches_single_ports_and_inclusive_ranges() {
+        let rules = rule_set(&["SRC-PORT,40000-40010,REJECT", "MATCH,DIRECT"]);
+        let target = domain_target("example.com", 443);
+        assert_eq!(
+            rules.route_with_source(&target, Some("127.0.0.1:40005".parse().unwrap())),
+            RouteAction::Reject
+        );
+        assert_eq!(
+            rules.route_with_source(&target, Some("127.0.0.1:40011".parse().unwrap())),
+            RouteAction::Direct
+        );
+        assert_eq!(rules.route_with_source(&target, None), RouteAction::Direct);
+    }
+
+    #[test]
     fn domain_matching_normalizes_ascii_case_and_terminal_root_dot() {
         let rules = rule_set(&["DOMAIN,example.com,REJECT", "MATCH,DIRECT"]);
         assert_eq!(
@@ -600,6 +661,10 @@ mod tests {
     fn rejects_invalid_cidr_domain_and_port_range() {
         assert!(matches!(
             RuleSet::parse(&["IP-CIDR,192.0.2.1/33,REJECT".to_owned()]),
+            Err(RuleError::InvalidCidr { .. })
+        ));
+        assert!(matches!(
+            RuleSet::parse(&["SRC-IP-CIDR,192.0.2.1/33,REJECT".to_owned()]),
             Err(RuleError::InvalidCidr { .. })
         ));
         assert!(matches!(

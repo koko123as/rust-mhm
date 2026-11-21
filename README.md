@@ -6,7 +6,7 @@
 
 - SOCKS5 TCP `CONNECT` 入站，支持 IPv4、IPv6 与域名目标；默认无认证，可用 `authentication` 列表启用 RFC 1929 用户名/密码认证，并可用 `skip-auth-prefixes` CIDR 允许指定来源免认证。
 - TCP 出站支持 `DIRECT`、HTTP `CONNECT`、SOCKS5；HTTP 与 SOCKS5 出站可选用户名/密码认证。
-- 有序首匹配规则支持 `DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`DOMAIN-WILDCARD`、`IP-CIDR`/`IP-CIDR6`、`DST-PORT`、`MATCH`；动作可为 `DIRECT`、`REJECT` 或配置中声明的代理名称。
+- 有序首匹配规则支持 `DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`DOMAIN-WILDCARD`、`IP-CIDR`/`IP-CIDR6`、`SRC-IP-CIDR`、`SRC-PORT`、`DST-PORT`、`MATCH`；动作可为 `DIRECT`、`REJECT` 或配置中声明的代理名称。
 - `REJECT` 在拨号前返回 SOCKS5 connection-not-allowed；代理握手与连接共用配置的出站超时。
 - 默认监听 `127.0.0.1:1080`，拒绝非 loopback 监听；连接并发有界。
 - 未知 YAML 字段、代理类型、规则类型、动作、重复代理名和未配置的代理引用均显式报错。

@@ -75,7 +75,7 @@ pub async fn run(config: Config) -> Result<(), ServerError> {
                         let skip_auth_prefixes = Arc::clone(&skip_auth_prefixes);
                         tasks.spawn(async move {
                             let _permit = permit;
-                            handle_connection_with_rules(stream, connect_timeout, routing, outbounds, authentication, skip_auth_prefixes, peer.ip()).await
+                            handle_connection_with_rules(stream, connect_timeout, routing, outbounds, authentication, skip_auth_prefixes, peer).await
                         });
                     }
                     Err(_) => {
@@ -107,7 +107,7 @@ pub async fn run(config: Config) -> Result<(), ServerError> {
 /// Handle one SOCKS5 TCP stream with the default direct-only routing table.
 /// Exposed for local integration tests and embedding.
 pub async fn handle_connection(client: TcpStream, connect_timeout: Duration) -> io::Result<()> {
-    let peer_ip = client.peer_addr()?.ip();
+    let peer = client.peer_addr()?;
     handle_connection_with_rules(
         client,
         connect_timeout,
@@ -115,7 +115,7 @@ pub async fn handle_connection(client: TcpStream, connect_timeout: Duration) -> 
         Arc::new(Vec::new()),
         Arc::new(Vec::new()),
         Arc::new(Vec::new()),
-        peer_ip,
+        peer,
     )
     .await
 }
@@ -127,12 +127,12 @@ async fn handle_connection_with_rules(
     outbounds: Arc<Vec<ProxyOutbound>>,
     authentication: Arc<Vec<(String, String)>>,
     skip_auth_prefixes: Arc<Vec<AuthSkipPrefix>>,
-    peer_ip: IpAddr,
+    peer: SocketAddr,
 ) -> io::Result<()> {
     let require_authentication = !authentication.is_empty()
         && !skip_auth_prefixes
             .iter()
-            .any(|prefix| prefix.contains(peer_ip));
+            .any(|prefix| prefix.contains(peer.ip()));
     let target = match timeout(
         HANDSHAKE_TIMEOUT,
         negotiate(&mut client, &authentication, require_authentication),
@@ -149,7 +149,7 @@ async fn handle_connection_with_rules(
         Ok(Err(ProtocolError::Io(error))) => return Err(error),
     };
 
-    let action = routing.route(&target);
+    let action = routing.route_with_source(&target, Some(peer));
     if action == RouteAction::Reject {
         send_reply(&mut client, REP_CONNECTION_NOT_ALLOWED, None).await?;
         return Ok(());
@@ -411,7 +411,7 @@ mod tests {
                 outbounds,
                 authentication,
                 skip_auth_prefixes,
-                peer.ip(),
+                peer,
             )
             .await
         });
@@ -622,6 +622,38 @@ mod tests {
     #[tokio::test]
     async fn reject_rule_sends_connection_not_allowed_without_dialing() {
         let rules = RuleSet::parse(&["DST-PORT,80,REJECT".to_owned()]).unwrap();
+        let (mut client, server_task) = start_one_connection_with_rules(rules).await;
+        negotiate_no_auth(&mut client).await;
+        client
+            .write_all(&[SOCKS_VERSION, CMD_CONNECT, 0, 0x01, 127, 0, 0, 1, 0, 80])
+            .await
+            .unwrap();
+        assert_eq!(
+            read_reply(&mut client).await,
+            (SOCKS_VERSION, REP_CONNECTION_NOT_ALLOWED)
+        );
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn source_ip_cidr_rule_uses_inbound_peer_address() {
+        let rules = RuleSet::parse(&["SRC-IP-CIDR,127.0.0.1/32,REJECT".to_owned()]).unwrap();
+        let (mut client, server_task) = start_one_connection_with_rules(rules).await;
+        negotiate_no_auth(&mut client).await;
+        client
+            .write_all(&[SOCKS_VERSION, CMD_CONNECT, 0, 0x01, 127, 0, 0, 1, 0, 80])
+            .await
+            .unwrap();
+        assert_eq!(
+            read_reply(&mut client).await,
+            (SOCKS_VERSION, REP_CONNECTION_NOT_ALLOWED)
+        );
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn source_port_rule_uses_inbound_peer_port() {
+        let rules = RuleSet::parse(&["SRC-PORT,1-65535,REJECT".to_owned()]).unwrap();
         let (mut client, server_task) = start_one_connection_with_rules(rules).await;
         negotiate_no_auth(&mut client).await;
         client
