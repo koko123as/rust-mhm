@@ -101,7 +101,7 @@ enum Matcher {
     DomainKeyword(String),
     DomainWildcard(String),
     DomainRegex(Regex),
-    IpCidr(Cidr),
+    IpCidr { cidr: Cidr, no_resolve: bool },
     SourceIpCidr(Cidr),
     SourcePort(PortMatcher),
     DstPort(PortMatcher),
@@ -314,7 +314,13 @@ impl RuleSet {
                         || (fields.len() == 4 && fields[3].eq_ignore_ascii_case("no-resolve")) =>
                 {
                     let cidr = Cidr::parse(fields[1]).ok_or(RuleError::InvalidCidr { index })?;
-                    (Matcher::IpCidr(cidr), fields[2])
+                    (
+                        Matcher::IpCidr {
+                            cidr,
+                            no_resolve: fields.len() == 4,
+                        },
+                        fields[2],
+                    )
                 }
                 "SRC-IP-CIDR" if fields.len() == 3 => {
                     let cidr = Cidr::parse(fields[1]).ok_or(RuleError::InvalidCidr { index })?;
@@ -382,11 +388,45 @@ impl RuleSet {
         target: &RequestTarget,
         source: Option<SocketAddr>,
     ) -> RouteAction {
+        self.route_with_resolved_ips(target, source, &[])
+    }
+
+    /// Evaluate rules against an already-resolved set of IP addresses for a domain target.
+    pub(crate) fn route_with_resolved_ips(
+        &self,
+        target: &RequestTarget,
+        source: Option<SocketAddr>,
+        resolved_ips: &[IpAddr],
+    ) -> RouteAction {
         self.rules
             .iter()
-            .find(|rule| rule.matches(target, source))
+            .find(|rule| rule.matches(target, source, resolved_ips))
             .map(|rule| self.resolve_action(&rule.action))
             .unwrap_or(RouteAction::Direct)
+    }
+
+    /// Whether ordered TCP rule evaluation reaches a CIDR rule that needs a domain lookup.
+    pub(crate) fn needs_domain_resolution(
+        &self,
+        target: &RequestTarget,
+        source: Option<SocketAddr>,
+    ) -> bool {
+        if !matches!(&target.host, TargetHost::Domain(_)) {
+            return false;
+        }
+        for rule in &self.rules {
+            match &rule.matcher {
+                Matcher::IpCidr {
+                    no_resolve: true, ..
+                } => continue,
+                Matcher::IpCidr {
+                    no_resolve: false, ..
+                } => return true,
+                _ if rule.matches(target, source, &[]) => return false,
+                _ => {}
+            }
+        }
+        false
     }
 
     /// Select a configured member for a group in this ruleset.
@@ -507,7 +547,12 @@ impl RuleSet {
 }
 
 impl RoutingRule {
-    fn matches(&self, target: &RequestTarget, source: Option<SocketAddr>) -> bool {
+    fn matches(
+        &self,
+        target: &RequestTarget,
+        source: Option<SocketAddr>,
+        resolved_ips: &[IpAddr],
+    ) -> bool {
         match &self.matcher {
             Matcher::DomainExact(expected) => match &target.host {
                 TargetHost::Domain(domain) => normalize_domain(domain).as_deref() == Some(expected),
@@ -535,9 +580,10 @@ impl RoutingRule {
                 }
                 TargetHost::Ip(_) => false,
             },
-            Matcher::IpCidr(cidr) => match target.host {
-                TargetHost::Ip(ip) => cidr.contains(ip),
-                TargetHost::Domain(_) => false,
+            Matcher::IpCidr { cidr, no_resolve } => match &target.host {
+                TargetHost::Ip(ip) => cidr.contains(*ip),
+                TargetHost::Domain(_) if *no_resolve => false,
+                TargetHost::Domain(_) => resolved_ips.iter().any(|ip| cidr.contains(*ip)),
             },
             Matcher::SourceIpCidr(cidr) => source.is_some_and(|peer| cidr.contains(peer.ip())),
             Matcher::SourcePort(port) => source.is_some_and(|peer| port.contains(peer.port())),
@@ -954,6 +1000,71 @@ mod tests {
         assert_eq!(
             all_ipv6.route(&ip_target("2001:db8::2", 443)),
             RouteAction::Reject
+        );
+    }
+
+    #[test]
+    fn domain_cidr_resolution_respects_rule_order_and_no_resolve() {
+        let target = domain_target("example.com", 443);
+        let domain_first = rule_set(&[
+            "DOMAIN,example.com,REJECT",
+            "IP-CIDR,127.0.0.0/8,REJECT",
+            "MATCH,DIRECT",
+        ]);
+        assert!(!domain_first.needs_domain_resolution(&target, None));
+        assert_eq!(domain_first.route(&target), RouteAction::Reject);
+
+        let no_resolve = rule_set(&["IP-CIDR,127.0.0.0/8,REJECT,no-resolve", "MATCH,DIRECT"]);
+        assert!(!no_resolve.needs_domain_resolution(&target, None));
+        assert_eq!(
+            no_resolve.route_with_resolved_ips(&target, None, &["127.0.0.1".parse().unwrap()],),
+            RouteAction::Direct
+        );
+
+        let ordinary_cidr = rule_set(&["IP-CIDR,127.0.0.0/8,REJECT", "MATCH,DIRECT"]);
+        assert!(ordinary_cidr.needs_domain_resolution(&target, None));
+    }
+
+    #[test]
+    fn domain_cidr_matches_any_resolved_ip_and_preserves_ordered_fallback() {
+        let target = domain_target("example.com", 443);
+        let rules = rule_set(&[
+            "IP-CIDR,10.0.0.0/8,REJECT",
+            "DOMAIN-SUFFIX,example.com,DIRECT",
+            "MATCH,REJECT",
+        ]);
+        assert_eq!(
+            rules.route_with_resolved_ips(
+                &target,
+                None,
+                &["2001:db8::1".parse().unwrap(), "10.2.3.4".parse().unwrap(),],
+            ),
+            RouteAction::Reject
+        );
+        assert_eq!(
+            rules.route_with_resolved_ips(&target, None, &["192.0.2.1".parse().unwrap()],),
+            RouteAction::Direct
+        );
+        assert_eq!(
+            rules.route_with_resolved_ips(
+                &domain_target("elsewhere.invalid", 443),
+                None,
+                &["192.0.2.1".parse().unwrap()],
+            ),
+            RouteAction::Reject
+        );
+    }
+
+    #[test]
+    fn ip_cidr_no_resolve_does_not_change_literal_ip_matching() {
+        let rules = rule_set(&["IP-CIDR6,2001:db8::/32,REJECT,no-resolve", "MATCH,DIRECT"]);
+        assert_eq!(
+            rules.route(&ip_target("2001:db8::44", 443)),
+            RouteAction::Reject
+        );
+        assert_eq!(
+            rules.route(&ip_target("192.0.2.1", 443)),
+            RouteAction::Direct
         );
     }
 

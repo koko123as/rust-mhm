@@ -11,7 +11,7 @@
 | `DOMAIN-KEYWORD` | 有限支持 | 在规范化后的 ASCII 域名中做大小写不敏感的子串匹配；不匹配 IP 字面量，也不要求标签边界。 |
 | `DOMAIN-WILDCARD` | 有限支持 | 在规范化 ASCII 域名上匹配完整模式；只支持 `*`（零个或多个字符）和 `?`（单个字符）。 |
 | `DOMAIN-REGEX` | 有限支持 | 规则加载时用 Rust `regex` crate 编译表达式，对规范化后的 ASCII 域名执行搜索匹配；表达式语法和上游引擎不保证等价。 |
-| `IP-CIDR` / `IP-CIDR6` | 支持 | 对 SOCKS5 请求给出的字面 IP 做同地址族 CIDR 前缀比较；不会为域名查询 DNS。 |
+| `IP-CIDR` / `IP-CIDR6` | 有限支持 | 字面 IP 按同地址族匹配；TCP 域名请求只有在有序规则实际到达普通 CIDR 规则时才使用系统解析结果，任一有界答案命中即匹配。`no-resolve` 跳过域名查询；UDP 路径不为规则解析域名。 |
 | `SRC-IP-CIDR` | 有限支持 | 对已接受 SOCKS5 TCP 连接的客户端 peer IP 做 CIDR 匹配；不匹配源端口或来源地理信息。 |
 | `SRC-PORT` | 有限支持 | 匹配 TCP 客户端 peer 端口，接受单端口或闭区间格式。 |
 | `DST-PORT` | 有限支持 | 匹配一个端口或一个闭区间，例如 `443` 或 `8000-8100`。 |
@@ -53,7 +53,7 @@
 - `DOMAIN`/`DOMAIN-SUFFIX` 只接收 ASCII DNS A-label（国际化域名需预先转为 `xn--...`）；匹配时转小写，并接受/去掉一个末尾根点。`DOMAIN-KEYWORD` 同样只在该规范化后的 ASCII 域名中做任意位置子串匹配。`DOMAIN-WILDCARD` 只接受 ASCII 字母数字、点、连字符、`*` 与 `?`；模式在完整域名上匹配。`DOMAIN-REGEX` 也在规范化后的域名上做搜索匹配（目标域名大小写不影响匹配）；正则表达式本身默认区分大小写，需要时可用 `(?i)` 标志。它采用 Rust `regex` crate 语法，表达式长度上限为 4096 字节，不承诺与 Mihomo 的 regex 引擎完全兼容。这些正规化细节是本项目选择。
 - HTTP CONNECT 的域名目标会做 ASCII DNS 格式校验后再写入 authority；这限制可表达的域名，但避免 HTTP 请求行/头注入。
 - SOCKS5 代理会在连接请求中传递域名地址；代理端通常负责目标解析。DIRECT 域名目标仍使用 Tokio/系统解析路径。
-- IP-CIDR 只检查请求中提供的字面地址。规则不执行 DNS；`no-resolve` 可作为 `IP-CIDR` 的可选参数接受，但本项目不会触发供其抑制的 DNS 路由查询。
+- TCP 的 `IP-CIDR`/`IP-CIDR6` 域名判定仅在有序路由评估到达普通 CIDR 规则时触发一次 Tokio/系统解析；最多保留 16 个去重后的 IP 答案，并在配置的 `connect_timeout_ms` 总时限内完成路由和连接。任一 IPv4/IPv6 答案命中 CIDR 即命中；`no-resolve` 对域名目标跳过该规则且不触发 CIDR 路由查询，但若后续选择 DIRECT，建立连接仍需解析目标域名。DIRECT 会复用已执行的 CIDR 查询地址快照；代理动作仍把原始域名交给上游，不会以本地答案替换。解析失败、无答案或答案超过上限都会失败关闭，不回退为 DIRECT。字面 IP 不解析，UDP 路由仍不为 IP-CIDR 查询 DNS。这里没有 DNS 配置策略、缓存、hosts、fake-IP 或 Mihomo DNS 兼容承诺。
 - `SRC-IP-CIDR` 与 `SRC-PORT` 检查 SOCKS5 TCP 控制连接提供的客户端 peer IP 和端口；UDP 数据报沿用该控制 peer 作为来源规则元数据。入站仍限制在 loopback，因此来源网段当前只代表 loopback 客户端地址。
 - `DST-PORT` 目前只接受单值或单个 `-` 区间，不承诺上游语法中的所有端口集合/表达式形式。
 - 没有规则时，或列表未写 `MATCH` 时，本项目会追加 `MATCH,DIRECT`。这是本项目的 fallback 约定，不代表完整 Mihomo 的默认值。

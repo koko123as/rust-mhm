@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -40,6 +40,7 @@ const REP_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_TRACKED_UDP_DESTINATIONS: usize = 1024;
 const MAX_ENCAPSULATED_UDP_PACKET_SIZE: usize = 65_507;
+const MAX_DOMAIN_ROUTE_ADDRESSES: usize = 16;
 
 #[derive(Clone, Copy)]
 struct ConnectionTimeouts {
@@ -65,6 +66,12 @@ struct SocksRequest {
 struct UdpDatagram<'a> {
     target: RequestTarget,
     payload: &'a [u8],
+}
+
+#[derive(Debug)]
+struct RouteDecision {
+    action: RouteAction,
+    resolved_ips: Option<Vec<IpAddr>>,
 }
 
 #[derive(Debug, Error)]
@@ -329,15 +336,15 @@ async fn handle_connection_with_rules(
     let target = request.target;
 
     let routing_table = Arc::clone(&routing.borrow());
-    let action = routing_table.route_with_source(&target, Some(peer));
-    if action == RouteAction::Reject {
-        send_reply(&mut client, REP_CONNECTION_NOT_ALLOWED, None).await?;
-        return Ok(());
-    }
-
     let connect_result = timeout(timeouts.connect, async {
+        let RouteDecision {
+            action,
+            resolved_ips,
+        } = route_tcp_target(&routing_table, &target, Some(peer)).await?;
         match action {
-            RouteAction::Direct => connect_target(&target).await,
+            RouteAction::Direct => connect_target(&target, resolved_ips.as_deref())
+                .await
+                .map(Some),
             RouteAction::Proxy(name) => {
                 let proxy = outbounds
                     .iter()
@@ -345,14 +352,18 @@ async fn handle_connection_with_rules(
                     .ok_or_else(|| {
                         io::Error::new(io::ErrorKind::InvalidInput, "configured proxy not found")
                     })?;
-                proxy.connect(&target).await
+                proxy.connect(&target).await.map(Some)
             }
-            RouteAction::Reject => unreachable!("REJECT returns before dialing"),
+            RouteAction::Reject => Ok(None),
         }
     })
     .await;
     let mut upstream = match connect_result {
-        Ok(Ok(upstream)) => upstream,
+        Ok(Ok(None)) => {
+            send_reply(&mut client, REP_CONNECTION_NOT_ALLOWED, None).await?;
+            return Ok(());
+        }
+        Ok(Ok(Some(upstream))) => upstream,
         Ok(Err(error)) => {
             let _ = send_reply(&mut client, reply_for_io_error(&error), None).await;
             return Err(error);
@@ -903,11 +914,123 @@ async fn relay_udp_response(
     Ok(())
 }
 
-async fn connect_target(target: &RequestTarget) -> io::Result<TcpStream> {
-    match &target.host {
-        TargetHost::Ip(address) => TcpStream::connect(SocketAddr::new(*address, target.port)).await,
-        TargetHost::Domain(domain) => TcpStream::connect((domain.as_str(), target.port)).await,
+async fn route_tcp_target(
+    rules: &RuleSet,
+    target: &RequestTarget,
+    source: Option<SocketAddr>,
+) -> io::Result<RouteDecision> {
+    route_tcp_target_with_resolver(rules, target, source, |domain, port| async move {
+        resolve_domain_ips(&domain, port).await
+    })
+    .await
+}
+
+async fn route_tcp_target_with_resolver<F, Fut>(
+    rules: &RuleSet,
+    target: &RequestTarget,
+    source: Option<SocketAddr>,
+    resolver: F,
+) -> io::Result<RouteDecision>
+where
+    F: FnOnce(String, u16) -> Fut,
+    Fut: Future<Output = io::Result<Vec<IpAddr>>>,
+{
+    if !rules.needs_domain_resolution(target, source) {
+        return Ok(RouteDecision {
+            action: rules.route_with_source(target, source),
+            resolved_ips: None,
+        });
     }
+
+    let TargetHost::Domain(domain) = &target.host else {
+        unreachable!("only domain targets can require a DNS route lookup");
+    };
+    let resolved_ips = resolver(domain.clone(), target.port)
+        .await
+        .map_err(map_domain_resolution_error)?;
+    let resolved_ips = bound_domain_answers(resolved_ips)?;
+    let action = rules.route_with_resolved_ips(target, source, &resolved_ips);
+    Ok(RouteDecision {
+        resolved_ips: (action == RouteAction::Direct).then_some(resolved_ips),
+        action,
+    })
+}
+
+async fn resolve_domain_ips(domain: &str, port: u16) -> io::Result<Vec<IpAddr>> {
+    let addresses = tokio::net::lookup_host((domain, port))
+        .await
+        .map_err(map_domain_resolution_error)?;
+    bound_domain_answers(addresses.map(|address| address.ip()))
+}
+
+fn bound_domain_answers(addresses: impl IntoIterator<Item = IpAddr>) -> io::Result<Vec<IpAddr>> {
+    let mut unique = HashSet::new();
+    let mut result = Vec::new();
+    for address in addresses {
+        if unique.insert(address) {
+            if result.len() == MAX_DOMAIN_ROUTE_ADDRESSES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "domain resolved to too many addresses",
+                ));
+            }
+            result.push(address);
+        }
+    }
+    if result.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::HostUnreachable,
+            "domain resolved to no IP addresses",
+        ));
+    }
+    Ok(result)
+}
+
+fn map_domain_resolution_error(error: io::Error) -> io::Error {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::HostUnreachable
+    ) {
+        error
+    } else {
+        io::Error::new(
+            io::ErrorKind::HostUnreachable,
+            format!("domain resolution failed: {error}"),
+        )
+    }
+}
+
+async fn connect_target(
+    target: &RequestTarget,
+    resolved_ips: Option<&[IpAddr]>,
+) -> io::Result<TcpStream> {
+    match (&target.host, resolved_ips) {
+        (TargetHost::Ip(address), _) => {
+            TcpStream::connect(SocketAddr::new(*address, target.port)).await
+        }
+        (TargetHost::Domain(_), Some(addresses)) => {
+            connect_resolved_addresses(addresses, target.port).await
+        }
+        (TargetHost::Domain(domain), None) => {
+            TcpStream::connect((domain.as_str(), target.port)).await
+        }
+    }
+}
+
+async fn connect_resolved_addresses(addresses: &[IpAddr], port: u16) -> io::Result<TcpStream> {
+    let mut last_error = None;
+    for address in addresses {
+        match TcpStream::connect(SocketAddr::new(*address, port)).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::HostUnreachable,
+            "no target addresses to connect",
+        )
+    }))
 }
 
 async fn send_reply<S>(
@@ -1031,6 +1154,23 @@ mod tests {
         let mut response = [0u8; 2];
         client.read_exact(&mut response).await.unwrap();
         assert_eq!(response, [SOCKS_VERSION, METHOD_NO_AUTH]);
+    }
+
+    async fn send_domain_connect(client: &mut TcpStream, domain: &str, port: u16) {
+        let domain_bytes = domain.as_bytes();
+        assert!(domain_bytes.len() <= u8::MAX as usize);
+        client
+            .write_all(&[
+                SOCKS_VERSION,
+                CMD_CONNECT,
+                0,
+                0x03,
+                domain_bytes.len() as u8,
+            ])
+            .await
+            .unwrap();
+        client.write_all(domain_bytes).await.unwrap();
+        client.write_all(&port.to_be_bytes()).await.unwrap();
     }
 
     async fn read_reply(client: &mut TcpStream) -> (u8, u8) {
@@ -2339,6 +2479,238 @@ mod tests {
             (SOCKS_VERSION, REP_CONNECTION_NOT_ALLOWED)
         );
         server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_domain_route_resolves_only_when_needed_and_only_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let target = RequestTarget {
+            host: TargetHost::Domain("early.example".into()),
+            port: 443,
+        };
+        let earlier_domain_rule = RuleSet::parse(&[
+            "DOMAIN,early.example,REJECT".to_owned(),
+            "IP-CIDR,127.0.0.0/8,REJECT".to_owned(),
+            "MATCH,DIRECT".to_owned(),
+        ])
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted_calls = Arc::clone(&calls);
+        let decision = route_tcp_target_with_resolver(
+            &earlier_domain_rule,
+            &target,
+            None,
+            move |_, _| async move {
+                counted_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(decision.action, RouteAction::Reject);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let no_resolve_rule = RuleSet::parse(&[
+            "IP-CIDR,127.0.0.0/8,REJECT,no-resolve".to_owned(),
+            "MATCH,DIRECT".to_owned(),
+        ])
+        .unwrap();
+        let decision =
+            route_tcp_target_with_resolver(&no_resolve_rule, &target, None, |_, _| async {
+                panic!("no-resolve must not call the resolver")
+            })
+            .await
+            .unwrap();
+        assert_eq!(decision.action, RouteAction::Direct);
+        assert!(decision.resolved_ips.is_none());
+
+        let cidr_rule = RuleSet::parse(&[
+            "IP-CIDR,127.0.0.0/8,DIRECT".to_owned(),
+            "MATCH,REJECT".to_owned(),
+        ])
+        .unwrap();
+        let counted_calls = Arc::clone(&calls);
+        let decision = route_tcp_target_with_resolver(
+            &cidr_rule,
+            &target,
+            None,
+            move |domain, port| async move {
+                assert_eq!(domain, "early.example");
+                assert_eq!(port, 443);
+                counted_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![
+                    "::1".parse().unwrap(),
+                    "127.0.0.1".parse().unwrap(),
+                    "127.0.0.1".parse().unwrap(),
+                ])
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(decision.action, RouteAction::Direct);
+        assert_eq!(decision.resolved_ips.unwrap().len(), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn tcp_domain_route_fails_closed_on_dns_errors_empty_or_excess_answers() {
+        let target = RequestTarget {
+            host: TargetHost::Domain("unresolved.example".into()),
+            port: 443,
+        };
+        let rules = RuleSet::parse(&[
+            "IP-CIDR,192.0.2.0/24,REJECT".to_owned(),
+            "MATCH,DIRECT".to_owned(),
+        ])
+        .unwrap();
+
+        let empty =
+            route_tcp_target_with_resolver(&rules, &target, None, |_, _| async { Ok(Vec::new()) })
+                .await
+                .unwrap_err();
+        assert_eq!(empty.kind(), io::ErrorKind::HostUnreachable);
+        assert_eq!(reply_for_io_error(&empty), REP_HOST_UNREACHABLE);
+
+        let lookup_error = route_tcp_target_with_resolver(&rules, &target, None, |_, _| async {
+            Err(io::Error::other("fake resolver failure"))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(lookup_error.kind(), io::ErrorKind::HostUnreachable);
+
+        let too_many = (0..=MAX_DOMAIN_ROUTE_ADDRESSES)
+            .map(|host| IpAddr::V4(Ipv4Addr::new(10, 0, 0, host as u8)))
+            .collect::<Vec<_>>();
+        let limit_error =
+            route_tcp_target_with_resolver(&rules, &target, None, |_, _| async { Ok(too_many) })
+                .await
+                .unwrap_err();
+        assert_eq!(limit_error.kind(), io::ErrorKind::InvalidData);
+
+        let timeout_result = timeout(
+            Duration::from_millis(20),
+            route_tcp_target_with_resolver(&rules, &target, None, |_, _| async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Ok(vec!["192.0.2.1".parse().unwrap()])
+            }),
+        )
+        .await;
+        assert!(timeout_result.is_err());
+    }
+
+    #[tokio::test]
+    async fn tcp_domain_ip_cidr_route_reuses_resolution_for_direct_connection() {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target_listener.local_addr().unwrap().port();
+        let target_task = tokio::spawn(async move {
+            let (mut target, _) = target_listener.accept().await.unwrap();
+            let mut payload = [0u8; 4];
+            target.read_exact(&mut payload).await.unwrap();
+            target.write_all(&payload).await.unwrap();
+        });
+        let rules = RuleSet::parse(&[
+            "IP-CIDR,127.0.0.0/8,DIRECT".to_owned(),
+            "MATCH,REJECT".to_owned(),
+        ])
+        .unwrap();
+        let (mut client, server_task) = start_one_connection_with_rules(rules).await;
+        negotiate_no_auth(&mut client).await;
+        send_domain_connect(&mut client, "localhost", target_port).await;
+        assert_eq!(
+            read_reply(&mut client).await,
+            (SOCKS_VERSION, REP_SUCCEEDED)
+        );
+        client.write_all(b"ping").await.unwrap();
+        let mut echoed = [0u8; 4];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"ping");
+        client.shutdown().await.unwrap();
+        server_task.await.unwrap().unwrap();
+        target_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_domain_ip_cidr_rejects_before_dialing() {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target_listener.local_addr().unwrap().port();
+        let rules = RuleSet::parse(&[
+            "IP-CIDR,127.0.0.0/8,REJECT".to_owned(),
+            "MATCH,DIRECT".to_owned(),
+        ])
+        .unwrap();
+        let (mut client, server_task) = start_one_connection_with_rules(rules).await;
+        negotiate_no_auth(&mut client).await;
+        send_domain_connect(&mut client, "localhost", target_port).await;
+        assert_eq!(
+            read_reply(&mut client).await,
+            (SOCKS_VERSION, REP_CONNECTION_NOT_ALLOWED)
+        );
+        assert!(
+            timeout(Duration::from_millis(20), target_listener.accept())
+                .await
+                .is_err()
+        );
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_domain_cidr_proxy_route_keeps_original_domain_for_upstream() {
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            let (mut stream, _) = proxy_listener.accept().await.unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                headers.push(stream.read_u8().await.unwrap());
+            }
+            let headers = String::from_utf8(headers).unwrap();
+            assert!(headers.starts_with("CONNECT localhost:443 HTTP/1.1\r\n"));
+            stream
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+            let mut buffer = [0u8; 128];
+            loop {
+                let count = stream.read(&mut buffer).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                stream.write_all(&buffer[..count]).await.unwrap();
+            }
+        });
+        let proxy = ProxyOutbound {
+            name: "upstream".into(),
+            kind: "http".into(),
+            server: proxy_address.ip().to_string(),
+            port: proxy_address.port(),
+            username: None,
+            password: None,
+        };
+        let names = vec!["upstream".to_owned()];
+        let rules = RuleSet::parse_with_proxies(
+            &[
+                "IP-CIDR,127.0.0.0/8,upstream".to_owned(),
+                "MATCH,REJECT".to_owned(),
+            ],
+            &names,
+        )
+        .unwrap();
+        let (mut client, server_task) =
+            start_one_connection_with_rules_and_outbounds(rules, vec![proxy]).await;
+        negotiate_no_auth(&mut client).await;
+        send_domain_connect(&mut client, "localhost", 443).await;
+        assert_eq!(
+            read_reply(&mut client).await,
+            (SOCKS_VERSION, REP_SUCCEEDED)
+        );
+        client.write_all(b"through-proxy").await.unwrap();
+        let mut echoed = [0u8; 13];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"through-proxy");
+        client.shutdown().await.unwrap();
+        server_task.await.unwrap().unwrap();
+        proxy_task.await.unwrap();
     }
 
     #[tokio::test]

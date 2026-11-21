@@ -48,7 +48,7 @@ UDP `REJECT` 与不支持 UDP 的 HTTP 代理动作都丢弃，不会回退直�
 ## 模块边界
 
 - `rust-mhm-core::config`：严格的本项目 YAML 配置；校验 loopback 地址、连接超时、并发上限、入站用户、代理定义、`select` 组成员/环路及规则引用；每次 `routing_rules()` 为组生成独立的默认选择状态。
-- `rust-mhm-core::routing`：纯决策层；处理 `DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`DOMAIN-WILDCARD`、有限的 `DOMAIN-REGEX`、`IP-CIDR`/`IP-CIDR6`、`SRC-IP-CIDR`、`SRC-PORT`、`DST-PORT`，并按原位置展开 inline classical `RULE-SET`；组名作为符号化动作保留，路由时读取进程内选择状态，公开方法可手动更改/读取成员。
+- `rust-mhm-core::routing`：纯决策层；处理 `DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`DOMAIN-WILDCARD`、有限的 `DOMAIN-REGEX`、`IP-CIDR`/`IP-CIDR6`、`SRC-IP-CIDR`、`SRC-PORT`、`DST-PORT`，并按原位置展开 inline classical `RULE-SET`；按原始顺序使用服务层提供的域名 IP 快照匹配 CIDR，不执行 I/O；组名作为符号化动作保留，路由时读取进程内选择状态，公开方法可手动更改/读取成员。
 - `rust-mhm-core::outbound`：HTTP CONNECT（可选 Basic 认证）、SOCKS5 TCP CONNECT 与 SOCKS5 UDP ASSOCIATE（可选 RFC 1929 用户名/密码认证）；不实现 HTTP UDP 或代理组。
 - `rust-mhm-core::server`：SOCKS5 入站（可选 RFC 1929 认证）、TCP CONNECT 转发、有限 UDP ASSOCIATE 入站、DIRECT/SOCKS5 UDP 逐数据报路由、客户端端点固定、错误映射与连接并发限制。
 - `rust-mhm-core::control`：可选的 loopback 控制 API；Bearer 密钥保护 `GET /proxies`、`GET /proxies/{name}` 和 `PUT /proxies/{name}`，只读/切换 `select` 组；请求体、并发数和处理时限均有上限。
@@ -62,7 +62,7 @@ provider 当前支持 `type: inline`/`file`/`http` 与 `behavior: classical`/`do
 
 SOCKS5 入站仅在配置非空 `authentication` 且 peer 不匹配豁免 CIDR 时要求 RFC 1929 用户名/密码，登录失败即关闭连接；该子协商本身没有加密。HTTP Basic 和 SOCKS5 用户密码在未加密代理链路上均可被观察，因此应限于可信主机/网络。HTTP 出站使用 HTTP/1.x `CONNECT` 并发送目标 authority；SOCKS5 TCP 与 UDP 出站都将域名地址类型交给代理端解析；DIRECT 域名目标仍由 Tokio/系统解析。HTTP 代理仅有 TCP `CONNECT`；SOCKS5 另支持受限 UDP ASSOCIATE。服务级组控制 API 仅绑定 loopback、使用 Bearer 密钥，支持三个组端点但没有 TLS、WebSocket、持久化或完整 Mihomo 控制面能力；手动 `select` 状态也不是完整 Mihomo 配置或语义实现。
 
-规则层不执行 DNS 查询。`IP-CIDR` 只匹配 SOCKS5 请求中给出的字面目标 IP；`SRC-IP-CIDR` 与 `SRC-PORT` 分别匹配接受连接时取得的客户端 peer IP 与来源端口。域名目标不会为了路由先解析。域名规则接受 ASCII DNS A-label（如 `xn--...`），按小写规范化并去掉一个末尾根点；`DOMAIN-REGEX` 使用 Rust `regex` crate 语法，表达式在配置加载时编译。上述均是本项目约定，不是完整上游行为承诺。HTTP CONNECT 的目标域名另作 ASCII DNS 名校验，以避免未经验证的控制字符进入 HTTP 请求头。
+规则匹配器本身不执行 DNS 查询。TCP 域名请求只有在有序评估到普通 `IP-CIDR`/`IP-CIDR6` 时，服务层才调用一次 Tokio/系统解析器；最多允许 16 个去重地址，解析、规则判定与连接共用 `connect_timeout_ms` 时限。任一解析答案命中 CIDR 即触发该规则，`no-resolve` 则跳过域名 CIDR 查询（但 DIRECT 建立连接仍需解析目标）；DIRECT 复用已执行的 CIDR 查询地址快照，代理动作仍将原域名交给上游。解析失败、空答案或超限时失败关闭，不回退 DIRECT。字面 IP 无需解析；UDP 的规则评估不使用该 TCP 解析路径。此切片没有 DNS 策略配置、缓存、hosts 或 fake-IP，也不代表 Mihomo DNS 兼容。`SRC-IP-CIDR` 与 `SRC-PORT` 分别匹配接受连接时取得的客户端 peer IP 与来源端口。域名规则接受 ASCII DNS A-label（如 `xn--...`），按小写规范化并去掉一个末尾根点；`DOMAIN-REGEX` 使用 Rust `regex` crate 语法，表达式在配置加载时编译。HTTP CONNECT 的目标域名另作 ASCII DNS 名校验，以避免未经验证的控制字符进入 HTTP 请求头。
 
 ## 生命周期与资源
 

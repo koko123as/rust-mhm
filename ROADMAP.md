@@ -44,7 +44,8 @@
 
 ## Phase 4 — DNS、UDP 与控制接口
 
-- [ ] 单独设计 DNS 解析策略、缓存和与 IP 规则的交互边界。
+- [x] TCP 域名 `IP-CIDR` 路由垂直切片：按有序规则需要时调用一次系统解析，限制 16 个去重答案并复用 DIRECT 地址；实现 `no-resolve`、失败关闭与 SOCKS 端到端覆盖。此项不含 DNS 策略、缓存或 hosts/fake-IP。
+- [ ] 单独设计通用 DNS 解析策略、缓存和与其余 IP 规则/代理行为的交互边界。
 - [x] SOCKS5 入站 `UDP ASSOCIATE` 的有限切片：控制 TCP 生命周期、loopback relay、IPv4/IPv6/域名目标、逐数据报规则判定与 DIRECT UDP 往返；只接收控制 peer 的来源 IP，固定客户端 UDP 端点；非 DIRECT、畸形与分片数据报均丢弃。
 - [x] 有限 SOCKS5 UDP 代理出站：按数据报策略选择具名 SOCKS5 上游，持有 UDP ASSOCIATE TCP 控制连接，目标域名交给代理解析；队列有界，失败不回退 DIRECT。
 - [ ] HTTP 代理 UDP、UDP 分片、完整 Mihomo UDP 入站配置及与 DNS 策略的交互。

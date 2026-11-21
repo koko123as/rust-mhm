@@ -7,6 +7,7 @@
 - SOCKS5 TCP `CONNECT` 入站，支持 IPv4、IPv6 与域名目标；默认无认证，可用 `authentication` 列表启用 RFC 1929 用户名/密码认证，并可用 `skip-auth-prefixes` CIDR 允许指定来源免认证。
 - TCP 出站支持 `DIRECT`、HTTP `CONNECT`、SOCKS5；HTTP 与 SOCKS5 出站可选用户名/密码认证。
 - 有序首匹配规则支持 `DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`DOMAIN-WILDCARD`、有限的 `DOMAIN-REGEX`、`IP-CIDR`/`IP-CIDR6`、`SRC-IP-CIDR`、`SRC-PORT`、`DST-PORT`、有限的 `RULE-SET` 和 `MATCH`；动作可为 `DIRECT`、`REJECT`、配置中的代理名或代理组名，组动作在路由时按该 `RuleSet` 当前的进程内选择解析。
+- TCP 域名请求只有在有序规则运行到普通 `IP-CIDR`/`IP-CIDR6` 时才查询一次系统解析器，最多接受 16 个去重答案；`no-resolve` 跳过 CIDR 路由查询（但 DIRECT 建立连接仍需解析域名），DIRECT 复用已执行的解析结果，代理动作保留原始域名交给上游。解析失败、无答案或答案超限均失败关闭。此能力不是通用 DNS 子系统，UDP 路径不改变。
 - `REJECT` 在拨号前返回 SOCKS5 connection-not-allowed；代理握手与连接共用配置的出站超时。
 - 默认监听 `127.0.0.1:1080`，拒绝非 loopback 监听；连接并发有界。
 - 严格配置支持 `type: select` 代理组子集：组可嵌套引用代理组；`default-selected` 未填写或不是成员时取首成员。核心库提供手动选择/读取状态；可选 loopback 控制 API 可读取并切换运行中服务的组成员，要求 Bearer 密钥。provider 刷新时仍有效的手动选择会保留。
@@ -91,7 +92,7 @@ HTTP 响应必须成功且不超过 4 MiB；完整请求及流式下载受 `conn
 
 SOCKS5 入站现支持有限的 RFC 1928 `UDP ASSOCIATE`：为每个已认证的 TCP 控制连接建立 loopback UDP relay，控制连接关闭时结束关联；仅允许来自控制连接客户端 IP 的数据报，并在首个合法数据报后固定客户端 UDP 端点。IPv4、IPv6 和域名目标按每个数据报应用路由规则：`DIRECT` 通过临时系统 UDP socket 发送，具名 SOCKS5 代理使用上游 `UDP ASSOCIATE`（域名交给代理端解析）；`REJECT` 与 HTTP 代理 UDP 动作会丢弃，绝不回退直连。上游 SOCKS5 控制连接随入站关联保持，队列有界。UDP 分片、HTTP 代理 UDP 出站、DNS 策略、Mihomo 的 `udp` 配置字段及完整入站语义均未实现；畸形和分片帧也会丢弃。relay 地址仍限制在 loopback。
 
-`skip-auth-prefixes` 命中时将协商无认证方法；该功能应谨慎配置，避免把不可信来源列入豁免范围。SOCKS5 入站认证和 SOCKS5 出站认证按 RFC 1929 传输明文凭据，因此仅应在可信本机网络使用。**仍未实现：** HTTP 入站、HTTPS/其他代理出站、组选择持久化、URL-test、fallback、load-balance、健康检查、Mihomo DNS 策略、TUN、订阅、完整 REST/WebSocket API、UI 与 Android 服务。当前只有受密钥保护的 loopback 组状态/切换 API，不是完整 Mihomo 控制面。核心库组选择和服务 API 都只在进程内生效；IP-CIDR 不会为域名目标先行解析。该项目不接受完整 Mihomo YAML；见 [兼容性台账](COMPATIBILITY.md)。
+`skip-auth-prefixes` 命中时将协商无认证方法；该功能应谨慎配置，避免把不可信来源列入豁免范围。SOCKS5 入站认证和 SOCKS5 出站认证按 RFC 1929 传输明文凭据，因此仅应在可信本机网络使用。**仍未实现：** HTTP 入站、HTTPS/其他代理出站、组选择持久化、URL-test、fallback、load-balance、健康检查、完整 Mihomo DNS 策略、TUN、订阅、完整 REST/WebSocket API、UI 与 Android 服务。当前只有受密钥保护的 loopback 组状态/切换 API，不是完整 Mihomo 控制面。核心库组选择和服务 API 都只在进程内生效；域名 CIDR 规则仅有上述 TCP 有界系统解析切片，不提供 DNS 策略、缓存或 hosts/fake-IP。该项目不接受完整 Mihomo YAML；见 [兼容性台账](COMPATIBILITY.md)。
 
 ## 快速开始
 
