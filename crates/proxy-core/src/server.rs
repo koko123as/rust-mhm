@@ -41,6 +41,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_TRACKED_UDP_DESTINATIONS: usize = 1024;
 const MAX_ENCAPSULATED_UDP_PACKET_SIZE: usize = 65_507;
 const MAX_DOMAIN_ROUTE_ADDRESSES: usize = 16;
+const IP_ADDRESS_CONNECT_STAGGER: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy)]
 struct ConnectionTimeouts {
@@ -1018,19 +1019,46 @@ async fn connect_target(
 }
 
 async fn connect_resolved_addresses(addresses: &[IpAddr], port: u16) -> io::Result<TcpStream> {
+    let mut attempts = JoinSet::new();
+    let mut next_address = 0;
+    let mut next_attempt_at = Instant::now();
     let mut last_error = None;
-    for address in addresses {
-        match TcpStream::connect(SocketAddr::new(*address, port)).await {
-            Ok(stream) => return Ok(stream),
-            Err(error) => last_error = Some(error),
+
+    loop {
+        if next_address < addresses.len() && Instant::now() >= next_attempt_at {
+            let address = SocketAddr::new(addresses[next_address], port);
+            next_address += 1;
+            attempts.spawn(async move { TcpStream::connect(address).await });
+            next_attempt_at = Instant::now() + IP_ADDRESS_CONNECT_STAGGER;
+        }
+
+        if attempts.is_empty() && next_address == addresses.len() {
+            return Err(last_error.unwrap_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::HostUnreachable,
+                    "no target addresses to connect",
+                )
+            }));
+        }
+
+        tokio::select! {
+            result = attempts.join_next(), if !attempts.is_empty() => {
+                match result {
+                    Some(Ok(Ok(stream))) => return Ok(stream),
+                    Some(Ok(Err(error))) => {
+                        last_error = Some(error);
+                        next_attempt_at = Instant::now();
+                    }
+                    Some(Err(error)) => {
+                        last_error = Some(io::Error::other(error));
+                        next_attempt_at = Instant::now();
+                    }
+                    None => {}
+                }
+            }
+            _ = sleep_until(next_attempt_at), if next_address < addresses.len() => {}
         }
     }
-    Err(last_error.unwrap_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::HostUnreachable,
-            "no target addresses to connect",
-        )
-    }))
 }
 
 async fn send_reply<S>(

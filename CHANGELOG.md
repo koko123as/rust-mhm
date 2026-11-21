@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- TCP 域名目标的 `IP-CIDR`/`IP-CIDR6` 路由现在按规则顺序按需执行一次有界系统解析；支持 `no-resolve`，DIRECT 复用最多 16 个去重答案，具名代理仍接收原始域名。超时、DNS 失败、无答案或超限不回退 DIRECT；UDP 路径未改变，也未新增通用 DNS 策略/缓存。
+- TCP 域名目标的 `IP-CIDR`/`IP-CIDR6` 路由现在按规则顺序按需执行一次有界系统解析；支持 `no-resolve`，DIRECT 复用最多 16 个去重答案并以 250ms 间隔交错尝试，避免慢失败的 IPv6 地址阻塞后续地址，具名代理仍接收原始域名。超时、DNS 失败、无答案或超限不回退 DIRECT；UDP 路径未改变，也未新增通用 DNS 策略/缓存。
 - 新增解析顺序与调用次数、IPv4/IPv6 多答案、空/失败/超限/超时，以及 SOCKS5 DIRECT、REJECT 无拨号和 HTTP 上游保留原域名的测试。
 - 增加严格配置的有限 `select` 代理组子集：支持代理与嵌套组前向引用、`DIRECT`/`REJECT`、有效 `default-selected` 默认项；缺省或无效默认项回退首成员，并校验成员、名称及引用环路。
 - `RuleSet` 增加进程内手动选择/读取组成员的方法；普通规则与 `RULE-SET` 组动作保留符号化组名并按当前选择递归解析。克隆共享选择状态，另一次 `Config::routing_rules()` 创建独立状态。
