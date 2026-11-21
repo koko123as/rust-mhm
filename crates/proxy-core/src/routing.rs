@@ -36,6 +36,8 @@ struct RoutingRule {
 enum Matcher {
     DomainExact(String),
     DomainSuffix(String),
+    DomainKeyword(String),
+    DomainWildcard(String),
     IpCidr(Cidr),
     DstPort(PortMatcher),
     Any,
@@ -63,6 +65,10 @@ pub enum RuleError {
     UnsupportedAction { index: usize, action: String },
     #[error("invalid domain in routing rule at index {index}")]
     InvalidDomain { index: usize },
+    #[error("invalid domain keyword in routing rule at index {index}")]
+    InvalidDomainKeyword { index: usize },
+    #[error("invalid domain wildcard in routing rule at index {index}")]
+    InvalidDomainWildcard { index: usize },
     #[error("invalid CIDR in routing rule at index {index}")]
     InvalidCidr { index: usize },
     #[error("invalid destination port or range in routing rule at index {index}")]
@@ -117,6 +123,36 @@ impl RuleSet {
                         normalize_domain(fields[1]).ok_or(RuleError::InvalidDomain { index })?;
                     (Matcher::DomainSuffix(domain), fields[2])
                 }
+                "DOMAIN-KEYWORD" if fields.len() == 3 => {
+                    let keyword = fields[1];
+                    if keyword.len() > 253
+                        || !keyword.is_ascii()
+                        || keyword.bytes().any(|byte| byte.is_ascii_whitespace())
+                    {
+                        return Err(RuleError::InvalidDomainKeyword { index });
+                    }
+                    (
+                        Matcher::DomainKeyword(keyword.to_ascii_lowercase()),
+                        fields[2],
+                    )
+                }
+                "DOMAIN-WILDCARD" if fields.len() == 3 => {
+                    let pattern = fields[1];
+                    if pattern.is_empty()
+                        || pattern.len() > 253
+                        || !pattern.is_ascii()
+                        || pattern.bytes().any(|byte| {
+                            !(byte.is_ascii_alphanumeric()
+                                || matches!(byte, b'.' | b'-' | b'*' | b'?'))
+                        })
+                    {
+                        return Err(RuleError::InvalidDomainWildcard { index });
+                    }
+                    (
+                        Matcher::DomainWildcard(pattern.to_ascii_lowercase()),
+                        fields[2],
+                    )
+                }
                 "IP-CIDR" | "IP-CIDR6"
                     if fields.len() == 3
                         || (fields.len() == 4 && fields[3].eq_ignore_ascii_case("no-resolve")) =>
@@ -130,7 +166,8 @@ impl RuleSet {
                     (Matcher::DstPort(port), fields[2])
                 }
                 "MATCH" if fields.len() == 2 => (Matcher::Any, fields[1]),
-                "DOMAIN" | "DOMAIN-SUFFIX" | "IP-CIDR" | "IP-CIDR6" | "DST-PORT" | "MATCH" => {
+                "DOMAIN" | "DOMAIN-SUFFIX" | "DOMAIN-KEYWORD" | "DOMAIN-WILDCARD" | "IP-CIDR"
+                | "IP-CIDR6" | "DST-PORT" | "MATCH" => {
                     return Err(RuleError::InvalidSyntax { index });
                 }
                 other => {
@@ -190,6 +227,17 @@ impl RoutingRule {
                     .is_some_and(|domain| domain == *suffix || has_label_suffix(&domain, suffix)),
                 TargetHost::Ip(_) => false,
             },
+            Matcher::DomainKeyword(keyword) => match &target.host {
+                TargetHost::Domain(domain) => {
+                    normalize_domain(domain).is_some_and(|domain| domain.contains(keyword))
+                }
+                TargetHost::Ip(_) => false,
+            },
+            Matcher::DomainWildcard(pattern) => match &target.host {
+                TargetHost::Domain(domain) => normalize_domain(domain)
+                    .is_some_and(|domain| wildcard_matches(pattern, &domain)),
+                TargetHost::Ip(_) => false,
+            },
             Matcher::IpCidr(cidr) => match target.host {
                 TargetHost::Ip(ip) => cidr.contains(ip),
                 TargetHost::Domain(_) => false,
@@ -222,6 +270,38 @@ fn has_label_suffix(domain: &str, suffix: &str) -> bool {
     domain
         .strip_suffix(suffix)
         .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+fn wildcard_matches(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let value = value.as_bytes();
+    let (mut pattern_index, mut value_index) = (0, 0);
+    let mut last_star = None;
+    let mut star_value_index = 0;
+
+    while value_index < value.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == b'?' || pattern[pattern_index] == value[value_index])
+        {
+            pattern_index += 1;
+            value_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+            last_star = Some(pattern_index);
+            pattern_index += 1;
+            star_value_index = value_index;
+        } else if let Some(star_index) = last_star {
+            star_value_index += 1;
+            pattern_index = star_index + 1;
+            value_index = star_value_index;
+        } else {
+            return false;
+        }
+    }
+
+    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
 }
 
 /// Canonicalize the limited ASCII DNS names handled by this rule engine.
@@ -370,6 +450,54 @@ mod tests {
     }
 
     #[test]
+    fn domain_keyword_matches_case_insensitive_substrings_in_domains_only() {
+        let rules = rule_set(&["DOMAIN-KEYWORD,Google,REJECT", "MATCH,DIRECT"]);
+        assert_eq!(
+            rules.route(&domain_target("mail.GOOGLE.example", 443)),
+            RouteAction::Reject
+        );
+        assert_eq!(
+            rules.route(&domain_target("notgoogle.example", 443)),
+            RouteAction::Reject
+        );
+        assert_eq!(
+            rules.route(&domain_target("example.org", 443)),
+            RouteAction::Direct
+        );
+        assert_eq!(
+            rules.route(&ip_target("192.0.2.1", 443)),
+            RouteAction::Direct
+        );
+    }
+
+    #[test]
+    fn domain_wildcard_supports_star_and_single_character_question_mark() {
+        let star = rule_set(&["DOMAIN-WILDCARD,*.Google.example,REJECT", "MATCH,DIRECT"]);
+        assert_eq!(
+            star.route(&domain_target("mail.google.example", 443)),
+            RouteAction::Reject
+        );
+        assert_eq!(
+            star.route(&domain_target("google.example", 443)),
+            RouteAction::Direct
+        );
+        assert_eq!(
+            star.route(&domain_target("notgoogle.example", 443)),
+            RouteAction::Direct
+        );
+
+        let question = rule_set(&["DOMAIN-WILDCARD,ab?.example.com,REJECT", "MATCH,DIRECT"]);
+        assert_eq!(
+            question.route(&domain_target("ab1.example.com", 443)),
+            RouteAction::Reject
+        );
+        assert_eq!(
+            question.route(&domain_target("ab12.example.com", 443)),
+            RouteAction::Direct
+        );
+    }
+
+    #[test]
     fn domain_matching_normalizes_ascii_case_and_terminal_root_dot() {
         let rules = rule_set(&["DOMAIN,example.com,REJECT", "MATCH,DIRECT"]);
         assert_eq!(
@@ -477,6 +605,14 @@ mod tests {
         assert!(matches!(
             RuleSet::parse(&["DOMAIN,not a domain,REJECT".to_owned()]),
             Err(RuleError::InvalidDomain { .. })
+        ));
+        assert!(matches!(
+            RuleSet::parse(&["DOMAIN-KEYWORD,bad keyword,REJECT".to_owned()]),
+            Err(RuleError::InvalidDomainKeyword { .. })
+        ));
+        assert!(matches!(
+            RuleSet::parse(&["DOMAIN-WILDCARD,*.éxample.com,REJECT".to_owned()]),
+            Err(RuleError::InvalidDomainWildcard { .. })
         ));
         assert!(matches!(
             RuleSet::parse(&["DST-PORT,90-80,REJECT".to_owned()]),
