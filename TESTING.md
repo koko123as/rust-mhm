@@ -39,4 +39,4 @@ TCP 域名 CIDR 路由切片通过本地完整门禁（103 项测试；格式、
 
 有限 load-balance round-robin 切片通过本地完整门禁（122 项 workspace 测试；格式、workspace 全目标检查、零警告 Clippy、CLI 帮助与 Rust 1.85 锁定测试）。最新工具链 CI 将 `AtomicUsize::fetch_update` 标为弃用后，游标改用 `compare_exchange_weak` 循环；提交 `628ece3` 对应的 [Linux、Windows、macOS 与 Rust 1.85 CI](https://github.com/koko123as/rust-mhm/actions/runs/44959469886) 四项任务全部通过。
 
-有限 URL-Test 切片已通过本地完整门禁（129 项 workspace 测试；格式、全目标检查、零警告 Clippy、CLI 帮助与 Rust 1.85.0 锁定测试）。该切片的跨平台 CI 尚待推送后验证。
+有限 URL-Test 切片通过本地完整门禁（129 项 workspace 测试；格式、workspace 全目标检查、零警告 Clippy、CLI 帮助与 Rust 1.85.0 锁定测试），并通过 [Linux、Windows、macOS 与 Rust 1.85 CI](https://github.com/koko123as/rust-mhm/actions/runs/44960824081) 四项任务。CI 仅有现有 `actions/checkout@v4` 的 Node.js 20 弃用提示，不影响结果。

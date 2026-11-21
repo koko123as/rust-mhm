@@ -133,4 +133,4 @@ Linux x86_64 上上一阶段的静态 `select` 组切片通过了 81 项 workspa
 
 有限 `load-balance` round-robin 切片通过本地完整门禁（122 项 workspace 测试、格式、全目标检查、零警告 Clippy、CLI 帮助与 Rust 1.85 锁定测试）；修复最新 Rust 弃用警告后的提交 `628ece3` 在 [Linux、Windows、macOS 与 Rust 1.85 CI](https://github.com/koko123as/rust-mhm/actions/runs/44959469886) 全项通过。
 
-有限 `url-test` 垂直切片已通过本地完整门禁（129 项 workspace 测试、格式、全目标检查、零警告 Clippy、CLI 帮助与 Rust 1.85 锁定测试）；本次跨平台 CI 尚待推送后验证。
+有限 `url-test` 垂直切片通过本地完整门禁（129 项 workspace 测试、格式、全目标检查、零警告 Clippy、CLI 帮助与 Rust 1.85 锁定测试），并通过 [Linux、Windows、macOS 与 Rust 1.85 CI](https://github.com/koko123as/rust-mhm/actions/runs/44960824081) 四项任务。CI 仅有现有 `actions/checkout@v4` 的 Node.js 20 弃用提示，不影响结果。
